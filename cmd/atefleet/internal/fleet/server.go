@@ -69,6 +69,62 @@ func (s *Server) DispatchActor(ctx context.Context, r *atefleetpb.DispatchActorR
 	return &atefleetpb.DispatchActorResponse{Actor: fleetActor(meta, addr, resumeResp.GetActor().GetStatus())}, nil
 }
 
+func (s *Server) ListFleet(ctx context.Context, r *atefleetpb.ListFleetRequest) (*atefleetpb.ListFleetResponse, error) {
+	metas, err := s.idx.List(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list index: %v", err)
+	}
+	// TODO(phase3): ListActors is paginated; this reads only the first page.
+	la, err := s.api.ListActors(ctx, &ateapipb.ListActorsRequest{})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list actors: %v", err)
+	}
+	stByID := map[string]ateapipb.Actor_Status{}
+	for _, a := range la.GetActors() {
+		stByID[a.GetActorId()] = a.GetStatus()
+	}
+
+	out := &atefleetpb.ListFleetResponse{}
+	for _, m := range metas {
+		if r.GetRole() != "" && m.Role != r.GetRole() {
+			continue
+		}
+		if r.GetOwner() != "" && m.Owner != r.GetOwner() {
+			continue
+		}
+		if r.GetGroup() != "" && m.Group != r.GetGroup() {
+			continue
+		}
+		st, live := stByID[m.ActorID]
+		if !live {
+			continue // actor gone but index lingering — skip (reaper cleans it)
+		}
+		addr, _ := ActorAddress(m.ActorID)
+		out.Actors = append(out.Actors, fleetActor(m, addr, st))
+	}
+	return out, nil
+}
+
+func (s *Server) GetFleetActor(ctx context.Context, r *atefleetpb.GetFleetActorRequest) (*atefleetpb.GetFleetActorResponse, error) {
+	m, err := s.idx.Get(ctx, r.GetActorId())
+	if err == ErrNotFound {
+		return nil, status.Error(codes.NotFound, "actor not in fleet")
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get index: %v", err)
+	}
+	ga, err := s.api.GetActor(ctx, &ateapipb.GetActorRequest{ActorId: r.GetActorId()})
+	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			// actor gone but index lingering — same race ListFleet skips (reaper cleans it).
+			return nil, status.Error(codes.NotFound, "actor not in fleet")
+		}
+		return nil, status.Errorf(codes.Internal, "get actor: %v", err)
+	}
+	addr, _ := ActorAddress(m.ActorID)
+	return &atefleetpb.GetFleetActorResponse{Actor: fleetActor(m, addr, ga.GetActor().GetStatus())}, nil
+}
+
 func fleetActor(m FleetMeta, addr string, st ateapipb.Actor_Status) *atefleetpb.FleetActor {
 	return &atefleetpb.FleetActor{
 		ActorId: m.ActorID, Address: addr, Status: st.String(),

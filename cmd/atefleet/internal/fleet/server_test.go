@@ -103,3 +103,35 @@ func TestDispatchActor(t *testing.T) {
 		t.Fatalf("meta %+v", m)
 	}
 }
+
+func TestListFleetFilter(t *testing.T) {
+	s, _ := newTestServer(t)
+	ctx := context.Background()
+	for _, id := range []string{"a1", "a2"} {
+		grp := "g1"
+		if id == "a2" {
+			grp = "g2"
+		}
+		if _, err := s.DispatchActor(ctx, &atefleetpb.DispatchActorRequest{ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: id, Group: grp}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resp, err := s.ListFleet(ctx, &atefleetpb.ListFleetRequest{Group: "g2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.GetActors()) != 1 || resp.GetActors()[0].GetActorId() != "a2" {
+		t.Fatalf("got %+v", resp.GetActors())
+	}
+	if resp.GetActors()[0].GetStatus() != "STATUS_RUNNING" {
+		t.Fatalf("status %q", resp.GetActors()[0].GetStatus())
+	}
+
+	g, err := s.GetFleetActor(ctx, &atefleetpb.GetFleetActorRequest{ActorId: "a1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.GetActor().GetAddress() != "a1.actors.resources.substrate.ate.dev" {
+		t.Fatalf("addr %q", g.GetActor().GetAddress())
+	}
+}
