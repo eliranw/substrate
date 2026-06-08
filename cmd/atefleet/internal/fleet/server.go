@@ -47,10 +47,19 @@ func (s *Server) DispatchActor(ctx context.Context, r *atefleetpb.DispatchActorR
 	if _, err := s.api.CreateActor(ctx, &ateapipb.CreateActorRequest{
 		ActorId: r.GetActorId(), ActorTemplateNamespace: r.GetActorTemplateNamespace(), ActorTemplateName: r.GetActorTemplateName(),
 	}); err != nil {
+		// Preserve the downstream gRPC code (AlreadyExists, FailedPrecondition, ...)
+		// so callers see the real reason instead of an opaque Internal.
+		if st, ok := status.FromError(err); ok {
+			return nil, status.Error(st.Code(), st.Message())
+		}
 		return nil, status.Errorf(codes.Internal, "create actor: %v", err)
 	}
 	resumeResp, err := s.api.ResumeActor(ctx, &ateapipb.ResumeActorRequest{ActorId: r.GetActorId()})
 	if err != nil {
+		// Preserve the downstream gRPC code (NotFound, Aborted, ...).
+		if st, ok := status.FromError(err); ok {
+			return nil, status.Error(st.Code(), st.Message())
+		}
 		return nil, status.Errorf(codes.Internal, "resume actor: %v", err)
 	}
 
@@ -74,13 +83,12 @@ func (s *Server) ListFleet(ctx context.Context, r *atefleetpb.ListFleetRequest) 
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list index: %v", err)
 	}
-	// TODO(phase3): ListActors is paginated; this reads only the first page.
-	la, err := s.api.ListActors(ctx, &ateapipb.ListActorsRequest{})
+	actors, err := listAllActors(ctx, s.api)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list actors: %v", err)
 	}
 	stByID := map[string]ateapipb.Actor_Status{}
-	for _, a := range la.GetActors() {
+	for _, a := range actors {
 		stByID[a.GetActorId()] = a.GetStatus()
 	}
 
@@ -139,6 +147,27 @@ func (s *Server) TerminateActor(ctx context.Context, r *atefleetpb.TerminateActo
 		return nil, status.Errorf(codes.Internal, "delete index: %v", err)
 	}
 	return &atefleetpb.TerminateActorResponse{}, nil
+}
+
+// listAllActors pages through ateapi.ListActors fully, accumulating every
+// actor across all pages. Reading only the first page (as the MVP did)
+// under-reports the fleet and, in the reaper, would destroy index metadata for
+// alive actors that only appear on later pages.
+func listAllActors(ctx context.Context, api ControlAPI) ([]*ateapipb.Actor, error) {
+	var out []*ateapipb.Actor
+	tok := ""
+	for {
+		resp, err := api.ListActors(ctx, &ateapipb.ListActorsRequest{PageToken: tok})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, resp.GetActors()...)
+		tok = resp.GetNextPageToken()
+		if tok == "" {
+			break
+		}
+	}
+	return out, nil
 }
 
 func fleetActor(m FleetMeta, addr string, st ateapipb.Actor_Status) *atefleetpb.FleetActor {

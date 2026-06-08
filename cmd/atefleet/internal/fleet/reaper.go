@@ -19,6 +19,9 @@ import (
 	"fmt"
 	"log/slog"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	ateapipb "github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
@@ -38,13 +41,14 @@ func (r *Reaper) ReapOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list index: %w", err)
 	}
-	// TODO(phase3): ListActors is paginated; reads only the first page.
-	la, err := r.api.ListActors(ctx, &ateapipb.ListActorsRequest{})
+	// Page through the full actor list; reading only the first page would treat
+	// alive actors on later pages as gone and destroy their index metadata.
+	actors, err := listAllActors(ctx, r.api)
 	if err != nil {
 		return fmt.Errorf("list actors: %w", err)
 	}
 	live := map[string]bool{}
-	for _, a := range la.GetActors() {
+	for _, a := range actors {
 		live[a.GetActorId()] = true
 	}
 
@@ -52,9 +56,23 @@ func (r *Reaper) ReapOnce(ctx context.Context) error {
 	for _, m := range metas {
 		switch {
 		case !live[m.ActorID]:
-			// actor gone (deleted out-of-band) — reconcile the stale index entry
+			// Actor appears gone, but the full list could still race a recent
+			// create. Confirm via GetActor before deleting: only reconcile the
+			// stale index entry when ateapi reports the actor is truly absent.
+			if _, err := r.api.GetActor(ctx, &ateapipb.GetActorRequest{ActorId: m.ActorID}); err != nil {
+				if st, ok := status.FromError(err); !ok || st.Code() != codes.NotFound {
+					// Ambiguous (transient) error — keep the index entry and
+					// retry next tick rather than risk deleting live metadata.
+					slog.WarnContext(ctx, "reaper: GetActor inconclusive; keeping index entry", "actor", m.ActorID, "err", err)
+					continue
+				}
+			} else {
+				// Actor actually exists; ListActors just didn't surface it. Keep it.
+				continue
+			}
 			if err := r.idx.Delete(ctx, m.ActorID); err != nil {
-				return err
+				slog.WarnContext(ctx, "reaper: drop stale index entry failed", "actor", m.ActorID, "err", err)
+				continue // one bad key must not stall the rest of the pass
 			}
 			slog.InfoContext(ctx, "reaper: dropped stale index entry", "actor", m.ActorID)
 		case m.ExpiryUnix > 0 && now >= m.ExpiryUnix:
@@ -63,7 +81,8 @@ func (r *Reaper) ReapOnce(ctx context.Context) error {
 				continue // keep index; retry next tick
 			}
 			if err := r.idx.Delete(ctx, m.ActorID); err != nil {
-				return err
+				slog.WarnContext(ctx, "reaper: delete expired index entry failed", "actor", m.ActorID, "err", err)
+				continue // one bad key must not stall the rest of the pass
 			}
 			slog.InfoContext(ctx, "reaper: reaped expired actor", "actor", m.ActorID)
 		}
