@@ -20,6 +20,8 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	atefleetpb "github.com/agent-substrate/substrate/internal/proto/atefleetpb"
 	ateapipb "github.com/agent-substrate/substrate/pkg/proto/ateapipb"
@@ -28,6 +30,7 @@ import (
 type fakeControl struct {
 	created, resumed, deleted []string
 	actors                    []*ateapipb.Actor
+	deleteErr                 error // if set, DeleteActor returns it before mutating state
 }
 
 func (f *fakeControl) CreateActor(_ context.Context, in *ateapipb.CreateActorRequest) (*ateapipb.CreateActorResponse, error) {
@@ -58,6 +61,9 @@ func (f *fakeControl) ListActors(_ context.Context, _ *ateapipb.ListActorsReques
 	return &ateapipb.ListActorsResponse{Actors: f.actors}, nil
 }
 func (f *fakeControl) DeleteActor(_ context.Context, in *ateapipb.DeleteActorRequest) (*ateapipb.DeleteActorResponse, error) {
+	if f.deleteErr != nil {
+		return nil, f.deleteErr
+	}
 	f.deleted = append(f.deleted, in.GetActorId())
 	kept := f.actors[:0]
 	for _, a := range f.actors {
@@ -133,5 +139,36 @@ func TestListFleetFilter(t *testing.T) {
 	}
 	if g.GetActor().GetAddress() != "a1.actors.resources.substrate.ate.dev" {
 		t.Fatalf("addr %q", g.GetActor().GetAddress())
+	}
+}
+
+func TestTerminateActor(t *testing.T) {
+	s, fc := newTestServer(t)
+	ctx := context.Background()
+	s.DispatchActor(ctx, &atefleetpb.DispatchActorRequest{ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1"})
+	if _, err := s.TerminateActor(ctx, &atefleetpb.TerminateActorRequest{ActorId: "a1"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.deleted) != 1 || fc.deleted[0] != "a1" {
+		t.Fatalf("deleted %v", fc.deleted)
+	}
+	if _, err := s.idx.Get(ctx, "a1"); err != ErrNotFound {
+		t.Fatal("index entry should be gone")
+	}
+}
+
+func TestTerminateActorPreservesDownstreamCode(t *testing.T) {
+	s, fc := newTestServer(t)
+	ctx := context.Background()
+	s.DispatchActor(ctx, &atefleetpb.DispatchActorRequest{ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1"})
+	// ateapi.DeleteActor returns FailedPrecondition for a running (not suspended) actor.
+	fc.deleteErr = status.Error(codes.FailedPrecondition, "Actor a1 is not suspended")
+	_, err := s.TerminateActor(ctx, &atefleetpb.TerminateActorRequest{ActorId: "a1"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("want FailedPrecondition, got %v (%v)", status.Code(err), err)
+	}
+	// On a failed downstream delete the index entry must remain.
+	if _, err := s.idx.Get(ctx, "a1"); err != nil {
+		t.Fatalf("index entry should remain: %v", err)
 	}
 }

@@ -125,6 +125,22 @@ func (s *Server) GetFleetActor(ctx context.Context, r *atefleetpb.GetFleetActorR
 	return &atefleetpb.GetFleetActorResponse{Actor: fleetActor(m, addr, ga.GetActor().GetStatus())}, nil
 }
 
+func (s *Server) TerminateActor(ctx context.Context, r *atefleetpb.TerminateActorRequest) (*atefleetpb.TerminateActorResponse, error) {
+	// ateapi.DeleteActor only deletes suspended actors; MVP surfaces that error.
+	// Preserve the downstream gRPC code (NotFound, FailedPrecondition, InvalidArgument,
+	// Aborted) so callers see the real reason instead of an opaque Internal.
+	if _, err := s.api.DeleteActor(ctx, &ateapipb.DeleteActorRequest{ActorId: r.GetActorId()}); err != nil {
+		if st, ok := status.FromError(err); ok {
+			return nil, status.Error(st.Code(), st.Message())
+		}
+		return nil, status.Errorf(codes.Internal, "delete actor: %v", err)
+	}
+	if err := s.idx.Delete(ctx, r.GetActorId()); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete index: %v", err)
+	}
+	return &atefleetpb.TerminateActorResponse{}, nil
+}
+
 func fleetActor(m FleetMeta, addr string, st ateapipb.Actor_Status) *atefleetpb.FleetActor {
 	return &atefleetpb.FleetActor{
 		ActorId: m.ActorID, Address: addr, Status: st.String(),
