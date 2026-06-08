@@ -38,7 +38,7 @@ import (
 )
 
 func newServeCmd() *cobra.Command {
-	var listen, ateapiAddr, redisAddr string
+	var listen, ateapiAddr, redisAddr, serverCredBundle string
 	var redisCACerts, redisTLSServerName, redisClientCert string
 	var reapEvery time.Duration
 	cmd := &cobra.Command{
@@ -87,7 +87,20 @@ func newServeCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("listen on %q: %w", listen, err)
 			}
-			g := grpc.NewServer(grpc.StatsHandler(otelgrpc.NewServerHandler()))
+			// Serve TLS using the servicedns pod-certificate credential bundle,
+			// mirroring cmd/ateapi/main.go's buildServerCreds. The FleetManager
+			// clients (kubectl-ate / atefleet subcommands) dial over TLS with
+			// InsecureSkipVerify, so the server must terminate TLS.
+			if serverCredBundle == "" {
+				return fmt.Errorf("--grpc-server-cred-bundle is required")
+			}
+			serverCreds := credentials.NewTLS(&tls.Config{
+				GetCertificate: credbundle.Loader(serverCredBundle),
+			})
+			g := grpc.NewServer(
+				grpc.Creds(serverCreds),
+				grpc.StatsHandler(otelgrpc.NewServerHandler()),
+			)
 			atefleetpb.RegisterFleetManagerServer(g, srv)
 			slog.InfoContext(ctx, "atefleet serving", "addr", listen)
 			return g.Serve(lis)
@@ -95,6 +108,7 @@ func newServeCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&listen, "grpc-listen-addr", "0.0.0.0:443", "Address and port the gRPC server should listen on.")
 	cmd.Flags().StringVar(&ateapiAddr, "ateapi-addr", "api.ate-system.svc:443", "Address of the ateapi Control gRPC service.")
+	cmd.Flags().StringVar(&serverCredBundle, "grpc-server-cred-bundle", "", "File with the server TLS credential bundle.")
 	cmd.Flags().StringVar(&redisAddr, "redis-cluster-address", "", "The address of the redis/valkey cluster.")
 	cmd.Flags().StringVar(&redisCACerts, "redis-ca-certs", "", "The file that contains the CA certificate for the Redis cluster.")
 	cmd.Flags().StringVar(&redisTLSServerName, "redis-tls-server-name", "", "The ServerName to use for Redis TLS hostname verification.")

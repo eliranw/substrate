@@ -1,0 +1,119 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# Service Account for the fleet manager.
+# atefleet makes no Kubernetes API calls (it talks only to the ateapi Control
+# gRPC service and to Redis/Valkey), so no ClusterRole/RoleBinding is needed.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: atefleet
+  namespace: ate-system
+---
+# Deploy the Fleet Manager.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atefleet-deployment
+  namespace: ate-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: atefleet
+  template:
+    metadata:
+      labels:
+        app: atefleet
+    spec:
+      serviceAccountName: atefleet
+      containers:
+      - name: atefleet
+        image: ko://github.com/agent-substrate/substrate/cmd/atefleet
+        args:
+          - "serve"
+          - "--grpc-listen-addr=0.0.0.0:443"
+          - "--grpc-server-cred-bundle=/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+          - "--ateapi-addr=api.ate-system.svc:443"
+          - "--redis-cluster-address=$(ATE_API_REDIS_ADDRESS)"
+          - "--redis-ca-certs=/etc/valkey-ca/ca.crt"
+          - "--redis-tls-server-name=$(ATE_API_REDIS_TLS_SERVER_NAME)"
+          - "--redis-client-cert=$(ATE_API_REDIS_CLIENT_CERT)"
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),service.instance.id=$(POD_UID)
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
+        # Share the per-developer redis config that ate-api-server uses, so a
+        # developer can customize their own redis address/TLS without editing
+        # this manifest. The serve command consumes the values via the
+        # $(ATE_API_REDIS_*) substitutions in args above.
+        envFrom:
+        - configMapRef:
+            name: ate-api-server-envvars
+            optional: true
+        volumeMounts:
+        - name: "servicedns"
+          mountPath: "/run/servicedns.podcert.ate.dev"
+        # Note: See README.md for how to generate this secret.
+        - name: "valkey-ca-certs"
+          mountPath: "/etc/valkey-ca"
+          readOnly: true
+        ports:
+        - containerPort: 443
+      volumes:
+      - name: "servicedns"
+        projected:
+          sources:
+          - podCertificate:
+              signerName: servicedns.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+      - name: "valkey-ca-certs"
+        projected:
+          sources:
+          - secret:
+              name: "valkey-ca-certs"
+              items:
+              - key: "ca.crt"
+                path: "ca.crt"
+---
+# Expose the Fleet Manager.
+apiVersion: v1
+kind: Service
+metadata:
+  name: atefleet
+  namespace: ate-system
+spec:
+  type: ClusterIP
+  selector:
+    app: atefleet
+  ports:
+  - name: grpc
+    protocol: TCP
+    port: 443
+    targetPort: 443
