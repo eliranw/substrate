@@ -47,10 +47,10 @@ spec:
           - "--grpc-listen-addr=0.0.0.0:443"
           - "--grpc-server-cred-bundle=/run/servicedns.podcert.ate.dev/credential-bundle.pem"
           - "--ateapi-addr=api.ate-system.svc:443"
-          - "--redis-cluster-address=$(ATE_API_REDIS_ADDRESS)"
+          - "--redis-cluster-address=@env"
           - "--redis-ca-certs=/etc/valkey-ca/ca.crt"
-          - "--redis-tls-server-name=$(ATE_API_REDIS_TLS_SERVER_NAME)"
-          - "--redis-client-cert=$(ATE_API_REDIS_CLIENT_CERT)"
+          - "--redis-tls-server-name=@env"
+          - "--redis-client-cert=@env"
         env:
         - name: POD_NAME
           valueFrom:
@@ -70,8 +70,8 @@ spec:
           value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
         # Share the per-developer redis config that ate-api-server uses, so a
         # developer can customize their own redis address/TLS without editing
-        # this manifest. The serve command consumes the values via the
-        # $(ATE_API_REDIS_*) substitutions in args above.
+        # this manifest. The serve command consumes the values by resolving the
+        # `@env` sentinel args above against the ATE_API_REDIS_* env vars.
         envFrom:
         - configMapRef:
             name: ate-api-server-envvars

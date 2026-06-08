@@ -47,6 +47,24 @@ func newServeCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 
+			// Resolve the `@env` sentinel for the redis flags against the
+			// matching environment variables, mirroring cmd/ateapi/main.go's
+			// loadFlagsFromEnv. This lets the deployment share the
+			// ate-api-server-envvars ConfigMap without relying on fragile
+			// Kubernetes $(VAR) arg expansion.
+			for _, o := range []struct {
+				flag *string
+				env  string
+			}{
+				{&redisAddr, "ATE_API_REDIS_ADDRESS"},
+				{&redisTLSServerName, "ATE_API_REDIS_TLS_SERVER_NAME"},
+				{&redisClientCert, "ATE_API_REDIS_CLIENT_CERT"},
+			} {
+				if *o.flag == "@env" {
+					*o.flag = os.Getenv(o.env)
+				}
+			}
+
 			// Dial the ateapi Control service. This mirrors
 			// internal/ateclient.dialDirect (TLS with InsecureSkipVerify +
 			// otel stats handler).
