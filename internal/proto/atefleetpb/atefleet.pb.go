@@ -535,6 +535,166 @@ func (*TerminateActorResponse) Descriptor() ([]byte, []int) {
 	return file_atefleet_proto_rawDescGZIP(), []int{8}
 }
 
+type RunSubtaskRequest struct {
+	state                  protoimpl.MessageState `protogen:"open.v1"`
+	ActorTemplateNamespace string                 `protobuf:"bytes,1,opt,name=actor_template_namespace,json=actorTemplateNamespace,proto3" json:"actor_template_namespace,omitempty"`
+	ActorTemplateName      string                 `protobuf:"bytes,2,opt,name=actor_template_name,json=actorTemplateName,proto3" json:"actor_template_name,omitempty"`
+	Command                []string               `protobuf:"bytes,3,rep,name=command,proto3" json:"command,omitempty"`
+	TimeoutSeconds         int64                  `protobuf:"varint,4,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"` // 0 = no explicit timeout
+	Owner                  string                 `protobuf:"bytes,5,opt,name=owner,proto3" json:"owner,omitempty"`
+	Group                  string                 `protobuf:"bytes,6,opt,name=group,proto3" json:"group,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *RunSubtaskRequest) Reset() {
+	*x = RunSubtaskRequest{}
+	mi := &file_atefleet_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RunSubtaskRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RunSubtaskRequest) ProtoMessage() {}
+
+func (x *RunSubtaskRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_atefleet_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RunSubtaskRequest.ProtoReflect.Descriptor instead.
+func (*RunSubtaskRequest) Descriptor() ([]byte, []int) {
+	return file_atefleet_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *RunSubtaskRequest) GetActorTemplateNamespace() string {
+	if x != nil {
+		return x.ActorTemplateNamespace
+	}
+	return ""
+}
+
+func (x *RunSubtaskRequest) GetActorTemplateName() string {
+	if x != nil {
+		return x.ActorTemplateName
+	}
+	return ""
+}
+
+func (x *RunSubtaskRequest) GetCommand() []string {
+	if x != nil {
+		return x.Command
+	}
+	return nil
+}
+
+func (x *RunSubtaskRequest) GetTimeoutSeconds() int64 {
+	if x != nil {
+		return x.TimeoutSeconds
+	}
+	return 0
+}
+
+func (x *RunSubtaskRequest) GetOwner() string {
+	if x != nil {
+		return x.Owner
+	}
+	return ""
+}
+
+func (x *RunSubtaskRequest) GetGroup() string {
+	if x != nil {
+		return x.Group
+	}
+	return ""
+}
+
+type RunSubtaskResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Stdout        string                 `protobuf:"bytes,1,opt,name=stdout,proto3" json:"stdout,omitempty"`
+	Stderr        string                 `protobuf:"bytes,2,opt,name=stderr,proto3" json:"stderr,omitempty"`
+	ExitCode      int32                  `protobuf:"varint,3,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
+	Error         string                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`                    // non-empty if the actor reported a run error
+	ActorId       string                 `protobuf:"bytes,5,opt,name=actor_id,json=actorId,proto3" json:"actor_id,omitempty"` // the ephemeral actor that ran it
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RunSubtaskResponse) Reset() {
+	*x = RunSubtaskResponse{}
+	mi := &file_atefleet_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RunSubtaskResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RunSubtaskResponse) ProtoMessage() {}
+
+func (x *RunSubtaskResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_atefleet_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RunSubtaskResponse.ProtoReflect.Descriptor instead.
+func (*RunSubtaskResponse) Descriptor() ([]byte, []int) {
+	return file_atefleet_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *RunSubtaskResponse) GetStdout() string {
+	if x != nil {
+		return x.Stdout
+	}
+	return ""
+}
+
+func (x *RunSubtaskResponse) GetStderr() string {
+	if x != nil {
+		return x.Stderr
+	}
+	return ""
+}
+
+func (x *RunSubtaskResponse) GetExitCode() int32 {
+	if x != nil {
+		return x.ExitCode
+	}
+	return 0
+}
+
+func (x *RunSubtaskResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *RunSubtaskResponse) GetActorId() string {
+	if x != nil {
+		return x.ActorId
+	}
+	return ""
+}
+
 var File_atefleet_proto protoreflect.FileDescriptor
 
 const file_atefleet_proto_rawDesc = "" +
@@ -573,12 +733,27 @@ const file_atefleet_proto_rawDesc = "" +
 	"\x05actor\x18\x01 \x01(\v2\x14.atefleet.FleetActorR\x05actor\"2\n" +
 	"\x15TerminateActorRequest\x12\x19\n" +
 	"\bactor_id\x18\x01 \x01(\tR\aactorId\"\x18\n" +
-	"\x16TerminateActorResponse2\xd5\x02\n" +
+	"\x16TerminateActorResponse\"\xec\x01\n" +
+	"\x11RunSubtaskRequest\x128\n" +
+	"\x18actor_template_namespace\x18\x01 \x01(\tR\x16actorTemplateNamespace\x12.\n" +
+	"\x13actor_template_name\x18\x02 \x01(\tR\x11actorTemplateName\x12\x18\n" +
+	"\acommand\x18\x03 \x03(\tR\acommand\x12'\n" +
+	"\x0ftimeout_seconds\x18\x04 \x01(\x03R\x0etimeoutSeconds\x12\x14\n" +
+	"\x05owner\x18\x05 \x01(\tR\x05owner\x12\x14\n" +
+	"\x05group\x18\x06 \x01(\tR\x05group\"\x92\x01\n" +
+	"\x12RunSubtaskResponse\x12\x16\n" +
+	"\x06stdout\x18\x01 \x01(\tR\x06stdout\x12\x16\n" +
+	"\x06stderr\x18\x02 \x01(\tR\x06stderr\x12\x1b\n" +
+	"\texit_code\x18\x03 \x01(\x05R\bexitCode\x12\x14\n" +
+	"\x05error\x18\x04 \x01(\tR\x05error\x12\x19\n" +
+	"\bactor_id\x18\x05 \x01(\tR\aactorId2\xa0\x03\n" +
 	"\fFleetManager\x12R\n" +
 	"\rDispatchActor\x12\x1e.atefleet.DispatchActorRequest\x1a\x1f.atefleet.DispatchActorResponse\"\x00\x12F\n" +
 	"\tListFleet\x12\x1a.atefleet.ListFleetRequest\x1a\x1b.atefleet.ListFleetResponse\"\x00\x12R\n" +
 	"\rGetFleetActor\x12\x1e.atefleet.GetFleetActorRequest\x1a\x1f.atefleet.GetFleetActorResponse\"\x00\x12U\n" +
-	"\x0eTerminateActor\x12\x1f.atefleet.TerminateActorRequest\x1a .atefleet.TerminateActorResponse\"\x00B@Z>github.com/agent-substrate/substrate/internal/proto/atefleetpbb\x06proto3"
+	"\x0eTerminateActor\x12\x1f.atefleet.TerminateActorRequest\x1a .atefleet.TerminateActorResponse\"\x00\x12I\n" +
+	"\n" +
+	"RunSubtask\x12\x1b.atefleet.RunSubtaskRequest\x1a\x1c.atefleet.RunSubtaskResponse\"\x00B@Z>github.com/agent-substrate/substrate/internal/proto/atefleetpbb\x06proto3"
 
 var (
 	file_atefleet_proto_rawDescOnce sync.Once
@@ -592,7 +767,7 @@ func file_atefleet_proto_rawDescGZIP() []byte {
 	return file_atefleet_proto_rawDescData
 }
 
-var file_atefleet_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_atefleet_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_atefleet_proto_goTypes = []any{
 	(*DispatchActorRequest)(nil),   // 0: atefleet.DispatchActorRequest
 	(*FleetActor)(nil),             // 1: atefleet.FleetActor
@@ -603,24 +778,28 @@ var file_atefleet_proto_goTypes = []any{
 	(*GetFleetActorResponse)(nil),  // 6: atefleet.GetFleetActorResponse
 	(*TerminateActorRequest)(nil),  // 7: atefleet.TerminateActorRequest
 	(*TerminateActorResponse)(nil), // 8: atefleet.TerminateActorResponse
+	(*RunSubtaskRequest)(nil),      // 9: atefleet.RunSubtaskRequest
+	(*RunSubtaskResponse)(nil),     // 10: atefleet.RunSubtaskResponse
 }
 var file_atefleet_proto_depIdxs = []int32{
-	1, // 0: atefleet.DispatchActorResponse.actor:type_name -> atefleet.FleetActor
-	1, // 1: atefleet.ListFleetResponse.actors:type_name -> atefleet.FleetActor
-	1, // 2: atefleet.GetFleetActorResponse.actor:type_name -> atefleet.FleetActor
-	0, // 3: atefleet.FleetManager.DispatchActor:input_type -> atefleet.DispatchActorRequest
-	3, // 4: atefleet.FleetManager.ListFleet:input_type -> atefleet.ListFleetRequest
-	5, // 5: atefleet.FleetManager.GetFleetActor:input_type -> atefleet.GetFleetActorRequest
-	7, // 6: atefleet.FleetManager.TerminateActor:input_type -> atefleet.TerminateActorRequest
-	2, // 7: atefleet.FleetManager.DispatchActor:output_type -> atefleet.DispatchActorResponse
-	4, // 8: atefleet.FleetManager.ListFleet:output_type -> atefleet.ListFleetResponse
-	6, // 9: atefleet.FleetManager.GetFleetActor:output_type -> atefleet.GetFleetActorResponse
-	8, // 10: atefleet.FleetManager.TerminateActor:output_type -> atefleet.TerminateActorResponse
-	7, // [7:11] is the sub-list for method output_type
-	3, // [3:7] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	1,  // 0: atefleet.DispatchActorResponse.actor:type_name -> atefleet.FleetActor
+	1,  // 1: atefleet.ListFleetResponse.actors:type_name -> atefleet.FleetActor
+	1,  // 2: atefleet.GetFleetActorResponse.actor:type_name -> atefleet.FleetActor
+	0,  // 3: atefleet.FleetManager.DispatchActor:input_type -> atefleet.DispatchActorRequest
+	3,  // 4: atefleet.FleetManager.ListFleet:input_type -> atefleet.ListFleetRequest
+	5,  // 5: atefleet.FleetManager.GetFleetActor:input_type -> atefleet.GetFleetActorRequest
+	7,  // 6: atefleet.FleetManager.TerminateActor:input_type -> atefleet.TerminateActorRequest
+	9,  // 7: atefleet.FleetManager.RunSubtask:input_type -> atefleet.RunSubtaskRequest
+	2,  // 8: atefleet.FleetManager.DispatchActor:output_type -> atefleet.DispatchActorResponse
+	4,  // 9: atefleet.FleetManager.ListFleet:output_type -> atefleet.ListFleetResponse
+	6,  // 10: atefleet.FleetManager.GetFleetActor:output_type -> atefleet.GetFleetActorResponse
+	8,  // 11: atefleet.FleetManager.TerminateActor:output_type -> atefleet.TerminateActorResponse
+	10, // 12: atefleet.FleetManager.RunSubtask:output_type -> atefleet.RunSubtaskResponse
+	8,  // [8:13] is the sub-list for method output_type
+	3,  // [3:8] is the sub-list for method input_type
+	3,  // [3:3] is the sub-list for extension type_name
+	3,  // [3:3] is the sub-list for extension extendee
+	0,  // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_atefleet_proto_init() }
@@ -634,7 +813,7 @@ func file_atefleet_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_atefleet_proto_rawDesc), len(file_atefleet_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

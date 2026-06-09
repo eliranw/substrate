@@ -37,6 +37,7 @@ const (
 	FleetManager_ListFleet_FullMethodName      = "/atefleet.FleetManager/ListFleet"
 	FleetManager_GetFleetActor_FullMethodName  = "/atefleet.FleetManager/GetFleetActor"
 	FleetManager_TerminateActor_FullMethodName = "/atefleet.FleetManager/TerminateActor"
+	FleetManager_RunSubtask_FullMethodName     = "/atefleet.FleetManager/RunSubtask"
 )
 
 // FleetManagerClient is the client API for FleetManager service.
@@ -47,6 +48,7 @@ type FleetManagerClient interface {
 	ListFleet(ctx context.Context, in *ListFleetRequest, opts ...grpc.CallOption) (*ListFleetResponse, error)
 	GetFleetActor(ctx context.Context, in *GetFleetActorRequest, opts ...grpc.CallOption) (*GetFleetActorResponse, error)
 	TerminateActor(ctx context.Context, in *TerminateActorRequest, opts ...grpc.CallOption) (*TerminateActorResponse, error)
+	RunSubtask(ctx context.Context, in *RunSubtaskRequest, opts ...grpc.CallOption) (*RunSubtaskResponse, error)
 }
 
 type fleetManagerClient struct {
@@ -97,6 +99,16 @@ func (c *fleetManagerClient) TerminateActor(ctx context.Context, in *TerminateAc
 	return out, nil
 }
 
+func (c *fleetManagerClient) RunSubtask(ctx context.Context, in *RunSubtaskRequest, opts ...grpc.CallOption) (*RunSubtaskResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RunSubtaskResponse)
+	err := c.cc.Invoke(ctx, FleetManager_RunSubtask_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // FleetManagerServer is the server API for FleetManager service.
 // All implementations must embed UnimplementedFleetManagerServer
 // for forward compatibility.
@@ -105,6 +117,7 @@ type FleetManagerServer interface {
 	ListFleet(context.Context, *ListFleetRequest) (*ListFleetResponse, error)
 	GetFleetActor(context.Context, *GetFleetActorRequest) (*GetFleetActorResponse, error)
 	TerminateActor(context.Context, *TerminateActorRequest) (*TerminateActorResponse, error)
+	RunSubtask(context.Context, *RunSubtaskRequest) (*RunSubtaskResponse, error)
 	mustEmbedUnimplementedFleetManagerServer()
 }
 
@@ -126,6 +139,9 @@ func (UnimplementedFleetManagerServer) GetFleetActor(context.Context, *GetFleetA
 }
 func (UnimplementedFleetManagerServer) TerminateActor(context.Context, *TerminateActorRequest) (*TerminateActorResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method TerminateActor not implemented")
+}
+func (UnimplementedFleetManagerServer) RunSubtask(context.Context, *RunSubtaskRequest) (*RunSubtaskResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RunSubtask not implemented")
 }
 func (UnimplementedFleetManagerServer) mustEmbedUnimplementedFleetManagerServer() {}
 func (UnimplementedFleetManagerServer) testEmbeddedByValue()                      {}
@@ -220,6 +236,24 @@ func _FleetManager_TerminateActor_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _FleetManager_RunSubtask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunSubtaskRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FleetManagerServer).RunSubtask(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FleetManager_RunSubtask_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FleetManagerServer).RunSubtask(ctx, req.(*RunSubtaskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // FleetManager_ServiceDesc is the grpc.ServiceDesc for FleetManager service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -242,6 +276,10 @@ var FleetManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "TerminateActor",
 			Handler:    _FleetManager_TerminateActor_Handler,
+		},
+		{
+			MethodName: "RunSubtask",
+			Handler:    _FleetManager_RunSubtask_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

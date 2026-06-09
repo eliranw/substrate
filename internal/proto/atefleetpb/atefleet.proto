@@ -21,6 +21,7 @@ service FleetManager {
   rpc ListFleet(ListFleetRequest) returns (ListFleetResponse) {}
   rpc GetFleetActor(GetFleetActorRequest) returns (GetFleetActorResponse) {}
   rpc TerminateActor(TerminateActorRequest) returns (TerminateActorResponse) {}
+  rpc RunSubtask(RunSubtaskRequest) returns (RunSubtaskResponse) {}
 }
 
 message DispatchActorRequest {
@@ -50,3 +51,19 @@ message GetFleetActorRequest  { string actor_id = 1; }
 message GetFleetActorResponse { FleetActor actor = 1; }
 message TerminateActorRequest  { string actor_id = 1; }
 message TerminateActorResponse {}
+
+message RunSubtaskRequest {
+  string actor_template_namespace = 1;
+  string actor_template_name      = 2;
+  repeated string command         = 3;
+  int64  timeout_seconds          = 4; // 0 = no explicit timeout
+  string owner                    = 5;
+  string group                    = 6;
+}
+message RunSubtaskResponse {
+  string stdout    = 1;
+  string stderr    = 2;
+  int32  exit_code = 3;
+  string error     = 4; // non-empty if the actor reported a run error
+  string actor_id  = 5; // the ephemeral actor that ran it
+}
