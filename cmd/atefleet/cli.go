@@ -178,6 +178,56 @@ func newRmCmd() *cobra.Command {
 	return cmd
 }
 
+func newRunCmd() *cobra.Command {
+	var template, owner, group string
+	var timeout time.Duration
+	cmd := &cobra.Command{
+		Use:   "run --template <ns>/<name> [flags] -- <cmd> [args...]",
+		Short: "Run a one-shot command in an ephemeral actor",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			parts := strings.Split(template, "/")
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				return fmt.Errorf("malformed --template %q (expected <namespace>/<name>)", template)
+			}
+			client, closeFn, err := dialFleet()
+			if err != nil {
+				return err
+			}
+			defer closeFn()
+
+			resp, err := client.RunSubtask(ctx, &atefleetpb.RunSubtaskRequest{
+				ActorTemplateNamespace: parts[0],
+				ActorTemplateName:      parts[1],
+				Command:                args,
+				TimeoutSeconds:         int64(timeout.Seconds()),
+				Owner:                  owner,
+				Group:                  group,
+			})
+			if err != nil {
+				return err
+			}
+
+			// Mirror the real command's semantics: relay stdout/stderr and exit
+			// with the subtask's exit code.
+			fmt.Fprint(os.Stdout, resp.GetStdout())
+			fmt.Fprint(os.Stderr, resp.GetStderr())
+			if resp.GetError() != "" {
+				fmt.Fprintln(os.Stderr, resp.GetError())
+			}
+			os.Exit(int(resp.GetExitCode()))
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&template, "template", "t", "", "Actor template in <namespace>/<name> format (required)")
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "Time limit for the command (0 = runner default)")
+	cmd.Flags().StringVar(&owner, "owner", "", "Owner label to assign to the ephemeral actor")
+	cmd.Flags().StringVar(&group, "group", "", "Group label to assign to the ephemeral actor")
+	_ = cmd.MarkFlagRequired("template")
+	return cmd
+}
+
 // printFleetActor prints a single FleetActor as a one-row table.
 func printFleetActor(a *atefleetpb.FleetActor) error {
 	return printFleetTable([]*atefleetpb.FleetActor{a})
