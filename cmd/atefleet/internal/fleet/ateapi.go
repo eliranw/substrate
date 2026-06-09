@@ -24,6 +24,7 @@ import (
 type ControlAPI interface {
 	CreateActor(ctx context.Context, in *ateapipb.CreateActorRequest) (*ateapipb.CreateActorResponse, error)
 	ResumeActor(ctx context.Context, in *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error)
+	SuspendActor(ctx context.Context, in *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error)
 	GetActor(ctx context.Context, in *ateapipb.GetActorRequest) (*ateapipb.GetActorResponse, error)
 	ListActors(ctx context.Context, in *ateapipb.ListActorsRequest) (*ateapipb.ListActorsResponse, error)
 	DeleteActor(ctx context.Context, in *ateapipb.DeleteActorRequest) (*ateapipb.DeleteActorResponse, error)
@@ -40,6 +41,9 @@ func (a *controlAdapter) CreateActor(ctx context.Context, in *ateapipb.CreateAct
 }
 func (a *controlAdapter) ResumeActor(ctx context.Context, in *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
 	return a.c.ResumeActor(ctx, in)
+}
+func (a *controlAdapter) SuspendActor(ctx context.Context, in *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
+	return a.c.SuspendActor(ctx, in)
 }
 func (a *controlAdapter) GetActor(ctx context.Context, in *ateapipb.GetActorRequest) (*ateapipb.GetActorResponse, error) {
 	return a.c.GetActor(ctx, in)

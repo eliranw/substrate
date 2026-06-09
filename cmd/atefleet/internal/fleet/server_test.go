@@ -29,12 +29,12 @@ import (
 )
 
 type fakeControl struct {
-	created, resumed, deleted []string
-	actors                    []*ateapipb.Actor
-	createErr                 error // if set, CreateActor returns it before mutating state
-	resumeErr                 error // if set, ResumeActor returns it before mutating state
-	deleteErr                 error // if set, DeleteActor returns it before mutating state
-	getErr                    error // if set, GetActor returns it instead of looking up actors
+	created, resumed, suspended, deleted []string
+	actors                               []*ateapipb.Actor
+	createErr                            error // if set, CreateActor returns it before mutating state
+	resumeErr                            error // if set, ResumeActor returns it before mutating state
+	deleteErr                            error // if set, DeleteActor returns it before mutating state
+	getErr                               error // if set, GetActor returns it instead of looking up actors
 	// pageSize, when >0, makes ListActors return at most this many actors per
 	// call and emit a NextPageToken so multi-page pagination can be exercised.
 	pageSize int
@@ -61,6 +61,16 @@ func (f *fakeControl) ResumeActor(_ context.Context, in *ateapipb.ResumeActorReq
 		}
 	}
 	return &ateapipb.ResumeActorResponse{}, nil
+}
+func (f *fakeControl) SuspendActor(_ context.Context, in *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
+	f.suspended = append(f.suspended, in.GetActorId())
+	for _, a := range f.actors {
+		if a.ActorId == in.GetActorId() {
+			a.Status = ateapipb.Actor_STATUS_SUSPENDED
+			return &ateapipb.SuspendActorResponse{Actor: a}, nil
+		}
+	}
+	return &ateapipb.SuspendActorResponse{}, nil
 }
 func (f *fakeControl) GetActor(_ context.Context, in *ateapipb.GetActorRequest) (*ateapipb.GetActorResponse, error) {
 	if f.getErr != nil {
