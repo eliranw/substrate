@@ -97,7 +97,7 @@ func newServeCmd() *cobra.Command {
 			idx := fleet.NewIndex(rdb)
 			nowUnix := func() int64 { return time.Now().Unix() }
 
-			srv := fleet.NewServer(api, idx, nowUnix)
+			srv := fleet.NewServer(api, idx, nowUnix, fleet.NewHTTPRunner(nil))
 			reaper := fleet.NewReaper(api, idx, nowUnix)
 			go runReaper(ctx, reaper, reapEvery)
 

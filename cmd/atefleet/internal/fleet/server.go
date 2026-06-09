@@ -16,6 +16,10 @@ package fleet
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -24,15 +28,21 @@ import (
 	ateapipb "github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
+// subtaskBackstopTTL bounds how long a one-shot subtask actor may linger if
+// RunSubtask crashes before its teardown runs: the reaper deletes any subtask
+// actor whose expiry has passed, so a crashed run leaks nothing.
+const subtaskBackstopTTL = 600
+
 type Server struct {
 	atefleetpb.UnimplementedFleetManagerServer
-	api ControlAPI
-	idx *Index
-	now func() int64 // unix seconds; injectable for tests
+	api    ControlAPI
+	idx    *Index
+	now    func() int64 // unix seconds; injectable for tests
+	runner SubtaskRunner
 }
 
-func NewServer(api ControlAPI, idx *Index, now func() int64) *Server {
-	return &Server{api: api, idx: idx, now: now}
+func NewServer(api ControlAPI, idx *Index, now func() int64, runner SubtaskRunner) *Server {
+	return &Server{api: api, idx: idx, now: now, runner: runner}
 }
 
 func (s *Server) DispatchActor(ctx context.Context, r *atefleetpb.DispatchActorRequest) (*atefleetpb.DispatchActorResponse, error) {
@@ -147,6 +157,103 @@ func (s *Server) TerminateActor(ctx context.Context, r *atefleetpb.TerminateActo
 		return nil, status.Errorf(codes.Internal, "delete index: %v", err)
 	}
 	return &atefleetpb.TerminateActorResponse{}, nil
+}
+
+// RunSubtask runs a one-shot command on an ephemeral actor: create + resume a
+// fresh actor, POST the command to its sandbox, then always tear the actor down
+// (suspend + delete) regardless of the command's outcome.
+func (s *Server) RunSubtask(ctx context.Context, r *atefleetpb.RunSubtaskRequest) (*atefleetpb.RunSubtaskResponse, error) {
+	if r.GetActorTemplateNamespace() == "" || r.GetActorTemplateName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "actor_template_namespace and actor_template_name are required")
+	}
+	if len(r.GetCommand()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "command is required")
+	}
+
+	id := newSubtaskID()
+
+	// Index a backstop entry first so a crash anywhere below still lets the
+	// reaper clean the actor up once the backstop TTL elapses.
+	meta := FleetMeta{
+		ActorID: id, Role: "subtask", Owner: r.GetOwner(), Group: r.GetGroup(),
+		ExpiryUnix:        s.now() + subtaskBackstopTTL,
+		TemplateNamespace: r.GetActorTemplateNamespace(), TemplateName: r.GetActorTemplateName(),
+	}
+	if err := s.idx.Put(ctx, meta); err != nil {
+		return nil, status.Errorf(codes.Internal, "index subtask: %v", err)
+	}
+
+	if _, err := s.api.CreateActor(ctx, &ateapipb.CreateActorRequest{
+		ActorId: id, ActorTemplateNamespace: r.GetActorTemplateNamespace(), ActorTemplateName: r.GetActorTemplateName(),
+	}); err != nil {
+		// On a failed create there is no actor to tear down; just drop the index.
+		if derr := s.idx.Delete(ctx, id); derr != nil {
+			slog.WarnContext(ctx, "subtask: drop index after create failure", "actor", id, "err", derr)
+		}
+		if st, ok := status.FromError(err); ok {
+			return nil, status.Error(st.Code(), st.Message())
+		}
+		return nil, status.Errorf(codes.Internal, "create actor: %v", err)
+	}
+
+	// From here the actor exists, so teardown must always run. The defer
+	// suspends + deletes the actor and drops the index entry; teardown errors
+	// are logged but never mask the primary result.
+	defer func() {
+		if _, err := s.api.SuspendActor(ctx, &ateapipb.SuspendActorRequest{ActorId: id}); err != nil {
+			slog.WarnContext(ctx, "subtask teardown: suspend failed", "actor", id, "err", err)
+		}
+		if _, err := s.api.DeleteActor(ctx, &ateapipb.DeleteActorRequest{ActorId: id}); err != nil {
+			slog.WarnContext(ctx, "subtask teardown: delete failed", "actor", id, "err", err)
+		}
+		if err := s.idx.Delete(ctx, id); err != nil {
+			slog.WarnContext(ctx, "subtask teardown: drop index failed", "actor", id, "err", err)
+		}
+	}()
+
+	if _, err := s.api.ResumeActor(ctx, &ateapipb.ResumeActorRequest{ActorId: id}); err != nil {
+		if st, ok := status.FromError(err); ok {
+			return nil, status.Error(st.Code(), st.Message())
+		}
+		return nil, status.Errorf(codes.Internal, "resume actor: %v", err)
+	}
+
+	ga, err := s.api.GetActor(ctx, &ateapipb.GetActorRequest{ActorId: id})
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			return nil, status.Error(st.Code(), st.Message())
+		}
+		return nil, status.Errorf(codes.Internal, "get actor: %v", err)
+	}
+	podIP := ga.GetActor().GetAteomPodIp()
+	if podIP == "" {
+		return nil, status.Error(codes.Internal, "actor has no pod ip")
+	}
+	addr := podIP + ":80"
+
+	var timeout time.Duration
+	if r.GetTimeoutSeconds() > 0 {
+		timeout = time.Duration(r.GetTimeoutSeconds()) * time.Second
+	}
+
+	res, err := s.runner.Run(ctx, addr, r.GetCommand(), timeout)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "run subtask: %v", err)
+	}
+
+	return &atefleetpb.RunSubtaskResponse{
+		Stdout: res.Stdout, Stderr: res.Stderr, ExitCode: int32(res.ExitCode), Error: res.RunError, ActorId: id,
+	}, nil
+}
+
+// newSubtaskID returns a fresh actor id for a one-shot subtask. The result is a
+// valid DNS-1123 label ("subtask-" + 16 lowercase hex chars).
+func newSubtaskID() string {
+	var b [8]byte
+	// crypto/rand.Read never returns an error on the platforms we target, but
+	// even a (theoretical) zero id is a valid, unique-enough label here.
+	_, _ = rand.Read(b[:])
+	return "subtask-" + hex.EncodeToString(b[:])
 }
 
 // listAllActors pages through ateapi.ListActors fully, accumulating every

@@ -16,8 +16,11 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -57,6 +60,8 @@ func (f *fakeControl) ResumeActor(_ context.Context, in *ateapipb.ResumeActorReq
 	for _, a := range f.actors {
 		if a.ActorId == in.GetActorId() {
 			a.Status = ateapipb.Actor_STATUS_RUNNING
+			// A resumed actor reports the worker pod IP; RunSubtask needs it.
+			a.AteomPodIp = "10.0.0.1"
 			return &ateapipb.ResumeActorResponse{Actor: a}, nil
 		}
 	}
@@ -120,7 +125,26 @@ func (f *fakeControl) DeleteActor(_ context.Context, in *ateapipb.DeleteActorReq
 	return &ateapipb.DeleteActorResponse{}, nil
 }
 
-func newTestServer(t *testing.T) (*Server, *fakeControl) {
+// fakeRunner records the address and command it was asked to run and returns a
+// canned result (or error) so RunSubtask can be exercised without a worker pod.
+type fakeRunner struct {
+	gotAddr    string
+	gotCommand []string
+	gotTimeout time.Duration
+	calls      int
+	res        RunResult
+	err        error
+}
+
+func (r *fakeRunner) Run(_ context.Context, addr string, command []string, timeout time.Duration) (RunResult, error) {
+	r.calls++
+	r.gotAddr = addr
+	r.gotCommand = command
+	r.gotTimeout = timeout
+	return r.res, r.err
+}
+
+func newTestServer(t *testing.T) (*Server, *fakeControl, *fakeRunner) {
 	mr, err := miniredis.Run()
 	if err != nil {
 		t.Fatal(err)
@@ -128,11 +152,12 @@ func newTestServer(t *testing.T) (*Server, *fakeControl) {
 	t.Cleanup(mr.Close)
 	idx := NewIndex(redis.NewClient(&redis.Options{Addr: mr.Addr()}))
 	fc := &fakeControl{}
-	return NewServer(fc, idx, func() int64 { return 1000 }), fc
+	fr := &fakeRunner{}
+	return NewServer(fc, idx, func() int64 { return 1000 }, fr), fc, fr
 }
 
 func TestDispatchActor(t *testing.T) {
-	s, fc := newTestServer(t)
+	s, fc, _ := newTestServer(t)
 	resp, err := s.DispatchActor(context.Background(), &atefleetpb.DispatchActorRequest{
 		ActorTemplateNamespace: "ns", ActorTemplateName: "tmpl", ActorId: "a1",
 		Role: "worker", Owner: "eliran", Group: "g1", TtlSeconds: 60,
@@ -156,7 +181,7 @@ func TestDispatchActor(t *testing.T) {
 }
 
 func TestDispatchActorPreservesCreateCode(t *testing.T) {
-	s, fc := newTestServer(t)
+	s, fc, _ := newTestServer(t)
 	fc.createErr = status.Error(codes.AlreadyExists, "Actor a1 already exists")
 	_, err := s.DispatchActor(context.Background(), &atefleetpb.DispatchActorRequest{
 		ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1",
@@ -167,7 +192,7 @@ func TestDispatchActorPreservesCreateCode(t *testing.T) {
 }
 
 func TestDispatchActorPreservesResumeCode(t *testing.T) {
-	s, fc := newTestServer(t)
+	s, fc, _ := newTestServer(t)
 	fc.resumeErr = status.Error(codes.Aborted, "Actor a1 is being reconciled")
 	_, err := s.DispatchActor(context.Background(), &atefleetpb.DispatchActorRequest{
 		ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1",
@@ -178,7 +203,7 @@ func TestDispatchActorPreservesResumeCode(t *testing.T) {
 }
 
 func TestDispatchActorInvalidArgs(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 	ctx := context.Background()
 	// empty template name
 	if _, err := s.DispatchActor(ctx, &atefleetpb.DispatchActorRequest{ActorTemplateNamespace: "ns", ActorId: "a1"}); status.Code(err) != codes.InvalidArgument {
@@ -191,7 +216,7 @@ func TestDispatchActorInvalidArgs(t *testing.T) {
 }
 
 func TestListFleetFilter(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 	ctx := context.Background()
 	for _, id := range []string{"a1", "a2"} {
 		grp := "g1"
@@ -223,7 +248,7 @@ func TestListFleetFilter(t *testing.T) {
 }
 
 func TestListFleetFilterByRoleAndOwner(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 	ctx := context.Background()
 	dispatch := func(id, role, owner string) {
 		if _, err := s.DispatchActor(ctx, &atefleetpb.DispatchActorRequest{
@@ -254,7 +279,7 @@ func TestListFleetFilterByRoleAndOwner(t *testing.T) {
 }
 
 func TestListFleetOmitsActorAbsentFromListActors(t *testing.T) {
-	s, fc := newTestServer(t)
+	s, fc, _ := newTestServer(t)
 	ctx := context.Background()
 	if _, err := s.DispatchActor(ctx, &atefleetpb.DispatchActorRequest{ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1"}); err != nil {
 		t.Fatal(err)
@@ -271,7 +296,7 @@ func TestListFleetOmitsActorAbsentFromListActors(t *testing.T) {
 }
 
 func TestGetFleetActorFields(t *testing.T) {
-	s, _ := newTestServer(t)
+	s, _, _ := newTestServer(t)
 	ctx := context.Background()
 	if _, err := s.DispatchActor(ctx, &atefleetpb.DispatchActorRequest{
 		ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1",
@@ -296,7 +321,7 @@ func TestGetFleetActorFields(t *testing.T) {
 }
 
 func TestGetFleetActorActorGone(t *testing.T) {
-	s, fc := newTestServer(t)
+	s, fc, _ := newTestServer(t)
 	ctx := context.Background()
 	if _, err := s.DispatchActor(ctx, &atefleetpb.DispatchActorRequest{ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1"}); err != nil {
 		t.Fatal(err)
@@ -335,7 +360,7 @@ func sameSet(got, want []string) bool {
 }
 
 func TestTerminateActor(t *testing.T) {
-	s, fc := newTestServer(t)
+	s, fc, _ := newTestServer(t)
 	ctx := context.Background()
 	s.DispatchActor(ctx, &atefleetpb.DispatchActorRequest{ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1"})
 	if _, err := s.TerminateActor(ctx, &atefleetpb.TerminateActorRequest{ActorId: "a1"}); err != nil {
@@ -350,7 +375,7 @@ func TestTerminateActor(t *testing.T) {
 }
 
 func TestTerminateActorPreservesDownstreamCode(t *testing.T) {
-	s, fc := newTestServer(t)
+	s, fc, _ := newTestServer(t)
 	ctx := context.Background()
 	s.DispatchActor(ctx, &atefleetpb.DispatchActorRequest{ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1"})
 	// ateapi.DeleteActor returns FailedPrecondition for a running (not suspended) actor.
@@ -362,5 +387,85 @@ func TestTerminateActorPreservesDownstreamCode(t *testing.T) {
 	// On a failed downstream delete the index entry must remain.
 	if _, err := s.idx.Get(ctx, "a1"); err != nil {
 		t.Fatalf("index entry should remain: %v", err)
+	}
+}
+
+func TestRunSubtask(t *testing.T) {
+	s, fc, fr := newTestServer(t)
+	fr.res = RunResult{Stdout: "out\n", Stderr: "err\n", ExitCode: 3, RunError: "oops"}
+	resp, err := s.RunSubtask(context.Background(), &atefleetpb.RunSubtaskRequest{
+		ActorTemplateNamespace: "ns", ActorTemplateName: "t",
+		Command: []string{"echo", "hi"}, TimeoutSeconds: 30, Owner: "alice", Group: "g1",
+	})
+	if err != nil {
+		t.Fatalf("RunSubtask: %v", err)
+	}
+
+	id := resp.GetActorId()
+	if !strings.HasPrefix(id, "subtask-") {
+		t.Fatalf("actor id %q, want subtask- prefix", id)
+	}
+	if resp.GetStdout() != "out\n" || resp.GetStderr() != "err\n" || resp.GetExitCode() != 3 || resp.GetError() != "oops" {
+		t.Fatalf("response = %+v, want canned runner result", resp)
+	}
+
+	// The runner saw the resumed actor's pod ip and the command.
+	if fr.gotAddr != "10.0.0.1:80" {
+		t.Fatalf("runner addr = %q, want 10.0.0.1:80", fr.gotAddr)
+	}
+	if len(fr.gotCommand) != 2 || fr.gotCommand[0] != "echo" || fr.gotCommand[1] != "hi" {
+		t.Fatalf("runner command = %v, want [echo hi]", fr.gotCommand)
+	}
+	if fr.gotTimeout != 30*time.Second {
+		t.Fatalf("runner timeout = %v, want 30s", fr.gotTimeout)
+	}
+
+	// Full one-shot lifecycle ran against the generated id.
+	if !sameSet(fc.created, []string{id}) {
+		t.Fatalf("created = %v, want [%s]", fc.created, id)
+	}
+	if !sameSet(fc.resumed, []string{id}) {
+		t.Fatalf("resumed = %v, want [%s]", fc.resumed, id)
+	}
+	if !sameSet(fc.suspended, []string{id}) {
+		t.Fatalf("suspended = %v, want [%s]", fc.suspended, id)
+	}
+	if !sameSet(fc.deleted, []string{id}) {
+		t.Fatalf("deleted = %v, want [%s]", fc.deleted, id)
+	}
+	// Teardown also dropped the backstop index entry.
+	if _, err := s.idx.Get(context.Background(), id); err != ErrNotFound {
+		t.Fatalf("index entry should be gone after teardown, got err=%v", err)
+	}
+}
+
+func TestRunSubtaskRunErrorStillTearsDown(t *testing.T) {
+	s, fc, fr := newTestServer(t)
+	fr.err = errors.New("dial failed")
+	_, err := s.RunSubtask(context.Background(), &atefleetpb.RunSubtaskRequest{
+		ActorTemplateNamespace: "ns", ActorTemplateName: "t", Command: []string{"echo"},
+	})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("want Internal on runner error, got %v (%v)", status.Code(err), err)
+	}
+	// Teardown must still run via the defer even though Run failed.
+	if len(fc.suspended) != 1 {
+		t.Fatalf("suspended = %v, want one teardown call", fc.suspended)
+	}
+	if len(fc.deleted) != 1 {
+		t.Fatalf("deleted = %v, want one teardown call", fc.deleted)
+	}
+}
+
+func TestRunSubtaskInvalidArgs(t *testing.T) {
+	s, _, _ := newTestServer(t)
+	ctx := context.Background()
+	// missing template
+	if _, err := s.RunSubtask(ctx, &atefleetpb.RunSubtaskRequest{ActorTemplateName: "t", Command: []string{"echo"}}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("missing namespace: want InvalidArgument, got %v (%v)", status.Code(err), err)
+	}
+	// empty command
+	if _, err := s.RunSubtask(ctx, &atefleetpb.RunSubtaskRequest{ActorTemplateNamespace: "ns", ActorTemplateName: "t"}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("empty command: want InvalidArgument, got %v (%v)", status.Code(err), err)
 	}
 }
