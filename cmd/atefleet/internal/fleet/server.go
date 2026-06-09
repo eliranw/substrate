@@ -200,14 +200,20 @@ func (s *Server) RunSubtask(ctx context.Context, r *atefleetpb.RunSubtaskRequest
 	// suspends + deletes the actor and drops the index entry; teardown errors
 	// are logged but never mask the primary result.
 	defer func() {
-		if _, err := s.api.SuspendActor(ctx, &ateapipb.SuspendActorRequest{ActorId: id}); err != nil {
-			slog.WarnContext(ctx, "subtask teardown: suspend failed", "actor", id, "err", err)
+		// Teardown must run even if the request ctx was already cancelled or
+		// timed out (e.g. a long-running subtask), so detach from its
+		// cancellation (keeping values such as tracing) with a fresh bounded
+		// deadline. The reaper is the backstop if even this fails.
+		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if _, err := s.api.SuspendActor(tctx, &ateapipb.SuspendActorRequest{ActorId: id}); err != nil {
+			slog.WarnContext(tctx, "subtask teardown: suspend failed", "actor", id, "err", err)
 		}
-		if _, err := s.api.DeleteActor(ctx, &ateapipb.DeleteActorRequest{ActorId: id}); err != nil {
-			slog.WarnContext(ctx, "subtask teardown: delete failed", "actor", id, "err", err)
+		if _, err := s.api.DeleteActor(tctx, &ateapipb.DeleteActorRequest{ActorId: id}); err != nil {
+			slog.WarnContext(tctx, "subtask teardown: delete failed", "actor", id, "err", err)
 		}
-		if err := s.idx.Delete(ctx, id); err != nil {
-			slog.WarnContext(ctx, "subtask teardown: drop index failed", "actor", id, "err", err)
+		if err := s.idx.Delete(tctx, id); err != nil {
+			slog.WarnContext(tctx, "subtask teardown: drop index failed", "actor", id, "err", err)
 		}
 	}()
 
