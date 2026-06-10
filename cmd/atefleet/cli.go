@@ -16,6 +16,7 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -33,6 +34,9 @@ import (
 // subcommands.
 var fleetAddr string
 
+// outputFmt is the persistent --output/-o flag (table|json) for ls/get.
+var outputFmt string
+
 // newRootCmd builds the atefleet cobra root command. It owns the persistent
 // --fleet-addr flag used by the client subcommands to dial the FleetManager.
 func newRootCmd() *cobra.Command {
@@ -42,6 +46,7 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage: true,
 	}
 	cmd.PersistentFlags().StringVar(&fleetAddr, "fleet-addr", "atefleet.ate-system.svc:443", "Address of the atefleet FleetManager gRPC service.")
+	cmd.PersistentFlags().StringVarP(&outputFmt, "output", "o", "table", "Output format for ls/get: table|json")
 	return cmd
 }
 
@@ -236,6 +241,30 @@ func printFleetActor(a *atefleetpb.FleetActor) error {
 // printFleetTable prints fleet actors as a tab-aligned table, mirroring the
 // kubectl-ate table style.
 func printFleetTable(actors []*atefleetpb.FleetActor) error {
+	if outputFmt == "json" {
+		type jsonActor struct {
+			ActorID    string `json:"actor_id"`
+			Status     string `json:"status"`
+			Role       string `json:"role"`
+			Owner      string `json:"owner"`
+			Group      string `json:"group"`
+			ExpiryUnix int64  `json:"expiry_unix"`
+			Address    string `json:"address"`
+		}
+		out := make([]jsonActor, 0, len(actors))
+		for _, a := range actors {
+			if a == nil {
+				continue
+			}
+			out = append(out, jsonActor{
+				ActorID: a.GetActorId(), Status: a.GetStatus(), Role: a.GetRole(),
+				Owner: a.GetOwner(), Group: a.GetGroup(), ExpiryUnix: a.GetExpiryUnix(), Address: a.GetAddress(),
+			})
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	fmt.Fprintln(w, "ID\tSTATUS\tROLE\tOWNER\tGROUP\tADDRESS")
 	for _, a := range actors {
