@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>atefleet — live fleet dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --font:'Sora',system-ui,sans-serif; --mono:'JetBrains Mono','SF Mono',monospace;
+    --bg:#0a0e16; --surface:#121a28; --surface2:#16203049; --border:#22304a;
+    --text:#e6edf7; --dim:#7f8ea8; --faint:#4a5b78;
+    --running:#34d399; --suspended:#fbbf24; --other:#64748b;
+    --fleet:#c084fc; --ctrl:#38bdf8; --exec:#34d399; --valkey:#fb7185; --bad:#f87171;
+    --glow:0 0 0 1px var(--border),0 8px 30px -10px #000;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:radial-gradient(ellipse at 12% -10%,#13203a 0%,transparent 55%),radial-gradient(ellipse at 92% 0%,#2a1330 0%,transparent 45%),var(--bg);color:var(--text);font-family:var(--font);padding:24px 28px;min-height:100vh}
+  .top{display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+  h1{font-size:25px;font-weight:700;letter-spacing:-.5px}
+  h1 .sub{font-family:var(--mono);font-size:12px;color:var(--dim);font-weight:400;margin-left:8px}
+  .live{font-family:var(--mono);font-size:11px;color:var(--running);display:flex;align-items:center;gap:7px}
+  .live .pulse{width:9px;height:9px;border-radius:50%;background:var(--running);animation:pulse 1.6s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 #34d39988}70%{box-shadow:0 0 0 7px #34d39900}100%{box-shadow:0 0 0 0 #34d39900}}
+
+  .flow{display:flex;align-items:center;gap:0;flex-wrap:wrap;background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:13px 16px;margin-bottom:14px;box-shadow:var(--glow)}
+  .fnode{font-family:var(--mono);font-size:12px;padding:7px 11px;border-radius:9px;border:1px solid var(--border);background:#0d1422;white-space:nowrap}
+  .fnode b{font-family:var(--font);font-weight:600}
+  .fnode.af{border-color:var(--fleet);color:#e9d5ff} .fnode.api{border-color:var(--ctrl);color:#bae6fd} .fnode.vk{border-color:var(--valkey);color:#fecdd3} .fnode.act{border-color:var(--exec);color:#bbf7d0}
+  .farr{color:var(--faint);font-family:var(--mono);font-size:13px;padding:0 9px}
+  .flow .lbl{font-family:var(--mono);font-size:10px;color:var(--faint);margin-left:auto;max-width:340px;text-align:right}
+
+  .kpis{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+  .kpi{flex:1;min-width:120px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 15px;box-shadow:var(--glow)}
+  .kpi .n{font-family:var(--mono);font-size:26px;font-weight:700;line-height:1}
+  .kpi .l{font-family:var(--mono);font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:1px;margin-top:6px}
+
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:13px;box-shadow:var(--glow);overflow:hidden;margin-bottom:14px}
+  .panel-h{display:flex;align-items:center;justify-content:space-between;padding:12px 15px;border-bottom:1px solid var(--border)}
+  .panel-h .t{font-size:14px;font-weight:600}
+  .panel-h .t .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;vertical-align:middle}
+  .panel-h .prov{font-family:var(--mono);font-size:10px;color:var(--faint)}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  thead th{text-align:left;font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--faint);padding:9px 15px;font-weight:500}
+  thead th.vk{color:var(--valkey)} thead th.api{color:var(--ctrl)}
+  tbody td{padding:10px 15px;border-top:1px solid var(--surface2);vertical-align:middle}
+  tbody tr:hover{background:#0d1422}
+  tbody tr.enter{animation:rowin .6s ease}
+  @keyframes rowin{from{background:#1c2c1c}to{background:transparent}}
+  .id{font-family:var(--mono);font-weight:700;color:#fff}
+  .st{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px}
+  .st .d{width:8px;height:8px;border-radius:50%}
+  .st.running{color:var(--running)} .st.running .d{background:var(--running);box-shadow:0 0 8px var(--running)}
+  .st.suspended{color:var(--suspended)} .st.suspended .d{background:var(--suspended)}
+  .st.other{color:var(--other)} .st.other .d{background:var(--other)}
+  .tag{font-family:var(--mono);font-size:11px}
+  .tag.role{color:#c4b5fd} .tag.owner{color:#7dd3fc} .tag.group{color:#fda4af}
+  .addr{font-family:var(--mono);font-size:10px;color:var(--faint)}
+  .ttl{font-family:var(--mono);font-size:11px;color:var(--dim)}
+  .empty{padding:30px 15px;text-align:center;color:var(--faint);font-family:var(--mono);font-size:12px}
+
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:1000px){.cols{grid-template-columns:1fr}}
+
+  /* valkey index panel */
+  .vk-set{font-family:var(--mono);font-size:11px;color:var(--dim);padding:11px 15px;border-bottom:1px solid var(--border);background:#0d1422}
+  .vk-set .k{color:var(--valkey)} .vk-set .m{color:#fecdd3}
+  .vk-recs{padding:10px 12px;display:flex;flex-direction:column;gap:8px;max-height:50vh;overflow:auto}
+  .vk-rec{border:1px solid var(--border);border-radius:9px;background:#0d1422;overflow:hidden}
+  .vk-rec .key{font-family:var(--mono);font-size:11px;color:var(--valkey);padding:7px 11px;border-bottom:1px solid var(--surface2);background:#10131f}
+  .vk-rec pre{font-family:var(--mono);font-size:11px;color:#9fb3cf;padding:9px 12px;white-space:pre-wrap;word-break:break-word;margin:0}
+  .vk-rec .jk{color:#7f8ea8} .vk-rec .jv{color:#a5e8c8} .vk-rec .jn{color:#fbbf24}
+
+  /* runs */
+  .runs{max-height:50vh;overflow:auto;padding:10px 12px;display:flex;flex-direction:column;gap:9px}
+  .run{border:1px solid var(--border);border-radius:10px;background:#0d1422;padding:10px 12px;animation:rowin .5s ease}
+  .run-h{display:flex;align-items:center;gap:9px;margin-bottom:7px}
+  .run-cmd{font-family:var(--mono);font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .run-cmd .p{color:var(--exec)}
+  .code{font-family:var(--mono);font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px}
+  .code.ok{color:#052e16;background:var(--running)} .code.err{color:#2e0505;background:var(--bad)}
+  .gv{font-family:var(--mono);font-size:9px;color:#bbf7d0;border:1px solid var(--exec);border-radius:5px;padding:1px 5px;letter-spacing:.5px}
+  .out{font-family:var(--mono);font-size:11px;color:#9fb3cf;white-space:pre-wrap;word-break:break-word;background:#070b12;border-radius:7px;padding:8px 10px;max-height:110px;overflow:auto;border:1px solid #1a2438}
+  .out .err{color:#fca5a5}
+  .ago{font-family:var(--mono);font-size:10px;color:var(--faint)}
+  .foot{margin-top:6px;font-family:var(--mono);font-size:10px;color:var(--faint);text-align:center}
+</style>
+</head>
+<body>
+  <div class="top">
+    <h1>atefleet <span class="sub">live fleet dashboard · real data from the valkey index</span></h1>
+    <div class="live"><span class="pulse"></span><span id="livetxt">connecting…</span></div>
+  </div>
+
+  <div class="flow">
+    <span class="fnode">you / <b>Claude Code</b></span><span class="farr">─▶</span>
+    <span class="fnode af"><b>atefleet</b></span><span class="farr">─▶</span>
+    <span class="fnode api"><b>ateapi</b> <span style="color:var(--faint)">(status)</span></span>
+    <span class="farr">+</span>
+    <span class="fnode vk"><b>valkey index</b> <span style="color:var(--faint)">(metadata)</span></span><span class="farr">─▶</span>
+    <span class="fnode act"><b>gVisor actor</b></span>
+    <span class="lbl">metadata (role/owner/group/ttl) lives in atefleet's valkey index · state is read from ateapi</span>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="n" id="k-total">0</div><div class="l">actors in fleet</div></div>
+    <div class="kpi"><div class="n" id="k-run" style="color:var(--running)">0</div><div class="l">running</div></div>
+    <div class="kpi"><div class="n" id="k-susp" style="color:var(--suspended)">0</div><div class="l">suspended</div></div>
+    <div class="kpi"><div class="n" id="k-runs" style="color:var(--exec)">0</div><div class="l">sub-tasks run</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-h"><div class="t"><span class="dot" style="background:var(--fleet)"></span>Fleet</div>
+      <div class="prov"><span style="color:var(--valkey)">■</span> valkey index metadata &nbsp; <span style="color:var(--ctrl)">■</span> ateapi live state</div></div>
+    <table>
+      <thead><tr><th>id</th><th class="api">status</th><th class="vk">role</th><th class="vk">owner</th><th class="vk">group</th><th class="vk">ttl</th><th>address</th></tr></thead>
+      <tbody id="fleet-body"></tbody>
+    </table>
+    <div id="fleet-empty" class="empty">empty fleet — run <span style="color:var(--dim)">atefleet dispatch …</span></div>
+  </div>
+
+  <div class="cols">
+    <div class="panel">
+      <div class="panel-h"><div class="t"><span class="dot" style="background:var(--valkey)"></span>valkey index</div>
+        <div class="prov">SMEMBERS / GET on the live cluster</div></div>
+      <div class="vk-set" id="vk-set">— <span class="k">atefleet:actor-ids</span> empty</div>
+      <div class="vk-recs" id="vk-recs"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-h"><div class="t"><span class="dot" style="background:var(--exec)"></span>One-shot sub-task runs</div>
+        <div class="prov">atefleet run → ephemeral gVisor actor</div></div>
+      <div class="runs" id="runs-body"></div>
+      <div id="runs-empty" class="empty">no runs yet — <span style="color:var(--dim)">atefleet run --template … -- &lt;cmd&gt;</span></div>
+    </div>
+  </div>
+
+  <div class="foot">polls <span style="color:var(--dim)">fleet.json</span> + <span style="color:var(--dim)">runs.json</span> every 1.5s · fleet.json = <span style="color:var(--dim)">atefleet ls -o json</span> (SMEMBERS atefleet:actor-ids → GET atefleet:actor:&lt;id&gt; ⊕ ateapi status)</div>
+
+<script>
+  const $ = s => document.querySelector(s);
+  const seen = new Set();
+  function rel(e){ if(!e) return '—'; const d=e-Math.floor(Date.now()/1000); if(d<=0)return'expired'; if(d<90)return d+'s'; if(d<5400)return Math.round(d/60)+'m'; return Math.round(d/3600)+'h'; }
+  function stClass(s){ s=(s||'').toUpperCase(); if(s.includes('RUNNING'))return'running'; if(s.includes('SUSPEND'))return'suspended'; return'other'; }
+  function stShort(s){ return (s||'').replace('STATUS_',''); }
+  function esc(t){ const d=document.createElement('div'); d.textContent=t==null?'':String(t); return d.innerHTML; }
+  function ago(ts){ const d=Math.floor(Date.now()/1000)-ts; if(d<2)return'now'; if(d<60)return d+'s ago'; return Math.round(d/60)+'m ago'; }
+
+  function renderFleet(list){
+    $('#k-total').textContent=list.length;
+    $('#k-run').textContent=list.filter(a=>stClass(a.status)==='running').length;
+    $('#k-susp').textContent=list.filter(a=>stClass(a.status)==='suspended').length;
+    $('#fleet-empty').style.display=list.length?'none':'block';
+    $('#fleet-body').innerHTML=list.map(a=>{
+      const sc=stClass(a.status); const isNew=!seen.has(a.actor_id); seen.add(a.actor_id);
+      return `<tr class="${isNew?'enter':''}"><td class="id">${esc(a.actor_id)}</td>
+        <td><span class="st ${sc}"><span class="d"></span>${esc(stShort(a.status))}</span></td>
+        <td class="tag role">${esc(a.role||'—')}</td><td class="tag owner">${esc(a.owner||'—')}</td>
+        <td class="tag group">${esc(a.group||'—')}</td><td class="ttl">${rel(a.expiry_unix)}</td>
+        <td class="addr">${esc(a.address||'')}</td></tr>`;
+    }).join('');
+    const present=new Set(list.map(a=>a.actor_id)); [...seen].forEach(id=>{ if(!present.has(id)) seen.delete(id); });
+  }
+
+  function renderValkey(list){
+    $('#vk-set').innerHTML = list.length
+      ? `SET <span class="k">atefleet:actor-ids</span> → <span class="m">{ ${list.map(a=>esc(a.actor_id)).join(', ')} }</span>`
+      : `— <span class="k">atefleet:actor-ids</span> empty`;
+    $('#vk-recs').innerHTML = list.map(a=>{
+      // exactly the FleetMeta fields Index.Put serializes into valkey
+      const rec = {actor_id:a.actor_id, role:a.role||'', owner:a.owner||'', group:a.group||'', expiry_unix:a.expiry_unix||0};
+      const json = Object.entries(rec).map(([k,v])=>{
+        const val = typeof v==='number' ? `<span class="jn">${v}</span>` : `<span class="jv">"${esc(v)}"</span>`;
+        return `  <span class="jk">"${k}"</span>: ${val}`;
+      }).join(',\n');
+      return `<div class="vk-rec"><div class="key">GET atefleet:actor:${esc(a.actor_id)}</div><pre>{\n${json}\n}</pre></div>`;
+    }).join('');
+  }
+
+  function renderRuns(list){
+    $('#k-runs').textContent=list.length;
+    $('#runs-empty').style.display=list.length?'none':'block';
+    $('#runs-body').innerHTML=list.map(r=>{
+      const ok=r.exit_code===0; const gv=/gvisor|runsc/i.test(r.stdout||'');
+      let out=esc(r.stdout||''); if(r.stderr) out+=`<span class="err">${esc(r.stderr)}</span>`;
+      return `<div class="run"><div class="run-h"><span class="run-cmd"><span class="p">$</span> ${esc(r.command)}</span>
+        ${gv?'<span class="gv">gVisor ✓</span>':''}<span class="code ${ok?'ok':'err'}">exit ${esc(r.exit_code)}</span><span class="ago">${ago(r.ts)}</span></div>
+        ${out?`<div class="out">${out}</div>`:''}</div>`;
+    }).join('');
+  }
+
+  async function getJSON(u){ try{ const r=await fetch(u+'?_='+Date.now()); return r.ok? await r.json():null; }catch(e){ return null; } }
+  async function tick(){
+    const fleet=await getJSON('fleet.json'); const runs=await getJSON('runs.json');
+    if(fleet===null && runs===null){ $('#livetxt').textContent='waiting for demo data…'; return; }
+    $('#livetxt').textContent='live · '+new Date().toLocaleTimeString();
+    const f=Array.isArray(fleet)?fleet:[]; renderFleet(f); renderValkey(f); renderRuns(Array.isArray(runs)?runs:[]);
+  }
+  tick(); setInterval(tick,1500);
+</script>
+</body>
+</html>

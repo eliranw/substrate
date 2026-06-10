@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# arun — run a one-shot sub-task via `atefleet run` AND log it to the dashboard.
+# Same as `atefleet run --template <RUN_TEMPLATE> -- <cmd>`, but also appends the
+# result to $DEMO_DIR/runs.json so it shows in the dashboard's sub-task panel.
+#
+# Usage:  hack/poc/arun -- echo hello
+#         hack/poc/arun -- sh -c 'uname -a; id -u'
+#
+# ENV: ATEFLEET, FLEET_ADDR, RUN_TEMPLATE (default ate-demo-sandbox/sandbox-template),
+#      DEMO_DIR (default /tmp/atefleet-demo), RUN_TIMEOUT (default 30s)
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ATEFLEET="${ATEFLEET:-$ROOT/bin/atefleet}"
+FLEET_ADDR="${FLEET_ADDR:-localhost:18443}"
+RUN_TEMPLATE="${RUN_TEMPLATE:-ate-demo-sandbox/sandbox-template}"
+DEMO_DIR="${DEMO_DIR:-/tmp/atefleet-demo}"
+RUN_TIMEOUT="${RUN_TIMEOUT:-30s}"
+
+[ "${1:-}" = "--" ] && shift
+[ "$#" -gt 0 ] || { echo "usage: arun -- <cmd> [args...]" >&2; exit 2; }
+
+mkdir -p "$DEMO_DIR"
+if out=$("$ATEFLEET" --fleet-addr "$FLEET_ADDR" run --template "$RUN_TEMPLATE" --timeout "$RUN_TIMEOUT" -- "$@" 2>/tmp/arun.err); then code=0; else code=$?; fi
+err=$(cat /tmp/arun.err 2>/dev/null)
+printf '%s' "$out"
+[ -n "$err" ] && printf '%s\n' "$err" >&2
+
+python3 - "$DEMO_DIR/runs.json" "$*" "$out" "$err" "$code" <<'PY'
+import json, os, sys, time
+path, cmd, out, err, code = sys.argv[1:6]
+runs = []
+if os.path.exists(path):
+    try: runs = json.load(open(path))
+    except Exception: runs = []
+runs.insert(0, {"ts": int(time.time()), "command": cmd, "stdout": out, "stderr": err, "exit_code": int(code)})
+json.dump(runs[:25], open(path, "w"), indent=2)
+PY
+exit "$code"
