@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -26,13 +27,20 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 
+	"github.com/agent-substrate/substrate/cmd/atefleet/internal/axconfig"
+	"github.com/agent-substrate/substrate/cmd/atefleet/internal/fleet"
 	atefleetpb "github.com/agent-substrate/substrate/internal/proto/atefleetpb"
 )
 
 // fleetAddr is the persistent --fleet-addr flag value shared by the client
 // subcommands.
 var fleetAddr string
+
+// ownerFlag is the persistent --owner flag value used to assert the caller's
+// owner scope (overrides env/context).
+var ownerFlag string
 
 // outputFmt is the persistent --output/-o flag (table|json) for ls/get.
 var outputFmt string
@@ -45,20 +53,40 @@ func newRootCmd() *cobra.Command {
 		Short:        "Manage a fleet of Agent Substrate actors via the FleetManager",
 		SilenceUsage: true,
 	}
-	cmd.PersistentFlags().StringVar(&fleetAddr, "fleet-addr", "atefleet.ate-system.svc:443", "Address of the atefleet FleetManager gRPC service.")
+	cmd.PersistentFlags().StringVar(&fleetAddr, "fleet-addr", "", "FleetManager address (overrides env/context).")
+	cmd.PersistentFlags().StringVar(&ownerFlag, "owner", "", "Owner to assert (overrides env/context).")
 	cmd.PersistentFlags().StringVarP(&outputFmt, "output", "o", "table", "Output format for ls/get: table|json")
 	return cmd
 }
 
-// dialFleet dials the FleetManager service. It mirrors serve.go's ateapi dial
-// (TLS with InsecureSkipVerify) and returns the client plus a closer for the
+// ownerClientInterceptor returns a unary client interceptor that appends the
+// asserted owner to the outgoing gRPC metadata when non-empty.
+func ownerClientInterceptor(owner string) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if owner != "" {
+			ctx = metadata.AppendToOutgoingContext(ctx, fleet.OwnerMetadataKey, owner)
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+}
+
+// dialFleet resolves the FleetManager address and owner through axconfig
+// (flag > env > current context) and dials the service. It mirrors serve.go's
+// ateapi dial (TLS with InsecureSkipVerify), adds a client interceptor that
+// asserts the resolved owner, and returns the client plus a closer for the
 // underlying connection.
 func dialFleet() (atefleetpb.FleetManagerClient, func(), error) {
-	conn, err := grpc.NewClient(fleetAddr,
+	cfg, err := axconfig.Load()
+	if err != nil {
+		return nil, nil, err
+	}
+	addr, owner := cfg.Resolve(fleetAddr, ownerFlag)
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})),
+		grpc.WithUnaryInterceptor(ownerClientInterceptor(owner)),
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dial atefleet %q: %w", fleetAddr, err)
+		return nil, nil, fmt.Errorf("dial atefleet %q: %w", addr, err)
 	}
 	return atefleetpb.NewFleetManagerClient(conn), func() { _ = conn.Close() }, nil
 }
