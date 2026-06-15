@@ -26,7 +26,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	root := newRootCmd()
-	root.AddCommand(newServeCmd(), newDispatchCmd(), newRunCmd(), newLsCmd(), newGetCmd(), newRmCmd())
+	root.AddCommand(newServeCmd(), newDispatchCmd(), newRunCmd(), newLsCmd(), newGetCmd(), newRmCmd(), newCtxCmd())
 	if err := root.ExecuteContext(ctx); err != nil {
 		slog.Error("atefleet", "err", err)
 		os.Exit(1)
