@@ -41,6 +41,7 @@ func newServeCmd() *cobra.Command {
 	var listen, ateapiAddr, redisAddr, serverCredBundle string
 	var redisCACerts, redisTLSServerName, redisClientCert string
 	var reapEvery time.Duration
+	var requireOwner bool
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the atefleet FleetManager gRPC service",
@@ -118,6 +119,7 @@ func newServeCmd() *cobra.Command {
 			g := grpc.NewServer(
 				grpc.Creds(serverCreds),
 				grpc.StatsHandler(otelgrpc.NewServerHandler()),
+				grpc.ChainUnaryInterceptor(fleet.OwnerUnaryInterceptor(requireOwner)),
 			)
 			atefleetpb.RegisterFleetManagerServer(g, srv)
 			slog.InfoContext(ctx, "atefleet serving", "addr", listen)
@@ -132,6 +134,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&redisTLSServerName, "redis-tls-server-name", "", "The ServerName to use for Redis TLS hostname verification.")
 	cmd.Flags().StringVar(&redisClientCert, "redis-client-cert", "", "The file containing the client TLS certificate/key credential bundle for Redis/Valkey.")
 	cmd.Flags().DurationVar(&reapEvery, "reap-interval", 30*time.Second, "How often the TTL/stale reaper runs.")
+	cmd.Flags().BoolVar(&requireOwner, "require-owner", false, "Reject calls that do not assert an x-atefleet-owner (scoped mode).")
 	return cmd
 }
 
