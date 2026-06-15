@@ -25,6 +25,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	atefleetpb "github.com/agent-substrate/substrate/internal/proto/atefleetpb"
@@ -467,5 +468,53 @@ func TestRunSubtaskInvalidArgs(t *testing.T) {
 	// empty command
 	if _, err := s.RunSubtask(ctx, &atefleetpb.RunSubtaskRequest{ActorTemplateNamespace: "ns", ActorTemplateName: "t"}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("empty command: want InvalidArgument, got %v (%v)", status.Code(err), err)
+	}
+}
+
+func scoped(owner string) context.Context {
+	return metadata.NewIncomingContext(context.Background(), metadata.Pairs(OwnerMetadataKey, owner))
+}
+
+func TestScope_DispatchStampsOwnerAndListFilters(t *testing.T) {
+	s, _, _ := newTestServer(t)
+	// alice dispatches (request owner "bogus" must be overridden to "alice")
+	if _, err := s.DispatchActor(scoped("alice"), &atefleetpb.DispatchActorRequest{
+		ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1", Owner: "bogus",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DispatchActor(scoped("bob"), &atefleetpb.DispatchActorRequest{
+		ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "b1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// alice's index entry is stamped owner=alice
+	m, _ := s.idx.Get(context.Background(), "a1")
+	if m.Owner != "alice" {
+		t.Fatalf("want owner alice, got %q", m.Owner)
+	}
+	// alice's ls sees only a1
+	resp, err := s.ListFleet(scoped("alice"), &atefleetpb.ListFleetRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.GetActors()) != 1 || resp.GetActors()[0].GetActorId() != "a1" {
+		t.Fatalf("alice ls = %+v", resp.GetActors())
+	}
+}
+
+func TestScope_GetAndRmCrossOwnerNotFound(t *testing.T) {
+	s, fc, _ := newTestServer(t)
+	s.DispatchActor(scoped("alice"), &atefleetpb.DispatchActorRequest{ActorTemplateNamespace: "ns", ActorTemplateName: "t", ActorId: "a1"})
+	// bob cannot get alice's actor
+	if _, err := s.GetFleetActor(scoped("bob"), &atefleetpb.GetFleetActorRequest{ActorId: "a1"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("want NotFound, got %v", err)
+	}
+	// bob cannot rm alice's actor (and DeleteActor must NOT be called)
+	if _, err := s.TerminateActor(scoped("bob"), &atefleetpb.TerminateActorRequest{ActorId: "a1"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("want NotFound, got %v", err)
+	}
+	if len(fc.deleted) != 0 {
+		t.Fatalf("DeleteActor should not be called cross-owner: %v", fc.deleted)
 	}
 }

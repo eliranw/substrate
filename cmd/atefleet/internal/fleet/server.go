@@ -77,8 +77,12 @@ func (s *Server) DispatchActor(ctx context.Context, r *atefleetpb.DispatchActorR
 	if r.GetTtlSeconds() > 0 {
 		expiry = s.now() + r.GetTtlSeconds()
 	}
+	owner := r.GetOwner()
+	if scope := ownerFromCtx(ctx); scope != "" {
+		owner = scope
+	}
 	meta := FleetMeta{
-		ActorID: r.GetActorId(), Role: r.GetRole(), Owner: r.GetOwner(), Group: r.GetGroup(),
+		ActorID: r.GetActorId(), Role: r.GetRole(), Owner: owner, Group: r.GetGroup(),
 		ExpiryUnix: expiry, TemplateNamespace: r.GetActorTemplateNamespace(), TemplateName: r.GetActorTemplateName(),
 	}
 	if err := s.idx.Put(ctx, meta); err != nil {
@@ -102,12 +106,17 @@ func (s *Server) ListFleet(ctx context.Context, r *atefleetpb.ListFleetRequest) 
 		stByID[a.GetActorId()] = a.GetStatus()
 	}
 
+	wantOwner := r.GetOwner()
+	if scope := ownerFromCtx(ctx); scope != "" {
+		wantOwner = scope
+	}
+
 	out := &atefleetpb.ListFleetResponse{}
 	for _, m := range metas {
 		if r.GetRole() != "" && m.Role != r.GetRole() {
 			continue
 		}
-		if r.GetOwner() != "" && m.Owner != r.GetOwner() {
+		if wantOwner != "" && m.Owner != wantOwner {
 			continue
 		}
 		if r.GetGroup() != "" && m.Group != r.GetGroup() {
@@ -131,6 +140,9 @@ func (s *Server) GetFleetActor(ctx context.Context, r *atefleetpb.GetFleetActorR
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "get index: %v", err)
 	}
+	if scope := ownerFromCtx(ctx); scope != "" && m.Owner != scope {
+		return nil, status.Error(codes.NotFound, "actor not in fleet")
+	}
 	ga, err := s.api.GetActor(ctx, &ateapipb.GetActorRequest{ActorId: r.GetActorId()})
 	if err != nil {
 		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
@@ -144,6 +156,15 @@ func (s *Server) GetFleetActor(ctx context.Context, r *atefleetpb.GetFleetActorR
 }
 
 func (s *Server) TerminateActor(ctx context.Context, r *atefleetpb.TerminateActorRequest) (*atefleetpb.TerminateActorResponse, error) {
+	if scope := ownerFromCtx(ctx); scope != "" {
+		m, err := s.idx.Get(ctx, r.GetActorId())
+		if err == ErrNotFound || (err == nil && m.Owner != scope) {
+			return nil, status.Error(codes.NotFound, "actor not in fleet")
+		}
+		if err != nil && err != ErrNotFound {
+			return nil, status.Errorf(codes.Internal, "get index: %v", err)
+		}
+	}
 	// ateapi.DeleteActor only deletes suspended actors; MVP surfaces that error.
 	// Preserve the downstream gRPC code (NotFound, FailedPrecondition, InvalidArgument,
 	// Aborted) so callers see the real reason instead of an opaque Internal.
@@ -172,10 +193,15 @@ func (s *Server) RunSubtask(ctx context.Context, r *atefleetpb.RunSubtaskRequest
 
 	id := newSubtaskID()
 
+	owner := r.GetOwner()
+	if scope := ownerFromCtx(ctx); scope != "" {
+		owner = scope
+	}
+
 	// Index a backstop entry first so a crash anywhere below still lets the
 	// reaper clean the actor up once the backstop TTL elapses.
 	meta := FleetMeta{
-		ActorID: id, Role: "subtask", Owner: r.GetOwner(), Group: r.GetGroup(),
+		ActorID: id, Role: "subtask", Owner: owner, Group: r.GetGroup(),
 		ExpiryUnix:        s.now() + subtaskBackstopTTL,
 		TemplateNamespace: r.GetActorTemplateNamespace(), TemplateName: r.GetActorTemplateName(),
 	}
