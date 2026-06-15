@@ -44,6 +44,10 @@ func TestReapOnce(t *testing.T) {
 	if len(fc.deleted) != 1 || fc.deleted[0] != "old" {
 		t.Fatalf("deleted %v (want [old])", fc.deleted)
 	}
+	// The expired actor is running; the reaper must suspend it before delete.
+	if len(fc.suspended) != 1 || fc.suspended[0] != "old" {
+		t.Fatalf("suspended %v (want [old] before delete)", fc.suspended)
+	}
 	if _, err := s.idx.Get(ctx, "old"); err != ErrNotFound {
 		t.Fatal("old index not cleared")
 	}

@@ -165,7 +165,13 @@ func (s *Server) TerminateActor(ctx context.Context, r *atefleetpb.TerminateActo
 			return nil, status.Errorf(codes.Internal, "get index: %v", err)
 		}
 	}
-	// ateapi.DeleteActor only deletes suspended actors; MVP surfaces that error.
+	// ateapi.DeleteActor only deletes suspended actors, but dispatched actors are
+	// resumed (running), so suspend first. Suspend is best-effort: an already-
+	// suspended actor (or a benign suspend hiccup) must not block delete, and the
+	// DeleteActor below still surfaces the real precondition if it stays running.
+	if _, err := s.api.SuspendActor(ctx, &ateapipb.SuspendActorRequest{ActorId: r.GetActorId()}); err != nil {
+		slog.WarnContext(ctx, "terminate: suspend failed (continuing to delete)", "actor", r.GetActorId(), "err", err)
+	}
 	// Preserve the downstream gRPC code (NotFound, FailedPrecondition, InvalidArgument,
 	// Aborted) so callers see the real reason instead of an opaque Internal.
 	if _, err := s.api.DeleteActor(ctx, &ateapipb.DeleteActorRequest{ActorId: r.GetActorId()}); err != nil {

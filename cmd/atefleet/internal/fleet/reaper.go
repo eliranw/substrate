@@ -76,6 +76,11 @@ func (r *Reaper) ReapOnce(ctx context.Context) error {
 			}
 			slog.InfoContext(ctx, "reaper: dropped stale index entry", "actor", m.ActorID)
 		case m.ExpiryUnix > 0 && now >= m.ExpiryUnix:
+			// Expired actors are running; ateapi.DeleteActor only deletes suspended
+			// actors, so suspend first (best-effort — delete surfaces any failure).
+			if _, err := r.api.SuspendActor(ctx, &ateapipb.SuspendActorRequest{ActorId: m.ActorID}); err != nil {
+				slog.WarnContext(ctx, "reaper: suspend expired actor failed (continuing to delete)", "actor", m.ActorID, "err", err)
+			}
 			if _, err := r.api.DeleteActor(ctx, &ateapipb.DeleteActorRequest{ActorId: m.ActorID}); err != nil {
 				slog.WarnContext(ctx, "reaper: delete expired actor failed", "actor", m.ActorID, "err", err)
 				continue // keep index; retry next tick

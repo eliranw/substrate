@@ -115,6 +115,14 @@ func (f *fakeControl) DeleteActor(_ context.Context, in *ateapipb.DeleteActorReq
 	if f.deleteErr != nil {
 		return nil, f.deleteErr
 	}
+	// Faithful to ateapi.DeleteActor: a running (not suspended) actor cannot be
+	// deleted and surfaces FailedPrecondition. The earlier lenient fake hid the
+	// bug where TerminateActor/the reaper deleted without suspending first.
+	for _, a := range f.actors {
+		if a.ActorId == in.GetActorId() && a.Status != ateapipb.Actor_STATUS_SUSPENDED {
+			return nil, status.Errorf(codes.FailedPrecondition, "Actor %s is not suspended (status: %v)", in.GetActorId(), a.Status)
+		}
+	}
 	f.deleted = append(f.deleted, in.GetActorId())
 	kept := f.actors[:0]
 	for _, a := range f.actors {
@@ -369,6 +377,10 @@ func TestTerminateActor(t *testing.T) {
 	}
 	if len(fc.deleted) != 1 || fc.deleted[0] != "a1" {
 		t.Fatalf("deleted %v", fc.deleted)
+	}
+	// A dispatched actor is running; terminate must suspend it before delete.
+	if len(fc.suspended) != 1 || fc.suspended[0] != "a1" {
+		t.Fatalf("suspended %v (want [a1] before delete)", fc.suspended)
 	}
 	if _, err := s.idx.Get(ctx, "a1"); err != ErrNotFound {
 		t.Fatal("index entry should be gone")
