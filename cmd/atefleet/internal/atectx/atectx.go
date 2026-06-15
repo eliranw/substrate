@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package axconfig is atefleet's kubeconfig-style context config: named
+// Package atectx is atefleet's kubeconfig-style context config: named
 // contexts each asserting a fleet-addr and owner, with flag>env>context>default
 // resolution.
-package axconfig
+package atectx
 
 import (
 	"fmt"

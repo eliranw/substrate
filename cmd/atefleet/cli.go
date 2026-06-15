@@ -29,7 +29,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 
-	"github.com/agent-substrate/substrate/cmd/atefleet/internal/axconfig"
+	"github.com/agent-substrate/substrate/cmd/atefleet/internal/atectx"
 	"github.com/agent-substrate/substrate/cmd/atefleet/internal/fleet"
 	atefleetpb "github.com/agent-substrate/substrate/internal/proto/atefleetpb"
 )
@@ -70,13 +70,13 @@ func ownerClientInterceptor(owner string) grpc.UnaryClientInterceptor {
 	}
 }
 
-// dialFleet resolves the FleetManager address and owner through axconfig
+// dialFleet resolves the FleetManager address and owner through atectx
 // (flag > env > current context) and dials the service. It mirrors serve.go's
 // ateapi dial (TLS with InsecureSkipVerify), adds a client interceptor that
 // asserts the resolved owner, and returns the client plus a closer for the
 // underlying connection.
 func dialFleet() (atefleetpb.FleetManagerClient, func(), error) {
-	cfg, err := axconfig.Load()
+	cfg, err := atectx.Load()
 	if err != nil {
 		return nil, nil, err
 	}

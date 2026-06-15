@@ -21,7 +21,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/agent-substrate/substrate/cmd/atefleet/internal/axconfig"
+	"github.com/agent-substrate/substrate/cmd/atefleet/internal/atectx"
 )
 
 func newCtxCmd() *cobra.Command {
@@ -36,7 +36,7 @@ func newCtxListCmd() *cobra.Command {
 }
 
 func runCtxList() error {
-	cfg, err := axconfig.Load()
+	cfg, err := atectx.Load()
 	if err != nil {
 		return err
 	}
@@ -56,7 +56,7 @@ func newCtxUseCmd() *cobra.Command {
 	return &cobra.Command{
 		Use: "use <name>", Short: "Set the current context", Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			cfg, err := axconfig.Load()
+			cfg, err := atectx.Load()
 			if err != nil {
 				return err
 			}
@@ -74,11 +74,11 @@ func newCtxSetCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use: "set <name>", Short: "Add or update a context", Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			cfg, err := axconfig.Load()
+			cfg, err := atectx.Load()
 			if err != nil {
 				return err
 			}
-			if err := cfg.Set(axconfig.Context{Name: args[0], FleetAddr: addr, Owner: owner}); err != nil {
+			if err := cfg.Set(atectx.Context{Name: args[0], FleetAddr: addr, Owner: owner}); err != nil {
 				return err
 			}
 			fmt.Printf("context %q set\n", args[0])
