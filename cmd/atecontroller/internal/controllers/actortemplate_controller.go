@@ -22,7 +22,6 @@ import (
 	"github.com/agent-substrate/substrate/internal/resources"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
@@ -80,7 +79,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	switch at.Status.Phase {
 	case atev1alpha1.PhaseInitial:
-		actorID := uuid.NewString()
+		actorName := string(at.UID)
 
 		// Golden actors live in the reserved ate-golden system atespace.
 		_, err := r.AteClient.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{
@@ -98,19 +97,19 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			Actor: &ateapipb.Actor{
 				Metadata: &ateapipb.ResourceMetadata{
 					Atespace: resources.GoldenActorAtespace,
-					Name:     actorID,
+					Name:     actorName,
 				},
 				ActorTemplateNamespace: at.ObjectMeta.Namespace,
 				ActorTemplateName:      at.ObjectMeta.Name,
 			},
 		}
 		_, err = r.AteClient.CreateActor(ctx, createReq)
-		if err != nil {
+		if err != nil && status.Code(err) != codes.AlreadyExists {
 			return ctrl.Result{}, fmt.Errorf("while creating golden actor: %w", err)
 		}
 
 		at.Status.Phase = atev1alpha1.PhaseResumeGoldenActor
-		at.Status.GoldenActorID = actorID
+		at.Status.GoldenActorID = actorName
 		if err := r.Status().Update(ctx, at); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -162,12 +161,13 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, fmt.Errorf("while suspending golden actor: %w", err)
 		}
 
-		if resp.GetActor().GetLatestSnapshotInfo().GetExternal() == nil {
-			return ctrl.Result{}, fmt.Errorf("unexpected snapshot type for golden actor: %T", resp.GetActor().GetLatestSnapshotInfo().GetData())
+		snapshot := resp.GetActor().GetLatestSnapshot()
+		if snapshot == nil {
+			return ctrl.Result{}, fmt.Errorf("suspending golden actor returned no ActorSnapshot")
 		}
 
 		// Transition to PhaseReady
-		at.Status.GoldenSnapshot = resp.GetActor().GetLatestSnapshotInfo().GetExternal().SnapshotUriPrefix
+		at.Status.GoldenSnapshot = snapshot.GetName()
 		at.Status.Phase = atev1alpha1.PhaseReady
 		meta.SetStatusCondition(&at.Status.Conditions, metav1.Condition{
 			Type:    "Ready",

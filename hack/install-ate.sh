@@ -42,8 +42,9 @@ ATE_DEMOS=()
 source "${ROOT}"/hack/install-demo-counter.sh
 source "${ROOT}"/hack/install-demo-sandbox.sh
 source "${ROOT}"/hack/install-demo-claude-code-multiplex.sh
-source "${ROOT}"/hack/install-demo-agent-secret.sh
 source "${ROOT}"/hack/install-demo-multi-template.sh
+source "${ROOT}"/hack/install-demo-parking.sh
+source "${ROOT}"/hack/install-demo-autoscaled-workerpool.sh
 
 # ANSI color codes for prettier output
 COLOR_CYAN='\033[1;36m'
@@ -61,9 +62,11 @@ function usage() {
   echo "Overall infrastructure (all infrastructure components):"
   echo ""
   echo "  --deploy-ate-system                    Deploy core system (CRDs, atelet, apiserver)"
+  echo "  --setup-csi                            Setup CSI hostpath and NFS drivers (Kind only)"
   echo "  --delete-ate-system                    Delete core system"
   echo "  --delete-all                           Delete core system and all registered demos"
-  echo "  --auth-mode=mtls|jwt                   Select ateapi auth mode for --deploy-ate-system (default: mtls)"
+  echo "  --ateapi-client-auth=cert|token        Select how in-cluster clients authenticate to ateapi for --deploy-ate-system (default: cert; the server always accepts both)"
+  echo "  --atenet-router=envoy|agentgateway     Select the atenet router dataplane (default: envoy)"
   echo ""
   echo "Infrastructure components:"
   echo ""
@@ -75,7 +78,7 @@ function usage() {
   echo "called automatically by --deploy-ate-system):"
   echo ""
   echo "  --create-jwt-authority-pool-secret     Create JWT authority pool secret"
-  echo "  --create-session-id-ca-pool-secret     Create session ID CA pool secret"
+  echo "  --create-actor-id-ca-pool-secret       Create actor ID CA pool secret"
   echo "  --create-podcertificate-controller-cas Create podcertificate controller CAs"
   echo "  --create-valkey-ca-certs-secret        Create Valkey CA certs secret"
   echo "  --create-api-server-env-vars           Create ate-api-server env vars"
@@ -112,10 +115,9 @@ run_kubectl_ate() {
 run_ko() {
   # Build up a set of ldflags to pass to ko.
   local ldflags=()
-  mapfile -t ldflags < <(make ldflags)
-  for i in "${!ldflags[@]}"; do
-    ldflags[i]="--ldflags=${ldflags[i]}"
-  done
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line}" ]] && ldflags+=("--ldflags=${line}")
+  done < <(make ldflags)
 
   # Only ko subcommands that delegate to kubectl (apply, create, delete, run)
   # accept args after `--`. ko build, resolve, deps, login etc. reject
@@ -133,26 +135,55 @@ run_ko() {
   esac
 }
 
-ate_auth_mode() {
-  case "${ATE_API_AUTH_MODE:-mtls}" in
-    mtls|jwt)
-      echo "${ATE_API_AUTH_MODE:-mtls}"
+ateapi_client_auth() {
+  case "${ATE_ATEAPI_CLIENT_AUTH:-cert}" in
+    cert|token)
+      echo "${ATE_ATEAPI_CLIENT_AUTH:-cert}"
       ;;
     *)
-      echo "Error: ATE_API_AUTH_MODE must be mtls or jwt, got '${ATE_API_AUTH_MODE}'" >&2
+      echo "Error: ATE_ATEAPI_CLIENT_AUTH must be cert or token, got '${ATE_ATEAPI_CLIENT_AUTH}'" >&2
+      exit 1
+      ;;
+  esac
+}
+
+atenet_router() {
+  case "${ATE_ATENET_ROUTER:-envoy}" in
+    envoy|agentgateway)
+      echo "${ATE_ATENET_ROUTER:-envoy}"
+      ;;
+    *)
+      echo "Error: --atenet-router must be envoy or agentgateway, got '${ATE_ATENET_ROUTER}'" >&2
       exit 1
       ;;
   esac
 }
 
 render_ate_system_manifests() {
-  local auth_mode=""
-  auth_mode="$(ate_auth_mode)"
+  local client_auth=""
+  local router=""
+  client_auth="$(ateapi_client_auth)"
+  router="$(atenet_router)"
 
-  if [[ "${auth_mode}" == "jwt" ]]; then
-    local overlay="manifests/ate-install/jwt"
+  if [[ "${router}" == "agentgateway" ]]; then
+    local overlay="manifests/ate-install/agentgateway"
+    if [[ "${client_auth}" == "token" ]]; then
+      overlay="manifests/ate-install/agentgateway-token-client"
+    fi
     if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
-      overlay="manifests/ate-install/kind-jwt"
+      overlay="manifests/ate-install/kind-agentgateway"
+      if [[ "${client_auth}" == "token" ]]; then
+        overlay="manifests/ate-install/kind-agentgateway-token-client"
+      fi
+    fi
+    kubectl kustomize "${overlay}" --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+    return
+  fi
+
+  if [[ "${client_auth}" == "token" ]]; then
+    local overlay="manifests/ate-install/token-client"
+    if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+      overlay="manifests/ate-install/kind-token-client"
     fi
     kubectl kustomize "${overlay}" --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
     return
@@ -167,17 +198,59 @@ render_ate_system_manifests() {
   fi
 }
 
-create_valkey_ca_certs_secret() {
-  log_step "create_valkey_ca_certs_secret"
-  local ca_certs=""
-  # Extract from in-cluster service-dns-ca-pool secret (base64 json)
+render_atenet_router_manifest() {
+  if [[ "$(atenet_router)" == "agentgateway" ]]; then
+    kubectl kustomize manifests/ate-install/agentgateway-router \
+      --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+  else
+    run_ko resolve -f manifests/ate-install/atenet-router.yaml
+  fi
+}
+
+# Apply the ate-otel-config ConfigMap that every control plane component reads
+# via envFrom. The full install gets it through render_ate_system_manifests, but
+# the targeted single-component redeploys below apply raw manifests with no
+# Kustomize, so they have to select the environment's copy themselves. Applying
+# the base file unconditionally would overwrite a kind cluster's ConfigMap with
+# the GKE endpoint and silently break telemetry for every component at once.
+apply_otel_config() {
+  if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+    run_kubectl apply -f manifests/ate-install/kind/ate-otel-config.yaml
+  else
+    run_kubectl apply -f manifests/ate-install/ate-otel-config.yaml
+  fi
+}
+
+# Extract a CA pool secret's RootCertificateDER and emit it as a PEM certificate.
+ca_pool_root_pem() {
+  local secret="$1"
   local pool_json=""
-  pool_json=$(run_kubectl get secret -n podcertificate-controller-system service-dns-ca-pool -o jsonpath='{.data.pool}' | base64 --decode)
-  # Extract RootCertificateDER base64 string
+  pool_json=$(run_kubectl get secret -n podcertificate-controller-system "${secret}" -o jsonpath='{.data.pool}' | base64 --decode)
   local der_base64=""
   der_base64=$(echo "${pool_json}" | grep -o '"RootCertificateDER":"[^"]*' | sed 's/"RootCertificateDER":"//')
-  # Convert DER to PEM certificate
-  ca_certs=$(echo "${der_base64}" | base64 --decode | openssl x509 -inform der -outform pem)
+  echo "${der_base64}" | base64 --decode | openssl x509 -inform der -outform pem
+}
+
+create_valkey_ca_certs_secret() {
+  log_step "create_valkey_ca_certs_secret"
+  # valkey requires a single tls-ca-cert-file to verify client and server certs it sees,
+  # so it needs both CAs:
+  #   - servicedns CA: verifies valkey peers' server certs.
+  #   - podidentity CA: verifies the client certs that connect to valkey
+  #     (apiserver, the init job, and peers acting as clients).
+  # Extract each root into its own variable: errexit cannot see a substitution
+  # failing inside printf's argument list, which would silently produce a CA
+  # file with a missing root.
+  local servicedns_root=""
+  servicedns_root=$(ca_pool_root_pem service-dns-ca-pool)
+  local podidentity_root=""
+  podidentity_root=$(ca_pool_root_pem pod-identity-ca-pool)
+  if [[ -z "${servicedns_root}" || -z "${podidentity_root}" ]]; then
+    echo "error: failed to extract a CA root for valkey-ca-certs" >&2
+    return 1
+  fi
+  local ca_certs=""
+  ca_certs=$(printf '%s\n%s\n' "${servicedns_root}" "${podidentity_root}")
 
   run_kubectl create secret generic valkey-ca-certs \
     --from-literal=ca.crt="${ca_certs}" \
@@ -190,15 +263,15 @@ create_jwt_authority_pool_secret() {
   log_step "create_jwt_authority_pool_secret"
   run_kubectl_ate admin make-jwt-pool \
     --key-id="1" \
-    --name="session-id-jwt-pool" \
+    --name="actor-id-jwt-pool" \
     --secret-namespace=ate-system
 }
 
-create_session_id_ca_pool_secret() {
-  log_step "create_session_id_ca_pool_secret"
+create_actor_id_ca_pool_secret() {
+  log_step "create_actor_id_ca_pool_secret"
   run_kubectl_ate admin make-ca-pool \
     --ca-id="1" \
-    --name="session-id-ca-pool" \
+    --name="actor-id-ca-pool" \
     --secret-namespace=ate-system
 }
 
@@ -227,7 +300,9 @@ create_api_server_env_vars() {
   redis_address="valkey-cluster.ate-system.svc:6379"
   use_iam_auth="false"
   tls_server_name="valkey-cluster.ate-system.svc"
-  client_cert="/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+  # The apiserver dials valkey as a client, so it presents a podidentity
+  # (SPIFFE) client cert rather than a servicedns serving cert.
+  client_cert="/run/podidentity.podcert.ate.dev/credential-bundle.pem"
 
   echo "REDIS_ADDRESS: ${redis_address}"
 
@@ -265,9 +340,25 @@ deploy_crds() {
   run_ko apply -f manifests/ate-install/generated
 }
 
+setup_csi() {
+  log_step "setup_csi"
+  "${ROOT}/hack/setup-csi-hostpath-kind.sh"
+  "${ROOT}/hack/setup-csi-nfs-kind.sh"
+}
+
 deploy_ate_system() {
   log_step "deploy_ate_system"
-  ensure_crds
+  # Not ensure_crds: its existence check skips upgrades, stranding stale CRD
+  # schemas and RBAC (role.yaml has no other apply path).
+  deploy_crds
+
+  if [[ "${SETUP_CSI:-false}" == "true" ]]; then
+    if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+      setup_csi
+    else
+      echo "Warning: CSI setup is only supported for Kind local installations. Skipping."
+    fi
+  fi
 
   # Enforce per-class SandboxConfig asset requirements (applied before any
   # SandboxConfig so the defaults below are validated too).
@@ -282,6 +373,14 @@ deploy_ate_system() {
   # Ensure namespace exists
   run_kubectl apply -f manifests/ate-install/ate-system-namespace.yaml \
     && run_kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/ate-system --timeout=60s
+
+  # Ahead of the bundle below, for the same reason as the namespace: every
+  # workload pulls this ConfigMap in via envFrom, and a container whose envFrom
+  # target is missing will not start. The bundle contains it, but a raw
+  # directory apply orders by filename, so ate-api-server.yaml and
+  # ate-controller.yaml would otherwise be created before it and sit in
+  # CreateContainerConfigError until it caught up.
+  apply_otel_config
 
   ensure_apiserver_prerequisites
 
@@ -313,10 +412,10 @@ deploy_ate_system() {
 # Ensure secrets and configmaps required by ate-apiserver
 ensure_apiserver_prerequisites() {
   log_step "ensure_apiserver_prerequisites"
-  run_kubectl get secret -n ate-system session-id-jwt-pool >/dev/null 2>&1 \
+  run_kubectl get secret -n ate-system actor-id-jwt-pool >/dev/null 2>&1 \
     || create_jwt_authority_pool_secret
-  run_kubectl get secret -n ate-system session-id-ca-pool >/dev/null 2>&1 \
-    || create_session_id_ca_pool_secret
+  run_kubectl get secret -n ate-system actor-id-ca-pool >/dev/null 2>&1 \
+    || create_actor_id_ca_pool_secret
   run_kubectl get secret -n podcertificate-controller-system service-dns-ca-pool >/dev/null 2>&1 \
     || create_podcertificate_controller_cas
   run_kubectl get secret -n ate-system valkey-ca-certs >/dev/null 2>&1 \
@@ -335,6 +434,7 @@ deploy_ate_apiserver() {
     && run_kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/ate-system --timeout=60s
 
   ensure_apiserver_prerequisites
+  apply_otel_config
 
   run_ko apply -f manifests/ate-install/ate-api-server.yaml
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
@@ -347,6 +447,8 @@ deploy_atelet() {
   # Ensure namespace exists
   run_kubectl apply -f manifests/ate-install/ate-system-namespace.yaml \
     && run_kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/ate-system --timeout=60s
+
+  apply_otel_config
 
   local manifest=""
   if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
@@ -368,10 +470,18 @@ deploy_atenet() {
   run_kubectl apply -f manifests/ate-install/ate-system-namespace.yaml \
     && run_kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/ate-system --timeout=60s
 
-  run_ko apply -f manifests/ate-install/atenet-router.yaml
+  apply_otel_config
+
+  local router_manifest=""
+  router_manifest="$(render_atenet_router_manifest)"
+  echo "${router_manifest}" | run_kubectl apply -f -
+
   run_ko apply -f manifests/ate-install/atenet-dns.yaml
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
-  run_kubectl rollout status deployment/atenet-dns -n ate-system --timeout=120s
+  # The Deployment in atenet-dns.yaml is named "dns"; every other resource in
+  # that file is "atenet-dns". Waiting on the filename rather than the actual
+  # Deployment made this step fail with NotFound on every successful deploy.
+  run_kubectl rollout status deployment/dns -n ate-system --timeout=120s
 }
 
 # get_actor_status echoes the actor's status enum (e.g. STATUS_SUSPENDED).
@@ -479,12 +589,16 @@ delete_ate_system() {
   else
     run_kubectl delete --ignore-not-found -f manifests/ate-install
   fi
+  run_kubectl delete --ignore-not-found \
+    -f manifests/ate-install/components/agentgateway/configmap.yaml
   run_kubectl delete --ignore-not-found -f manifests/ate-install/generated
 }
 
 delete_atenet() {
   log_step "delete_atenet"
   run_kubectl delete --ignore-not-found -f manifests/ate-install/atenet-router.yaml
+  run_kubectl delete --ignore-not-found \
+    -f manifests/ate-install/components/agentgateway/configmap.yaml
 }
 
 deploy_benchmarks() {
@@ -526,17 +640,26 @@ done
 # flag they configure (e.g. --benchmark-worker-count before/after
 # --deploy-benchmarks). The dispatch loop below also accepts these flags but
 # treats them as no-ops since the value is already captured here.
+SETUP_CSI=false
 BENCHMARK_WORKER_COUNT=1
 prescan_args=("$@")
 for ((i = 0; i < ${#prescan_args[@]}; i++)); do
   case "${prescan_args[i]}" in
-    --auth-mode=*) ATE_API_AUTH_MODE="${prescan_args[i]#*=}" ;;
-    --auth-mode)
+    --ateapi-client-auth=*) ATE_ATEAPI_CLIENT_AUTH="${prescan_args[i]#*=}" ;;
+    --ateapi-client-auth)
       if (( i + 1 >= ${#prescan_args[@]} )); then
-        echo "Error: --auth-mode requires mtls or jwt" >&2
+        echo "Error: --ateapi-client-auth requires cert or token" >&2
         exit 1
       fi
-      ATE_API_AUTH_MODE="${prescan_args[$((i + 1))]}"
+      ATE_ATEAPI_CLIENT_AUTH="${prescan_args[$((i + 1))]}"
+      ;;
+    --atenet-router=*) ATE_ATENET_ROUTER="${prescan_args[i]#*=}" ;;
+    --atenet-router)
+      if (( i + 1 >= ${#prescan_args[@]} )); then
+        echo "Error: --atenet-router requires envoy or agentgateway" >&2
+        exit 1
+      fi
+      ATE_ATENET_ROUTER="${prescan_args[$((i + 1))]}"
       ;;
     --benchmark-worker-count)
       BENCHMARK_WORKER_COUNT="${prescan_args[i+1]:-1}"
@@ -544,8 +667,12 @@ for ((i = 0; i < ${#prescan_args[@]}; i++)); do
     --benchmark-worker-count=*)
       BENCHMARK_WORKER_COUNT="${prescan_args[i]#*=}"
       ;;
+    --setup-csi)
+      SETUP_CSI=true
+      ;;
   esac
 done
+atenet_router >/dev/null
 
 while [[ "$#" -gt 0 ]]; do
   # Run ${demo}_cmdline if it exists. If it returns 0, then we successfully
@@ -561,17 +688,34 @@ while [[ "$#" -gt 0 ]]; do
   done
 
   case $1 in
-    --auth-mode=*) ATE_API_AUTH_MODE="${1#*=}" ;;
-    --auth-mode)
+    --ateapi-client-auth=*) ATE_ATEAPI_CLIENT_AUTH="${1#*=}" ;;
+    --ateapi-client-auth)
       shift
       if [[ "$#" -eq 0 ]]; then
-        echo "Error: --auth-mode requires mtls or jwt" >&2
+        echo "Error: --ateapi-client-auth requires cert or token" >&2
         exit 1
       fi
-      ATE_API_AUTH_MODE="$1"
+      ATE_ATEAPI_CLIENT_AUTH="$1"
+      ;;
+    --atenet-router=*) ATE_ATENET_ROUTER="${1#*=}" ;;
+    --atenet-router)
+      shift
+      if [[ "$#" -eq 0 ]]; then
+        echo "Error: --atenet-router requires envoy or agentgateway" >&2
+        exit 1
+      fi
+      ATE_ATENET_ROUTER="$1"
       ;;
 
     --deploy-ate-system) deploy_ate_system ;;
+    --setup-csi)
+      if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+        ensure_crds
+        setup_csi
+      else
+        echo "Warning: CSI setup is only supported for Kind local installations. Skipping."
+      fi
+      ;;
     --delete-ate-system) delete_ate_system ;;
     --delete-all) delete_all ;;
 
@@ -589,7 +733,7 @@ while [[ "$#" -gt 0 ]]; do
     --benchmark-worker-count=*) ;;
 
     --create-jwt-authority-pool-secret) create_jwt_authority_pool_secret ;;
-    --create-session-id-ca-pool-secret) create_session_id_ca_pool_secret ;;
+    --create-actor-id-ca-pool-secret) create_actor_id_ca_pool_secret ;;
     --create-podcertificate-controller-cas) create_podcertificate_controller_cas ;;
     --create-valkey-ca-certs-secret) create_valkey_ca_certs_secret ;;
     --create-api-server-env-vars) create_api_server_env_vars ;;

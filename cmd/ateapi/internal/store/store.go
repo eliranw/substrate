@@ -18,8 +18,9 @@ package store
 import (
 	"context"
 	"errors"
-	"time"
+	"sync"
 
+	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
@@ -30,17 +31,20 @@ var (
 	// ErrAlreadyExists indicates that the object already exists in the DB.
 	ErrAlreadyExists = errors.New("persistence: already exists")
 
-	// ErrPersistenceRetry is the error returned when the persistence layer needs to retry.
-	ErrPersistenceRetry = errors.New("persistence: retry status")
+	// ErrVersionConflict indicates an update's expected version did not match the stored one.
+	ErrVersionConflict = errors.New("persistence: version conflict")
 
 	// ErrFailedPrecondition indicates the object is not in the required state for the operation.
 	ErrFailedPrecondition = errors.New("persistence: failed precondition")
+
+	// ErrLockConflict indicates that a distributed lock is already held by another client.
+	ErrLockConflict = errors.New("persistence: lock conflict")
 )
 
 // Interface defines the contract for the persistence layer storing actor state.
 type Interface interface {
-	// Fetches an actor by (atespace, name). Returns ErrNotFound if missing.
-	GetActor(ctx context.Context, atespace, name string) (*ateapipb.Actor, error)
+	// Fetches an actor by reference. Returns ErrNotFound if missing.
+	GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
 
 	// Stores a new actor in suspended state and returns the stored resource with
 	// server-assigned metadata (uid, version, timestamps). The input is not
@@ -49,16 +53,37 @@ type Interface interface {
 
 	// Updates actor state with optimistic concurrency check and returns the stored
 	// resource with advanced metadata (version, update_time). The input is not
-	// mutated. Returns ErrNotFound if missing, or ErrPersistenceRetry on version mismatch.
+	// mutated. Returns ErrNotFound if missing, or ErrVersionConflict on version mismatch.
 	UpdateActor(ctx context.Context, actor *ateapipb.Actor, expectedVersion int64) (*ateapipb.Actor, error)
 
 	// Removes an actor and returns the deleted resource. Returns ErrNotFound if
 	// missing, or ErrFailedPrecondition if not suspended.
-	DeleteActor(ctx context.Context, atespace, name string) (*ateapipb.Actor, error)
+	DeleteActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
 
 	// Lists actors in the given atespace (scoped scan), or across ALL atespaces if atespace is
 	// empty. Returns a page of actors and a next page token.
 	ListActors(ctx context.Context, atespace string, pageSize int32, pageToken string) ([]*ateapipb.Actor, string, error)
+
+	// Creates an immutable ActorSnapshot and stores its private physical location.
+	CreateActorSnapshot(ctx context.Context, snapshot *ateapipb.ActorSnapshot, location string) (*ateapipb.ActorSnapshot, error)
+
+	// Fetches an ActorSnapshot and its private physical location.
+	GetActorSnapshot(ctx context.Context, atespace, name string) (*ateapipb.ActorSnapshot, string, error)
+
+	// Resolves an Atespace-owned tag to an ActorSnapshot in constant time.
+	GetActorSnapshotByTag(ctx context.Context, atespace, name string) (*ateapipb.ActorSnapshot, string, *ateapipb.ActorSnapshotTag, error)
+
+	// Lists ActorSnapshots in one atespace, or all atespaces when empty.
+	ListActorSnapshots(ctx context.Context, atespace string, pageSize int32, pageToken string) ([]*ateapipb.ActorSnapshot, string, error)
+
+	// Adds an immutable Atespace-owned tag to an ActorSnapshot.
+	TagActorSnapshot(ctx context.Context, atespace, name string, tag *ateapipb.ActorSnapshotTag) (*ateapipb.ActorSnapshotTag, error)
+
+	// Updates a tag's reuse scope.
+	UpdateActorSnapshotTag(ctx context.Context, atespace, name string, scope ateapipb.ActorSnapshotTagScope, expectedVersion int64) (*ateapipb.ActorSnapshotTag, error)
+
+	// Deletes and returns a tag.
+	DeleteActorSnapshotTag(ctx context.Context, atespace, name string) (*ateapipb.ActorSnapshotTag, error)
 
 	// Stores a new atespace and returns the stored resource with server-assigned
 	// metadata (uid, version, timestamps). The input is not mutated. Returns
@@ -85,7 +110,7 @@ type Interface interface {
 	// Registers a new idle worker. Returns ErrAlreadyExists if already registered.
 	CreateWorker(ctx context.Context, worker *ateapipb.Worker) error
 
-	// Updates worker state with optimistic concurrency check. Returns ErrNotFound if missing, or ErrPersistenceRetry on version mismatch.
+	// Updates worker state with optimistic concurrency check. Returns ErrNotFound if missing, or ErrVersionConflict on version mismatch.
 	UpdateWorker(ctx context.Context, worker *ateapipb.Worker, expectedVersion int64) error
 
 	// Removes a worker. Idempotent: does nothing if worker is not found.
@@ -101,17 +126,10 @@ type Interface interface {
 	// must Close the watch to release its subscription.
 	WatchWorkers(ctx context.Context) (*WorkerWatch, error)
 
-	// AcquireLock attempts to acquire a distributed lock with a TTL.
-	// Returns true if the lock was successfully acquired.
-	// Returns false if the lock is already held by another client (conflict).
-	// Returns an error only on database failure.
-	// The value must be a unique token (e.g., UUID) to ensure safe release.
-	AcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
-
-	// ReleaseLock releases a distributed lock if the stored value matches the passed value.
-	// Returns nil if the lock was successfully released or if the lock was not held by this value.
-	// Returns an error only on database failure.
-	ReleaseLock(ctx context.Context, key string, value string) error
+	// AcquireLock attempts to acquire a distributed lock for key. The lock is
+	// held and renewed automatically until the returned Lock is closed.
+	// Returns ErrLockConflict if the lock is already held by another client.
+	AcquireLock(ctx context.Context, key string) (*Lock, error)
 
 	// DebugClearAll drop all data from the database. Useful for debugging / local testing/
 	DebugClearAll(ctx context.Context) error
@@ -152,3 +170,28 @@ func NewWorkerWatch(events <-chan WorkerEvent, stop context.CancelFunc) *WorkerW
 
 // Close releases the subscription. Safe to call multiple times.
 func (w *WorkerWatch) Close() { w.stop() }
+
+// Lock represents a held distributed lock that is renewed automatically until
+// Close is called. If renewal cannot keep the lease alive, the context
+// returned by Context is cancelled so the caller can detect it may no
+// longer have exclusive access.
+type Lock struct {
+	ctx     context.Context
+	closeFn func()
+	once    sync.Once
+}
+
+// NewLock builds a Lock from its lease context (cancelled on loss or Close)
+// and the func that stops lease renewal and releases the lock.
+func NewLock(ctx context.Context, closeFn func()) *Lock {
+	return &Lock{ctx: ctx, closeFn: closeFn}
+}
+
+// Context returns a context derived from the context AcquireLock was called
+// with. It is cancelled when Close is called, or earlier if the lease is
+// lost.
+func (l *Lock) Context() context.Context { return l.ctx }
+
+// Close stops lease renewal and releases the lock. Safe to call multiple
+// times.
+func (l *Lock) Close() { l.once.Do(l.closeFn) }

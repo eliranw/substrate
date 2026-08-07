@@ -18,6 +18,26 @@ package atelet;
 
 option go_package = "github.com/agent-substrate/substrate/internal/proto/ateletpb";
 
+// CredentialBroker gives an authenticated worker its current actor credential.
+service CredentialBroker {
+  rpc MintActorCertificate(MintActorCertificateRequest) returns (MintActorCertificateResponse) {}
+}
+
+message MintActorCertificateRequest {
+  // DER-encoded PKCS #10 certificate signing request. Atunnel retains the
+  // corresponding private key.
+  bytes certificate_signing_request = 1;
+
+  // Actor incarnation this activation expects. Ateapi resolves the actor from
+  // the authenticated worker and rejects the request if its UID differs.
+  string expected_actor_uid = 2;
+}
+
+message MintActorCertificateResponse {
+  // DER-encoded leaf followed by any intermediate certificates.
+  repeated bytes actor_certificates = 1;
+}
+
 service AteomHerder {
   // Run tells atelet to create a new containerized workload from scratch on an
   // ateom.
@@ -48,10 +68,20 @@ message RunRequest {
   // fetches the relevant assets and records them with the actor's on-node state
   // so a later Checkpoint can pin the same version into the snapshot manifest.
   SandboxAssets sandbox_assets = 8;
+
+  // When absent, actor traffic uses direct egress instead of atunnel.
+  optional EgressGateway egress_gateway = 9;
+}
+
+// EgressGateway configures tunneled egress for one actor activation.
+message EgressGateway {
+  // address is required and identifies the remote gateway as an IP address or
+  // DNS name followed by its port.
+  string address = 1;
 }
 
 // AssetFile is one content-addressed file atelet fetches for a sandbox runtime
-// (e.g. the gVisor runsc binary).
+// (e.g. the gVisor release tarball).
 message AssetFile {
   // gs:// URL to download the asset from.
   string url = 1;
@@ -68,7 +98,8 @@ message ArchAssets {
 // SandboxAssets is the generic, backend-agnostic description of the sandbox
 // binaries for an actor: a sandbox class plus assets keyed first by
 // architecture (GOARCH) and then by asset name. atelet's backend code
-// interprets the asset names (gVisor expects "runsc").
+// interprets the asset names (gVisor expects "gvisor", the release tarball;
+// legacy "runsc", a bare binary, is still accepted).
 message SandboxAssets {
   string sandbox_class = 1;           // e.g. "gvisor"
   map<string, ArchAssets> assets = 2; // arch -> {name -> file}
@@ -84,9 +115,16 @@ message WorkloadSpec {
 enum VolumeType {
   VOLUME_TYPE_UNSPECIFIED = 0;
   VOLUME_TYPE_DURABLE_DIR = 1;
+  VOLUME_TYPE_EXTERNAL = 2;
 }
 
 message DurableDirVolume {
+}
+
+message ExternalVolumeSource {
+  string storage_volume_id = 1;
+  string volume_type = 2;
+  map<string, string> volume_context = 3;
 }
 
 message Volume {
@@ -96,6 +134,7 @@ message Volume {
 
   oneof source {
     DurableDirVolume durable_dir = 3;
+    ExternalVolumeSource external = 4;
   }
 }
 
@@ -108,6 +147,7 @@ message Container {
   string name = 1;
   string image = 2;
   repeated string command = 3;
+  repeated string args = 7;
   repeated EnvEntry env = 4;
   Readyz readyz = 5;
   repeated VolumeMount volume_mounts = 6;
@@ -122,6 +162,9 @@ message EnvEntry {
 // Only HTTP is supported today.
 message Readyz {
   HTTPGetAction http_get = 1;
+  // How long to keep polling before giving up and failing the actor start.
+  // Zero means the ateom's default.
+  int32 timeout_seconds = 2;
 }
 
 // HTTPGetAction performs an HTTP GET against the container.
@@ -174,6 +217,13 @@ enum SnapshotScope {
   // (currently DurableDir-typed volumes). Memory and the rest of rootfs are
   // excluded.
   SNAPSHOT_SCOPE_DATA = 2;
+  // Restore-only: restore the ActorTemplate's golden snapshot's guest state
+  // (memory + full filesystem delta) combined with the snapshot's durable
+  // data. Never valid for Checkpoint — snapshots only ever capture FULL or
+  // DATA; whether a snapshot restores from its own content or on the golden
+  // is decided by the control plane from the template's onResume
+  // configuration.
+  SNAPSHOT_SCOPE_DATA_ON_GOLDEN = 3;
 }
 
 message CheckpointRequest {
@@ -231,6 +281,17 @@ message RestoreRequest {
 
   // What content to restore from the checkpoint.
   SnapshotScope scope = 11;
+
+  // The object storage URI prefix of the ActorTemplate's golden snapshot.
+  // Set only when scope is SNAPSHOT_SCOPE_DATA_ON_GOLDEN: restore combines
+  // the golden snapshot (memory + full fs delta) with the durable data in
+  // the snapshot referenced by `config`. A top-level field rather than part
+  // of the `config` oneof: the actor's snapshot may be local (a pause
+  // checkpoint) while the golden snapshot is always external.
+  string golden_snapshot_uri_prefix = 12;
+
+  // When absent, actor traffic uses direct egress instead of atunnel.
+  optional EgressGateway egress_gateway = 13;
 }
 
 message RestoreResponse {

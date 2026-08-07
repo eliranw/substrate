@@ -18,6 +18,7 @@ import (
 	"context"
 	goflag "flag"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/spf13/pflag"
@@ -41,6 +42,10 @@ func RunTestMain(m *testing.M) int {
 	bindFlags()
 	pflag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 	pflag.Parse()
+	if err := pflag.ParseSkippedFlags(os.Args[1:], goflag.CommandLine); err != nil {
+		fmt.Printf("Failed to parse Go test flags: %v\n", err)
+		return 1
+	}
 
 	if !RunE2E {
 		fmt.Println(Colorf(`
@@ -71,7 +76,16 @@ func runAndCleanup(m *testing.M) int {
 		return 1
 	}
 
-	defer CleanupNamespaces()
-
-	return m.Run()
+	// Namespaces are deleted only on success. A failed run keeps them: the actor
+	// lives in a worker pod there, and its ateom logs (for a micro-VM worker, the
+	// guest's console tail too) are the only record of why it failed. Deleting the
+	// namespace takes those pods with it before anyone — a developer or CI's
+	// post-failure log dump — can read them.
+	code := m.Run()
+	if code != 0 {
+		RetainNamespaces()
+		return code
+	}
+	CleanupNamespaces()
+	return code
 }

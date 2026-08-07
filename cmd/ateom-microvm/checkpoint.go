@@ -21,37 +21,77 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/agent-substrate/substrate/internal/ateomnet"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 	"github.com/agent-substrate/substrate/internal/ateompath"
+	"github.com/agent-substrate/substrate/internal/imagecache"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
+	"github.com/agent-substrate/substrate/internal/resources"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-// CheckpointWorkload suspends the actor and writes a portable CH snapshot.
+// CheckpointWorkload suspends the actor and writes a portable snapshot.
 //
 // Contract with atelet: after we return, atelet uploads the checkpoint dir to object
 // storage, then tears down bundles and resets the actor dir.
 //
-// ateom drives the CH REST api-socket: pause -> snapshot file://<CheckpointStateDir>
-// (config.json + state.json + sparse memory-ranges) -> tear the VMM down. Each
-// container's rootfs is overlay(virtio-fs RO lower + guest-tmpfs upper), so the
-// writable upper lives in guest RAM and is captured by the memory snapshot — process
-// memory and rootfs writes both persist across suspend/resume. The RO lower is
-// reconstructed from the OCI image at restore, so nothing rootfs-related ships here.
+// What the snapshot holds depends on the requested scope:
+//
+//   - FULL: the whole guest. ateom drives the CH REST api-socket: pause -> snapshot
+//     file://<CheckpointStateDir> (config.json + state.json + sparse memory-ranges)
+//     -> tear the VMM down. Each container's rootfs is overlay(virtio-fs RO lower +
+//     guest-tmpfs upper), so the writable upper lives in guest RAM and is captured by
+//     the memory snapshot — process memory and rootfs writes both persist across
+//     suspend/resume. The RO lower is reconstructed from the OCI image at restore, so
+//     nothing rootfs-related ships. Durable-dir volumes are host-backed rather than in
+//     guest RAM, so they ship alongside as a tar.
+//   - DATA: the durable-dir volumes only, as that same tar. The guest is discarded, so
+//     the actor cold-starts on restore with its volumes re-materialized.
+//
+// Either way the guest is paused first, which is what makes the tar coherent: the
+// durable share is served write-through, so every completed guest write is already on
+// the host and no further ones can arrive.
 func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.CheckpointWorkloadRequest) (*ateompb.CheckpointWorkloadResponse, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+	if err := s.deactivateActorNetworking(ctx); err != nil {
+		return nil, err
+	}
 
-	atespace := req.GetAtespace()
-	name := req.GetActorName()
+	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
 	actorUID := req.GetActorUid()
 	templateNS := req.GetActorTemplateNamespace()
 	templateName := req.GetActorTemplateName()
 
-	s.actorLogger.EmitLifecycleLog("Actor checkpointing", atespace, name, actorUID, templateNS, templateName)
+	s.actorLogger.EmitLifecycleLog("Actor checkpointing", actorRef, actorUID, templateNS, templateName)
+
+	// Check what the request asks for BEFORE touching the guest: these are
+	// properties of the request, and pausing first would leave the actor
+	// suspended mid-flight for a call that could never have succeeded.
+	//
+	// Durable-dir volumes are host-backed, so they are captured the same way
+	// under either scope — and are the ONLY thing a Data-scope snapshot
+	// captures. DATA_ON_GOLDEN is restore-only (a DataOnGolden commit arrives
+	// here as plain DATA) and lands in the default rejection.
+	durable := hasDurableVolumes(req.GetSpec().GetContainers())
+	scope := req.GetScope()
+	switch scope {
+	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
+	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
+		if !durable {
+			return nil, status.Error(codes.FailedPrecondition,
+				"no durable-dir volumes found for a Data-scope snapshot")
+		}
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "unsupported snapshot scope: %v", scope)
+	}
 
 	// The actor's CH was booted by RunWorkload or relaunched by RestoreWorkload;
 	// either way ateom owns it and tracks its api-socket.
@@ -80,6 +120,63 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		return nil, fmt.Errorf("while creating checkpoint dir %q: %w", checkpointDir, err)
 	}
 
+	// Only a Full snapshot captures the guest. A Data snapshot deliberately
+	// captures no VM state — no memory image, and no base-id, since nothing will
+	// reattach to the frozen virtio-fs lower: at restore the actor cold-boots
+	// from the OCI image (or, under an OnGolden data resume policy, is combined
+	// with the golden snapshot's guest state) and gets its durable-dir volumes
+	// back from the tar below.
+	var dSnapshot time.Duration
+	if scope == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
+		var err error
+		if dSnapshot, err = s.snapshotVMState(ctx, client, ra, actorUID, checkpointDir); err != nil {
+			return nil, err
+		}
+	}
+
+	var dDurable time.Duration
+	if durable {
+		tDurable := time.Now()
+		if err := tarDurableVolumes(ctx, ateompath.DurableDirVolumeMountsDir(actorUID), checkpointDir); err != nil {
+			return nil, err
+		}
+		dDurable = time.Since(tDurable)
+	}
+
+	// Report exactly the files we wrote so atelet ships precisely this snapshot: for
+	// Full, the CH snapshot (config.json + state.json + memory-ranges + base-id) plus
+	// any durable-dir tar; for Data, that tar alone.
+	snapshotFiles, err := listFiles(checkpointDir)
+	if err != nil {
+		return nil, fmt.Errorf("while listing snapshot files: %w", err)
+	}
+
+	// Tear down: the actor returns to "available". Best-effort; the snapshot is
+	// already on disk for atelet to ship.
+	tTeardown := time.Now()
+	s.teardownActor(ctx, actorUID, ra, client)
+	dTeardown := time.Since(tTeardown)
+	delete(s.running, actorUID)
+
+	// Tear down the per-activation actor network.
+	if err := ateomnet.CleanupActorNetwork(ctx, s.interiorNetNS); err != nil {
+		slog.WarnContext(ctx, "Failed to clean up actor network after checkpoint", slog.Any("err", err))
+	}
+
+	s.actorLogger.EmitLifecycleLog("Actor checkpointed", actorRef, actorUID, templateNS, templateName)
+	slog.InfoContext(ctx, "Actor checkpointed", slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
+		slog.String("scope", scope.String()), slog.Duration("pause", dPause),
+		slog.Duration("snapshot", dSnapshot),
+		// The durable-dir tar runs while the guest is paused, so its cost is part
+		// of the suspend latency and scales with the volume's contents.
+		slog.Duration("durable_dir", dDurable), slog.Duration("teardown", dTeardown))
+	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
+}
+
+// snapshotVMState captures the paused guest into checkpointDir: the CH snapshot
+// (config.json + state.json + memory-ranges) plus the base-id the restore side
+// needs, and returns how long the snapshot itself took.
+func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, ra *runningActor, actorUID, checkpointDir string) (time.Duration, error) {
 	// Record the FROZEN base id (the id the guest's virtio-fs find-paths are pinned
 	// to, <baseID>/rootfs). For a cold-run actor this is its own id; for a restored
 	// actor it is the golden id propagated via ra.baseID (set from the snapshot we
@@ -92,13 +189,13 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		baseID = ra.baseID
 	}
 	if err := os.WriteFile(filepath.Join(checkpointDir, baseIDFile), []byte(baseID), 0o600); err != nil {
-		return nil, fmt.Errorf("while writing %s: %w", baseIDFile, err)
+		return 0, fmt.Errorf("while writing %s: %w", baseIDFile, err)
 	}
 
 	slog.InfoContext(ctx, "Snapshotting guest", slog.String("id", actorUID), slog.String("dir", checkpointDir))
 	tSnapshot := time.Now()
 	if err := client.Snapshot(ctx, checkpointDir); err != nil {
-		return nil, fmt.Errorf("while snapshotting guest: %w", err)
+		return 0, fmt.Errorf("while snapshotting guest: %w", err)
 	}
 	dSnapshot := time.Since(tSnapshot)
 
@@ -116,7 +213,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		// CH is paused and about to be torn down, and base is discarded after. See
 		// MergeDeltaIntoBase. (Falls back to the copying merge across filesystems.)
 		if err := ch.MergeDeltaIntoBase(ctx, base, delta); err != nil {
-			return nil, fmt.Errorf("while merging OnDemand delta into restore source: %w", err)
+			return 0, fmt.Errorf("while merging OnDemand delta into restore source: %w", err)
 		}
 		slog.InfoContext(ctx, "Merged OnDemand delta into base (complete snapshot)",
 			slog.String("id", actorUID), slog.Duration("merge", time.Since(tMerge)))
@@ -125,32 +222,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// Nothing rootfs-related ships: the overlay's writable upper is a guest tmpfs, so
 	// the actor's rootfs writes are already in the memory snapshot above, and the RO
 	// lower is reconstructed from the OCI image at restore (it never changes).
-
-	// Report exactly the files we wrote so atelet ships precisely the CH snapshot
-	// (config.json + state.json + memory-ranges + base-id). The RO base is
-	// reconstructed from the OCI image at restore.
-	snapshotFiles, err := listFiles(checkpointDir)
-	if err != nil {
-		return nil, fmt.Errorf("while listing snapshot files: %w", err)
-	}
-
-	// Tear down: the actor returns to "available". Best-effort; the snapshot is
-	// already on disk for atelet to ship.
-	tTeardown := time.Now()
-	s.teardownActor(ctx, actorUID, ra, client)
-	dTeardown := time.Since(tTeardown)
-	delete(s.running, actorUID)
-
-	// Tear down the per-activation actor network.
-	if err := s.cleanupActorNetwork(ctx); err != nil {
-		slog.WarnContext(ctx, "Failed to clean up actor network after checkpoint", slog.Any("err", err))
-	}
-
-	s.actorLogger.EmitLifecycleLog("Actor checkpointed", atespace, name, actorUID, templateNS, templateName)
-	slog.InfoContext(ctx, "Actor checkpointed", slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
-		slog.Duration("pause", dPause),
-		slog.Duration("snapshot", dSnapshot), slog.Duration("teardown", dTeardown))
-	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
+	return dSnapshot, nil
 }
 
 // listFiles returns the (relative) names of regular files directly under dir.
@@ -197,14 +269,24 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, ra *running
 			_ = ra.chCmd.Process.Kill()
 			_, _ = ra.chCmd.Process.Wait()
 		}
-		// Kill the virtiofsd serving the overlay RO lower (after CH, its only client).
-		if ra.vfsdCmd != nil && ra.vfsdCmd.Process != nil {
-			_ = ra.vfsdCmd.Process.Kill()
-			_, _ = ra.vfsdCmd.Process.Wait()
+		// Kill the virtiofsds (after CH, their only client): the overlay RO lower's
+		// and, when the actor has durable-dir volumes, the writable share's.
+		for _, cmd := range []*exec.Cmd{ra.vfsdCmd, ra.durableVfsdCmd} {
+			if cmd != nil && cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}
 		}
 	}
 
 	// Sweep any leftover per-sandbox host-side state + orphaned per-sandbox
 	// processes. This is ateom's own cleanup (process kill + unmount + rm).
 	kata.CleanupSandboxState(ctx, id)
+
+	// Detach the bundle rootfs overlays composed in buildActorContainers, so
+	// atelet's bundle wipe doesn't strand live mounts in this namespace.
+	// Best-effort like the rest of teardown.
+	if err := imagecache.UnmountAllUnder(ateompath.OCIBundleDir(id)); err != nil {
+		slog.WarnContext(ctx, "Failed to unmount bundle rootfs overlays", slog.String("actorUID", id), slog.Any("err", err))
+	}
 }

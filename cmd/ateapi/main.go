@@ -24,34 +24,42 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/actoridentity"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/credbundle"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/debugapi"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/k8sjwt"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/sessionidentity"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/ateredis"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
 	"github.com/agent-substrate/substrate/internal/ateapiauth"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
+	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/serverboot"
 	"github.com/agent-substrate/substrate/internal/version"
+	"github.com/agent-substrate/substrate/internal/volume"
 	"github.com/agent-substrate/substrate/pkg/client/clientset/versioned"
 	"github.com/agent-substrate/substrate/pkg/client/informers/externalversions"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
+
+// maxRPCDeadline is the max deadline for all RPC methods exposed by this server.
+const maxRPCDeadline = 10 * time.Minute
 
 var (
 	listenAddr           = pflag.String("grpc-listen-addr", ":443", "Address and port the gRPC server should listen on.")
@@ -66,13 +74,18 @@ var (
 
 	clientJWTIssuer      = pflag.String("client-jwt-issuer", "", "The expected issuer URL for client JWTs.")
 	clientJWTAudience    = pflag.String("client-jwt-audience", "", "The expected audience for client JWTs.")
-	sessionIDJWTPoolFile = pflag.String("session-id-jwt-pool", "", "The file that contains the serialized JWT authority pool for signing session JWTs")
+	actorIDJWTPoolFile   = pflag.String("actor-id-jwt-pool", "", "The file that contains the serialized JWT authority pool for signing actor JWTs")
+	egressGatewayAddress = pflag.String("egress-gateway-address", "", "Address of the egress PEP. Empty disables tunneled egress.")
 
-	sessionIDCAPoolFile = pflag.String("session-id-ca-pool", "", "The file that contains the CA pool for signing session JWTs")
-	workerpoolCACerts   = pflag.String("workerpool-ca-certs", "", "The file that contains the CA for verifying workerpool client certificates.")
+	actorIDCAPoolFile      = pflag.String("actor-id-ca-pool", "", "The file that contains the CA pool for signing actor JWTs")
+	podIdentityCACerts     = pflag.String("pod-identity-ca-certs", "", "The file that contains the pod-identity CA bundle, used both for verifying client certificates presented to the gRPC server and for verifying atelet serving certificates when dialing atelet. If empty, client-cert verification is disabled and atelet dials will fail.")
+	ateletClientCredBundle = pflag.String("atelet-client-cred-bundle", "", "Credential bundle presented as the client certificate when dialing atelet.")
+
+	drainDelay   = pflag.Duration("drain-delay", 13*time.Second, "How long to keep accepting new work after SIGTERM, before starting the gRPC drain.")
+	drainTimeout = pflag.Duration("drain-timeout", 15*time.Second, "Deadline for the graceful gRPC drain on shutdown. In-flight RPCs still running past it are forcefully cancelled.")
 
 	showVersion     = pflag.Bool("version", false, "Print version and exit.")
-	authMode        = pflag.String("auth-mode", "mtls", "Auth mode for incoming gRPC: mtls|jwt. 'mtls' (default) relies on transport-level mTLS for client identity. 'jwt' additionally requires a Kubernetes ServiceAccount Bearer token on every RPC. Substrate will drop support for JWT auth mode once the Pod Certificates feature is enabled by default in the minimum supported Kubernetes version.")
+	logLevelFlag    = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
 	clientJWTCAFile = pflag.String("client-jwt-ca-cert", ateapiauth.DefaultServiceAccountCAFile, "CA cert file used to verify TLS when fetching the OIDC discovery document and JWKS for JWT authentication. Defaults to the in-cluster service account CA.")
 )
 
@@ -84,10 +97,19 @@ func main() {
 	}
 	ctx := context.Background()
 	serverboot.InitLogger()
+	if err := serverboot.SetLogLevel(*logLevelFlag); err != nil {
+		serverboot.Fatal(ctx, "Invalid --log-level", err)
+	}
+
+	// Kept separate from ctx so that in-progress work (clients, informers) is
+	// not cancelled the moment SIGTERM arrives. The drainOnShutdown
+	// function drives the shutdown process.
+	shutdownCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)
+	defer stopSignals()
 
 	tp, err := serverboot.InitTracing(ctx, serverboot.TracingOptions{
 		ServiceName: "ateapi",
-		Sampler:     sdktrace.ParentBased(sdktrace.AlwaysSample()),
+		Sampling:    serverboot.ResolveTraceSampling(ctx, serverboot.ParentRatioSampling(serverboot.ControlPlaneTraceRatio)),
 	})
 	if err != nil {
 		serverboot.Fatal(ctx, "Failed to initialize tracing", err)
@@ -102,11 +124,6 @@ func main() {
 
 	loadFlagsFromEnv()
 	logFlagValues(ctx)
-
-	authModeParsed, err := ateapiauth.ParseMode(*authMode)
-	if err != nil {
-		serverboot.Fatal(ctx, "Invalid --auth-mode", err)
-	}
 
 	redisClient, err := connectRedis(ctx)
 	if err != nil {
@@ -134,9 +151,12 @@ func main() {
 	actorTemplateLister := ateFactory.Api().V1alpha1().ActorTemplates().Lister()
 	workerPoolLister := ateFactory.Api().V1alpha1().WorkerPools().Lister()
 	sandboxConfigLister := ateFactory.Api().V1alpha1().SandboxConfigs().Lister()
+	csiDriverConfigLister := ateFactory.Api().V1alpha1().CSIDriverConfigs().Lister()
 
 	workerPodInformerFactory, workerPodInformer := controlapi.WorkerPodInformer(clientset)
 	ateletPodInformerFactory, ateletPodInformer := controlapi.AteletInformer(clientset)
+	scInformerFactory := informers.NewSharedInformerFactory(clientset, 0)
+	storageClassLister := scInformerFactory.Storage().V1().StorageClasses().Lister()
 
 	syncer := controlapi.NewWorkerPoolSyncer(redisPersistence, workerPodInformer, workerPoolLister)
 	syncer.Start(ctx)
@@ -146,20 +166,32 @@ func main() {
 	workerPodInformerFactory.Start(stopCh)
 	ateletPodInformerFactory.Start(stopCh)
 	ateFactory.Start(stopCh)
+	scInformerFactory.Start(stopCh)
 
 	workerPodInformerFactory.WaitForCacheSync(stopCh)
 	ateletPodInformerFactory.WaitForCacheSync(stopCh)
 	ateFactory.WaitForCacheSync(stopCh)
+	scInformerFactory.WaitForCacheSync(stopCh)
 
-	dialer := controlapi.NewAteletDialer(workerPodInformer.GetIndexer(), ateletPodInformer.GetIndexer())
-	sm := controlapi.NewService(redisPersistence, workerCache, actorTemplateLister, workerPoolLister, sandboxConfigLister, dialer, clientset)
-
-	jwtIssuerDiscoveryClient := buildK8sServiceAccountIssuerDiscoveryClient(ctx, *clientJWTCAFile, *clientJWTIssuer)
-	if authModeParsed == ateapiauth.ModeJWT && jwtIssuerDiscoveryClient == nil {
-		serverboot.Fatal(ctx, "JWT auth mode requires a Kubernetes ServiceAccount issuer discovery client", fmt.Errorf("client JWT issuer %q is not usable for discovery", *clientJWTIssuer))
+	if err := controlapi.RegisterWorkerCount(otel.Meter("ateapi"), workerCache.Workers, workerPoolLister.List); err != nil {
+		serverboot.Fatal(ctx, "Failed to register worker-count metric", err)
+	}
+	if err := controlapi.RegisterActorCrashes(otel.Meter("ateapi")); err != nil {
+		serverboot.Fatal(ctx, "Failed to register actor-crashes metric", err)
 	}
 
-	sessionIdentitySrv := sessionidentity.New(*clientJWTIssuer, *clientJWTAudience, *sessionIDJWTPoolFile, *sessionIDCAPoolFile, *workerpoolCACerts, jwtIssuerDiscoveryClient)
+	instruments, err := controlapi.NewInstruments(otel.Meter("ateapi"))
+	if err != nil {
+		serverboot.Fatal(ctx, "Failed to create metric instruments", err)
+	}
+
+	volPlugins := make(map[string]volume.VolumePluginControlPlane)
+	ateletDialer := controlapi.NewAteletDialer(workerPodInformer.GetIndexer(), ateletPodInformer.GetIndexer(), *ateletClientCredBundle, *podIdentityCACerts)
+	sm := controlapi.NewService(redisPersistence, workerCache, actorTemplateLister, workerPoolLister, sandboxConfigLister, csiDriverConfigLister, storageClassLister, ateletDialer, clientset, instruments, *egressGatewayAddress, volPlugins)
+
+	jwtIssuerDiscoveryClient := buildK8sServiceAccountIssuerDiscoveryClient(ctx, *clientJWTCAFile, *clientJWTIssuer)
+
+	actorIdentitySrv := actoridentity.New(*clientJWTIssuer, *clientJWTAudience, *actorIDJWTPoolFile, *actorIDCAPoolFile, *podIdentityCACerts, jwtIssuerDiscoveryClient, redisPersistence, workerCache)
 	debugSrv := debugapi.NewService(redisPersistence)
 
 	lisCfg := &net.ListenConfig{}
@@ -169,10 +201,12 @@ func main() {
 	}
 
 	authCfg := ateapiauth.ServerConfig{
-		Mode: authModeParsed,
-		VerifyBearerToken: func(ctx context.Context, bearer string) error {
-			_, err := k8sjwt.Verify(ctx, jwtIssuerDiscoveryClient, bearer, *clientJWTIssuer, *clientJWTAudience, time.Now())
-			return err
+		VerifyBearerToken: func(ctx context.Context, bearer string) (string, error) {
+			claims, err := k8sjwt.Verify(ctx, jwtIssuerDiscoveryClient, bearer, *clientJWTIssuer, *clientJWTAudience, time.Now())
+			if err != nil {
+				return "", err
+			}
+			return claims.Subject, nil
 		},
 	}
 	if err := ateapiauth.ValidateServerConfig(authCfg); err != nil {
@@ -182,8 +216,22 @@ func main() {
 	mux := grpc.NewServer(
 		grpc.Creds(serverCreds),
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		// Bounds every connection's lifetime so round_robin clients
+		// periodically re-resolve DNS and pick up replicas added since they
+		// last connected - without this, an existing connection never
+		// notices new replicas on its own (see https://github.com/grpc/grpc/issues/12295).
+		//
+		// TODO: Replace with a resolver that watches Endpoints/EndpointSlices
+		// directly and pushes address updates, instead of relying on forced
+		// reconnects to trigger DNS re-resolution. See
+		// https://github.com/sercand/kuberesolver.
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionAge:      1 * time.Minute,
+			MaxConnectionAgeGrace: maxRPCDeadline + time.Minute,
+		}),
 		grpc.ChainUnaryInterceptor(
 			ateapiauth.UnaryServerInterceptor(authCfg),
+			ateinterceptors.MaxDeadlineUnaryInterceptor(maxRPCDeadline),
 			ateinterceptors.ServerUnaryInterceptor,
 		),
 		grpc.ChainStreamInterceptor(
@@ -192,17 +240,48 @@ func main() {
 	)
 	reflection.Register(mux)
 	ateapipb.RegisterControlServer(mux, sm)
-	ateapipb.RegisterSessionIdentityServer(mux, sessionIdentitySrv)
+	ateapipb.RegisterActorIdentityServer(mux, actorIdentitySrv)
 	ateapipb.RegisterDebugServer(mux, debugSrv)
 
+	readiness := &serverboot.Readiness{}
 	go serverboot.StartMetricsServer(ctx, serverboot.MetricsServerOptions{
-		Addr:         *metricsListenAddr,
-		EnableReadyz: true,
+		Addr:          *metricsListenAddr,
+		Readiness:     readiness,
+		EnableHealthz: true,
 	})
+
+	drainDone := drainOnShutdown(shutdownCtx, mux, readiness)
 
 	if err := mux.Serve(lis); err != nil {
 		serverboot.Fatal(ctx, "Failed to serve", err)
 	}
+	<-drainDone
+	slog.InfoContext(ctx, "Shutdown complete")
+}
+
+func drainOnShutdown(ctx context.Context, srv *grpc.Server, readiness *serverboot.Readiness) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-ctx.Done()
+		slog.InfoContext(ctx, "Shutdown signal received; draining")
+		readiness.MarkNotReady()
+		time.Sleep(*drainDelay)
+		slog.InfoContext(ctx, "Starting gRPC drain")
+		drainComplete := make(chan struct{})
+		go func() {
+			srv.GracefulStop()
+			close(drainComplete)
+		}()
+		select {
+		case <-drainComplete:
+			slog.InfoContext(ctx, "Drain completed within deadline")
+		case <-time.After(*drainTimeout):
+			slog.WarnContext(ctx, "Drain deadline exceeded; forcing stop")
+			srv.Stop()
+		}
+	}()
+	return done
 }
 
 // loadFlagsFromEnv resolves any flag whose value is the sentinel `@env`
@@ -238,10 +317,12 @@ func logFlagValues(ctx context.Context) {
 		slog.String("redis-client-cert", *redisClientCert),
 		slog.String("client-jwt-issuer", *clientJWTIssuer),
 		slog.String("client-jwt-audience", *clientJWTAudience),
-		slog.String("session-id-jwt-pool", *sessionIDJWTPoolFile),
-		slog.String("session-id-ca-pool", *sessionIDCAPoolFile),
-		slog.String("workerpool-ca-certs", *workerpoolCACerts),
-		slog.String("auth-mode", *authMode),
+		slog.String("actor-id-jwt-pool", *actorIDJWTPoolFile),
+		slog.String("actor-id-ca-pool", *actorIDCAPoolFile),
+		slog.String("pod-identity-ca-certs", *podIdentityCACerts),
+		slog.String("atelet-client-cred-bundle", *ateletClientCredBundle),
+		slog.Duration("drain-delay", *drainDelay),
+		slog.Duration("drain-timeout", *drainTimeout),
 	)
 }
 
@@ -285,7 +366,7 @@ func connectRedis(ctx context.Context) (*redis.ClusterClient, error) {
 }
 
 func buildRedisTLSConfig(ctx context.Context) (*tls.Config, error) {
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13}
 	if *redisCACerts != "" {
 		ca, err := os.ReadFile(*redisCACerts)
 		if err != nil {
@@ -348,27 +429,30 @@ func newKubeClients() (*kubernetes.Clientset, versioned.Interface, error) {
 	return clientset, ateClient, nil
 }
 
-// buildServerCreds loads the workerpool CA pool (if configured) and
+// buildServerCreds loads the pod-identity CA pool (if configured) and
 // composes gRPC TransportCredentials over the server bundle + optional
 // client-cert verification.
 func buildServerCreds(ctx context.Context) (credentials.TransportCredentials, error) {
 	var clientCAs *x509.CertPool
-	if *workerpoolCACerts != "" {
+	if *podIdentityCACerts != "" {
 		// TODO: Periodically reload these to handle rotations. Consult with Tina to see how she did it for client-go.
-		ca, err := os.ReadFile(*workerpoolCACerts)
+		ca, err := os.ReadFile(*podIdentityCACerts)
 		if err != nil {
-			return nil, fmt.Errorf("read workerpool CA: %w", err)
+			return nil, fmt.Errorf("read pod-identity CA: %w", err)
 		}
 		clientCAs = x509.NewCertPool()
 		if !clientCAs.AppendCertsFromPEM(ca) {
-			return nil, fmt.Errorf("parse workerpool CA from %s", *workerpoolCACerts)
+			return nil, fmt.Errorf("parse pod-identity CA from %s", *podIdentityCACerts)
 		}
-		slog.InfoContext(ctx, "Using custom CA for workerpool clients", slog.String("path", *workerpoolCACerts))
+		slog.InfoContext(ctx, "Using pod-identity CA for client-cert verification", slog.String("path", *podIdentityCACerts))
 	}
 	return credentials.NewTLS(&tls.Config{
 		GetCertificate: credbundle.Loader(*grpcServerCredBundle),
-		ClientAuth:     tls.VerifyClientCertIfGiven,
-		ClientCAs:      clientCAs,
+		// Client certs stay optional at the transport level: certless
+		// clients such as kubectl-ate authenticate with a Bearer token in the
+		// ateapiauth interceptor.
+		ClientAuth: tls.VerifyClientCertIfGiven,
+		ClientCAs:  clientCAs,
 	}), nil
 }
 

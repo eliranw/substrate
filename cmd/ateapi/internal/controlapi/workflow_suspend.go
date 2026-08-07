@@ -24,23 +24,28 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
+	"github.com/agent-substrate/substrate/internal/resources"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 // SuspendInput holds the immutable parameters requested by the client.
 type SuspendInput struct {
-	ActorName string
-	Atespace  string
+	ActorRef resources.ActorRef
 }
 
 // SuspendState holds the mutable state loaded and modified during execution.
 type SuspendState struct {
-	Actor         *ateapipb.Actor
-	ActorTemplate *atev1alpha1.ActorTemplate
+	Actor             *ateapipb.Actor
+	ActorTemplate     *atev1alpha1.ActorTemplate
+	SourceVersion     int64
+	WireSnapshotScope string
 }
 
 type LoadActorForSuspendStep struct {
@@ -53,12 +58,19 @@ func (s *LoadActorForSuspendStep) IsComplete(ctx context.Context, input *Suspend
 	// Always run to get the freshest state
 	return false, nil
 }
+func (s *LoadActorForSuspendStep) CheckPrerequisite(ctx context.Context, input *SuspendInput, state *SuspendState) error {
+	return nil
+}
 func (s *LoadActorForSuspendStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
-	actor, err := s.store.GetActor(ctx, input.Atespace, input.ActorName)
+	actor, err := s.store.GetActor(ctx, input.ActorRef)
 	if err != nil {
 		return err
 	}
 	state.Actor = actor
+	state.SourceVersion = actor.GetMetadata().GetVersion()
+	if actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDING {
+		state.SourceVersion = actor.GetInProgressSnapshotSourceActorVersion()
+	}
 
 	actorTemplate, err := s.actorTemplateLister.ActorTemplates(actor.GetActorTemplateNamespace()).Get(actor.GetActorTemplateName())
 	if err != nil {
@@ -80,14 +92,17 @@ func (s *MarkSuspendingStep) IsComplete(ctx context.Context, input *SuspendInput
 	// Fast forward if we've already marked our intent or if we are further along.
 	return state.Actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDING || state.Actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDED, nil
 }
-func (s *MarkSuspendingStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
+func (s *MarkSuspendingStep) CheckPrerequisite(ctx context.Context, input *SuspendInput, state *SuspendState) error {
 	if state.Actor.GetStatus() != ateapipb.Actor_STATUS_RUNNING {
-		return nil
+		return status.Errorf(codes.FailedPrecondition, "MarkSuspendingStep prerequisite not met for Actor: %s (got: %v, want %s)", input.ActorRef, state.Actor.GetStatus(), ateapipb.Actor_STATUS_RUNNING)
 	}
-
+	return nil
+}
+func (s *MarkSuspendingStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
 	state.Actor.Status = ateapipb.Actor_STATUS_SUSPENDING
+	state.Actor.InProgressSnapshotSourceActorVersion = state.SourceVersion
 	snapshotID := time.Now().Format(time.RFC3339) + "-" + rand.Text()
-	state.Actor.InProgressSnapshot = strings.TrimSuffix(state.ActorTemplate.Spec.SnapshotsConfig.Location, "/") + "/" + input.ActorName + "/" + snapshotID
+	state.Actor.InProgressSnapshot = strings.TrimSuffix(state.ActorTemplate.Spec.SnapshotsConfig.Location, "/") + "/snapshots/" + snapshotID
 	updatedActor, err := s.store.UpdateActor(ctx, state.Actor, state.Actor.GetMetadata().GetVersion())
 	if err != nil {
 		return err
@@ -97,6 +112,18 @@ func (s *MarkSuspendingStep) Execute(ctx context.Context, input *SuspendInput, s
 }
 
 func (s *MarkSuspendingStep) RetryBackoff() *wait.Backoff { return nil }
+
+// commitSnapshotScope returns the scope a commit (suspend) snapshot is taken
+// with. Golden actors always commit Full regardless of the template's
+// onCommit: the golden snapshot is the base an OnGolden data resume is
+// combined with at restore, so it must carry the guest memory and filesystem
+// — a data-only golden would leave nothing to restore the guest from.
+func commitSnapshotScope(atespace string, tmpl *atev1alpha1.ActorTemplate) atev1alpha1.SnapshotScope {
+	if atespace == resources.GoldenActorAtespace {
+		return atev1alpha1.SnapshotScopeFull
+	}
+	return tmpl.Spec.SnapshotsConfig.OnCommit
+}
 
 type CallAteletSuspendStep struct {
 	store  store.Interface
@@ -108,31 +135,44 @@ func (s *CallAteletSuspendStep) IsComplete(ctx context.Context, input *SuspendIn
 	// If we are already SUSPENDED, we've already called Atelet
 	return state.Actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDED, nil
 }
-func (s *CallAteletSuspendStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
-	if state.Actor.GetAteomPodNamespace() == "" || state.Actor.GetAteomPodName() == "" {
-		if err := crashActor(ctx, s.store, state.Actor.GetMetadata().GetAtespace(), state.Actor.GetMetadata().GetName()); err != nil {
-			slog.Error("Failed to crash actor", slog.String("err", err.Error()))
+func (s *CallAteletSuspendStep) CheckPrerequisite(ctx context.Context, input *SuspendInput, state *SuspendState) error {
+	if state.Actor.GetStatus() != ateapipb.Actor_STATUS_SUSPENDING {
+		return status.Errorf(codes.FailedPrecondition, "CallAteletSuspendStep prerequisite not met for Actor: %s (got: %v, want %s)", input.ActorRef, state.Actor.GetStatus(), ateapipb.Actor_STATUS_SUSPENDING)
+	}
+	if state.Actor.GetWorkerAssignment() == nil {
+		// Missing active worker pod reference in SUSPENDING state indicates corrupted store state.
+		if err := crashActor(ctx, s.store, input.ActorRef, ateattr.OperationSuspend, ateattr.ReasonCorruptedAssignment); err != nil {
+			slog.ErrorContext(ctx, "Failed to crash actor", slog.String("err", err.Error()))
 		}
 		return fmt.Errorf("actor is CRASHED because it was in SUSPENDING state but has no active worker")
 	}
-
-	ateletConn, err := s.dialer.DialForWorker(state.Actor.GetAteomPodNamespace(), state.Actor.GetAteomPodName())
+	return nil
+}
+func (s *CallAteletSuspendStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
+	assignment := state.Actor.GetWorkerAssignment()
+	ateletConn, err := s.dialer.DialForWorker(assignment.GetWorkerNamespace(), assignment.GetWorkerPod())
 	if err != nil {
 		if errors.Is(err, ErrWorkerPodNotFound) {
-			slog.Warn("Skipping suspend for dangling worker pod", "namespace", state.Actor.GetAteomPodNamespace(), "pod", state.Actor.GetAteomPodName())
-			return nil
+			slog.ErrorContext(ctx, "Worker pod gone before checkpoint, crashing actor", "namespace", assignment.GetWorkerNamespace(), "pod", assignment.GetWorkerPod(), "in_progress_snapshot", state.Actor.GetInProgressSnapshot())
+			if err := crashActor(ctx, s.store, input.ActorRef, ateattr.OperationSuspend, ateattr.ReasonWorkerPodGone); err != nil {
+				slog.ErrorContext(ctx, "Failed to crash actor", slog.String("err", err.Error()))
+			}
+			return fmt.Errorf("actor is CRASHED because its worker pod is gone and no snapshot was written")
 		}
 		return fmt.Errorf("while getting atelet conn for worker pod: %w", err)
 	}
 	client := ateletpb.NewAteomHerderClient(ateletConn)
 
-	workloadSpec := workloadSpecFromActorTemplate(state.ActorTemplate)
+	workloadSpec, err := workloadSpecFromActorTemplate(state.ActorTemplate, state.Actor)
+	if err != nil {
+		return err
+	}
 
 	// Checkpoint does not carry the sandbox config: atelet uses the version the
 	// actor is currently running (recorded on-node at Run/Restore) and pins it
 	// into the snapshot manifest.
 	req := &ateletpb.CheckpointRequest{
-		TargetAteomUid:         state.Actor.GetAteomPodUid(),
+		TargetAteomUid:         assignment.GetWorkerPodUid(),
 		Atespace:               state.Actor.GetMetadata().GetAtespace(),
 		ActorName:              state.Actor.GetMetadata().GetName(),
 		ActorTemplateNamespace: state.Actor.GetActorTemplateNamespace(),
@@ -144,15 +184,38 @@ func (s *CallAteletSuspendStep) Execute(ctx context.Context, input *SuspendInput
 				SnapshotUriPrefix: state.Actor.GetInProgressSnapshot(),
 			},
 		},
-		Scope:    toAteletSnapshotScope(state.ActorTemplate.Spec.SnapshotsConfig.OnCommit),
+		Scope:    toAteletSnapshotScope(commitSnapshotScope(state.Actor.GetMetadata().GetAtespace(), state.ActorTemplate)),
 		ActorUid: state.Actor.GetMetadata().Uid,
 	}
+	state.WireSnapshotScope = ateattr.SnapshotScopeValue(req.Scope)
 
 	_, err = client.Checkpoint(ctx, req)
-	return maybeCrashActor(ctx, s.store, input.Atespace, input.ActorName, err, "while checkpointing workload")
+	return maybeCrashActor(ctx, s.store, input.ActorRef, err, "while checkpointing workload", ateattr.OperationSuspend)
 }
 
 func (s *CallAteletSuspendStep) RetryBackoff() *wait.Backoff { return nil }
+
+type DetachVolumesStep struct {
+	store          store.Interface
+	pluginRegistry VolumePluginRegistry
+}
+
+func (s *DetachVolumesStep) Name() string { return "DetachVolumes" }
+
+func (s *DetachVolumesStep) IsComplete(ctx context.Context, input *SuspendInput, state *SuspendState) (bool, error) {
+	// TODO replace with a proper check on the volumes.
+	return state.Actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDED && state.Actor.GetWorkerAssignment() == nil, nil
+}
+
+func (s *DetachVolumesStep) CheckPrerequisite(ctx context.Context, input *SuspendInput, state *SuspendState) error {
+	return nil
+}
+
+func (s *DetachVolumesStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
+	return detachActorVolumes(ctx, s.store, s.pluginRegistry, state.Actor, state.ActorTemplate, ateattr.OperationSuspend)
+}
+
+func (s *DetachVolumesStep) RetryBackoff() *wait.Backoff { return nil }
 
 type FinalizeSuspendedStep struct {
 	store store.Interface
@@ -160,32 +223,34 @@ type FinalizeSuspendedStep struct {
 
 func (s *FinalizeSuspendedStep) Name() string { return "FinalizeSuspended" }
 func (s *FinalizeSuspendedStep) IsComplete(ctx context.Context, input *SuspendInput, state *SuspendState) (bool, error) {
-	// The workflow is completely done ONLY if the status is SUSPENDED *and* we've successfully freed the worker.
-	return state.Actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDED && state.Actor.GetAteomPodNamespace() == "", nil
+	return state.Actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDED, nil
+}
+func (s *FinalizeSuspendedStep) CheckPrerequisite(ctx context.Context, input *SuspendInput, state *SuspendState) error {
+	if state.Actor.GetStatus() != ateapipb.Actor_STATUS_SUSPENDING {
+		return status.Errorf(codes.FailedPrecondition, "FinalizeSuspendedStep prerequisite not met for Actor: %s (got: %v, want %s)", input.ActorRef, state.Actor.GetStatus(), ateapipb.Actor_STATUS_SUSPENDING)
+	}
+	return nil
 }
 func (s *FinalizeSuspendedStep) Execute(ctx context.Context, input *SuspendInput, state *SuspendState) error {
-	latestActor, err := s.store.GetActor(ctx, input.Atespace, input.ActorName)
+	latestActor, err := s.store.GetActor(ctx, input.ActorRef)
 	if err != nil {
 		return err
 	}
 
 	// 1. Free the worker (if it hasn't been freed yet)
-	if latestActor.GetAteomPodNamespace() != "" {
-		workerNs := latestActor.GetAteomPodNamespace()
-		workerPod := latestActor.GetAteomPodName()
+	if assignment := latestActor.GetWorkerAssignment(); assignment != nil {
+		workerPod := assignment.GetWorkerPod()
 
-		workerPool := latestActor.GetWorkerPoolName()
-
-		worker, err := s.store.GetWorker(ctx, workerNs, workerPool, workerPod)
+		worker, err := s.store.GetWorker(ctx, assignment.GetWorkerNamespace(), assignment.GetWorkerPool(), workerPod)
 		if err != nil {
 			if !errors.Is(err, store.ErrNotFound) {
 				return fmt.Errorf("while getting worker for release: %w", err)
 			}
-			slog.Warn("Worker already gone during finalize suspend, skipping release", "worker", workerPod)
+			slog.WarnContext(ctx, "Worker already gone during finalize suspend, skipping release", "worker", workerPod)
 		} else {
 			// Only free it if it still belongs to us
 			if wass := worker.Assignment; wass != nil {
-				if wass.Actor.Atespace == input.Atespace && wass.Actor.Name == input.ActorName {
+				if wass.GetActorUid() == latestActor.GetMetadata().GetUid() {
 					worker.Assignment = nil
 					err = s.store.UpdateWorker(ctx, worker, worker.Version)
 					if err != nil {
@@ -195,26 +260,35 @@ func (s *FinalizeSuspendedStep) Execute(ctx context.Context, input *SuspendInput
 			}
 		}
 
-		// 2. Safely clear ActiveWorker now that the worker object in DB is freed
-		latestActor, err = s.store.GetActor(ctx, input.Atespace, input.ActorName)
+		// 2. Clear the actor's assignment, now that the worker is freed
+		latestActor, err = s.store.GetActor(ctx, input.ActorRef)
 		if err != nil {
 			return err
 		}
 		latestActor.Status = ateapipb.Actor_STATUS_SUSPENDED
 		if latestActor.InProgressSnapshot != "" {
-			latestActor.LatestSnapshotInfo = &ateapipb.SnapshotInfo{
-				Data: &ateapipb.SnapshotInfo_External{
-					External: &ateapipb.ExternalSnapshotInfo{
-						SnapshotUriPrefix: latestActor.InProgressSnapshot,
-					},
-				},
+			location := latestActor.InProgressSnapshot
+			prefix := strings.TrimSuffix(state.ActorTemplate.Spec.SnapshotsConfig.Location, "/") + "/snapshots/"
+			snapshotID := strings.ToLower(strings.NewReplacer(":", "-", "+", "-").Replace(strings.TrimPrefix(location, prefix)))
+			snapshot := &ateapipb.ActorSnapshot{
+				Metadata:               &ateapipb.ResourceMetadata{Atespace: input.ActorRef.Atespace, Name: snapshotID},
+				SourceActor:            input.ActorRef.ToObjectRef(),
+				SourceActorUid:         latestActor.GetMetadata().GetUid(),
+				SourceActorVersion:     state.SourceVersion,
+				ActorTemplateNamespace: latestActor.GetActorTemplateNamespace(),
+				ActorTemplateName:      latestActor.GetActorTemplateName(),
+				ActorTemplateUid:       string(state.ActorTemplate.GetUID()),
+				ContentScope:           toActorSnapshotContentScope(commitSnapshotScope(input.ActorRef.Atespace, state.ActorTemplate)),
 			}
+			if _, err := s.store.CreateActorSnapshot(ctx, snapshot, location); err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+				return err
+			}
+			latestActor.LatestSnapshot = &ateapipb.ObjectRef{Atespace: input.ActorRef.Atespace, Name: snapshotID}
 			latestActor.InProgressSnapshot = ""
+			latestActor.InProgressSnapshotSourceActorVersion = 0
 		}
-		latestActor.AteomPodNamespace = ""
-		latestActor.AteomPodName = ""
-		latestActor.AteomPodIp = ""
-		latestActor.WorkerPoolName = ""
+		latestActor.WorkerAssignment = nil
+		latestActor.LocalSnapshotInfo = nil
 		updatedActor, err := s.store.UpdateActor(ctx, latestActor, latestActor.GetMetadata().GetVersion())
 		if err != nil {
 			return err

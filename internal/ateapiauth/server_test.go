@@ -16,37 +16,20 @@ package ateapiauth
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"net/url"
 	"testing"
 
+	"github.com/agent-substrate/substrate/internal/principal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
-
-func TestParseMode(t *testing.T) {
-	cases := []struct {
-		in      string
-		want    Mode
-		wantErr bool
-	}{
-		{"", ModeMTLS, false},
-		{"mtls", ModeMTLS, false},
-		{"jwt", ModeJWT, false},
-		{"none", "", true},
-		{"bogus", "", true},
-	}
-	for _, tc := range cases {
-		got, err := ParseMode(tc.in)
-		if (err != nil) != tc.wantErr {
-			t.Errorf("ParseMode(%q) err=%v wantErr=%v", tc.in, err, tc.wantErr)
-		}
-		if !tc.wantErr && got != tc.want {
-			t.Errorf("ParseMode(%q)=%v want %v", tc.in, got, tc.want)
-		}
-	}
-}
 
 func TestValidateServerConfig(t *testing.T) {
 	tests := []struct {
@@ -54,11 +37,8 @@ func TestValidateServerConfig(t *testing.T) {
 		cfg     ServerConfig
 		wantErr bool
 	}{
-		{name: "mtls zero config", cfg: ServerConfig{Mode: ModeMTLS}},
-		{name: "empty mode zero config", cfg: ServerConfig{}},
-		{name: "jwt valid", cfg: ServerConfig{Mode: ModeJWT, VerifyBearerToken: func(context.Context, string) error { return nil }}},
-		{name: "jwt missing verifier", cfg: ServerConfig{Mode: ModeJWT}, wantErr: true},
-		{name: "unknown mode", cfg: ServerConfig{Mode: Mode("bogus")}, wantErr: true},
+		{name: "valid", cfg: ServerConfig{VerifyBearerToken: func(context.Context, string) (string, error) { return "", nil }}},
+		{name: "missing verifier", cfg: ServerConfig{}, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -71,17 +51,117 @@ func TestValidateServerConfig(t *testing.T) {
 	}
 }
 
-func TestMTLSServerAuthenticatorAllowsAnonymous(t *testing.T) {
-	_, err := (mtlsServerAuthenticator{}).authenticate(context.Background())
-	if err != nil {
-		t.Fatalf("ModeMTLS should not error: %v", err)
+func TestChainedServerAuthenticatorPrincipal(t *testing.T) {
+	const subject = "system:serviceaccount:ate-system:ate-client"
+	spiffeID := &url.URL{Scheme: "spiffe", Host: "ate.dev", Path: "/ns/default/sa/router"}
+	spiffePeer := func(ctx context.Context) context.Context {
+		return peer.NewContext(ctx, &peer.Peer{
+			AuthInfo: credentials.TLSInfo{State: tls.ConnectionState{
+				PeerCertificates: []*x509.Certificate{{URIs: []*url.URL{spiffeID}}},
+			}},
+		})
+	}
+	withBearer := func(ctx context.Context, token string) context.Context {
+		return metadata.NewIncomingContext(ctx, metadata.Pairs("authorization", "Bearer "+token))
+	}
+	verifyGoodToken := func(_ context.Context, bearer string) (string, error) {
+		if bearer != "good-token" {
+			return "", fmt.Errorf("bad token")
+		}
+		return subject, nil
+	}
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		// verify is the bearer token verifier; nil means the test fails if
+		// it is called (the certificate identity must take precedence).
+		verify   func(context.Context, string) (string, error)
+		want     principal.PrincipalInfo
+		wantCode codes.Code
+	}{
+		{
+			name:     "no peer and no token",
+			ctx:      context.Background(),
+			wantCode: codes.Unauthenticated,
+		},
+		{
+			name: "peer without certificates and no token",
+			ctx: peer.NewContext(context.Background(), &peer.Peer{
+				AuthInfo: credentials.TLSInfo{},
+			}),
+			wantCode: codes.Unauthenticated,
+		},
+		{
+			name:     "no peer with valid bearer",
+			ctx:      withBearer(context.Background(), "good-token"),
+			verify:   verifyGoodToken,
+			want:     principal.PrincipalInfo{ID: subject, Kind: principal.KindJWT},
+			wantCode: codes.OK,
+		},
+		{
+			name:     "no peer with invalid bearer",
+			ctx:      withBearer(context.Background(), "bad-token"),
+			verify:   verifyGoodToken,
+			wantCode: codes.Unauthenticated,
+		},
+		{
+			name: "certificate without URI SAN with valid bearer",
+			ctx: withBearer(peer.NewContext(context.Background(), &peer.Peer{
+				AuthInfo: credentials.TLSInfo{State: tls.ConnectionState{
+					PeerCertificates: []*x509.Certificate{{}},
+				}},
+			}), "good-token"),
+			verify:   verifyGoodToken,
+			want:     principal.PrincipalInfo{ID: subject, Kind: principal.KindJWT},
+			wantCode: codes.OK,
+		},
+		{
+			name:     "certificate with SPIFFE URI SAN",
+			ctx:      spiffePeer(context.Background()),
+			want:     principal.PrincipalInfo{ID: spiffeID.String(), Kind: principal.KindMTLS},
+			wantCode: codes.OK,
+		},
+		{
+			name:     "certificate takes precedence over bearer",
+			ctx:      withBearer(spiffePeer(context.Background()), "good-token"),
+			want:     principal.PrincipalInfo{ID: spiffeID.String(), Kind: principal.KindMTLS},
+			wantCode: codes.OK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verify := tt.verify
+			if verify == nil {
+				verify = func(context.Context, string) (string, error) {
+					t.Fatal("bearer token verifier called; certificate identity must take precedence")
+					return "", nil
+				}
+			}
+			auth := newChainedAuthenticator(ServerConfig{VerifyBearerToken: verify})
+			newCtx, err := auth.authenticate(tt.ctx)
+			if code := status.Code(err); code != tt.wantCode {
+				t.Fatalf("authenticate: code=%v (err=%v), want %v", code, err, tt.wantCode)
+			}
+			if tt.wantCode != codes.OK {
+				return
+			}
+			got, ok := principal.FromContext(newCtx)
+			if !ok {
+				t.Fatal("no principal in context")
+			}
+			if got != tt.want {
+				t.Errorf("principal=%+v want %+v", got, tt.want)
+			}
+		})
 	}
 }
 
 func TestJWTServerAuthenticatorRequiresBearer(t *testing.T) {
 	auth := jwtServerAuthenticator{
-		verifyBearerToken: func(context.Context, string) error {
-			return fmt.Errorf("bad token")
+		verifyBearerToken: func(context.Context, string) (string, error) {
+			return "", fmt.Errorf("bad token")
 		},
 	}
 
@@ -96,6 +176,29 @@ func TestJWTServerAuthenticatorRequiresBearer(t *testing.T) {
 	_, err = auth.authenticate(ctx)
 	if code := status.Code(err); code != codes.Unauthenticated {
 		t.Fatalf("bad bearer: want Unauthenticated, got %v (err=%v)", code, err)
+	}
+}
+
+func TestJWTServerAuthenticatorInjectsPrincipal(t *testing.T) {
+	const subject = "system:serviceaccount:default:router"
+	auth := jwtServerAuthenticator{
+		verifyBearerToken: func(context.Context, string) (string, error) {
+			return subject, nil
+		},
+	}
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer good-token"))
+	newCtx, err := auth.authenticate(ctx)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	got, ok := principal.FromContext(newCtx)
+	if !ok {
+		t.Fatal("no principal in context")
+	}
+	want := principal.PrincipalInfo{ID: subject, Kind: principal.KindJWT}
+	if got != want {
+		t.Errorf("principal=%+v want %+v", got, want)
 	}
 }
 

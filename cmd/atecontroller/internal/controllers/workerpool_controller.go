@@ -21,6 +21,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -34,7 +35,20 @@ const workerPoolFieldOwner = "workerpool-controller"
 
 type WorkerPoolReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme       *runtime.Scheme
+	OTelEndpoint string
+	// OTelMetricExportInterval is the OTEL_METRIC_EXPORT_INTERVAL propagated to
+	// ateom pods. Empty keeps the SDK's default.
+	OTelMetricExportInterval string
+	// OTelMetricExportTimeout is the OTEL_METRIC_EXPORT_TIMEOUT propagated to
+	// ateom pods. Empty keeps the SDK's default.
+	OTelMetricExportTimeout string
+	// OTelTracesSampler is the OTEL_TRACES_SAMPLER propagated to ateom pods.
+	// Empty keeps the ateom binary's default.
+	OTelTracesSampler string
+	// OTelTracesSamplerArg is the OTEL_TRACES_SAMPLER_ARG propagated to ateom
+	// pods. Ignored unless OTelTracesSampler is set.
+	OTelTracesSamplerArg string
 }
 
 //+kubebuilder:rbac:groups=ate.dev,resources=workerpools,verbs=get;list;watch;create;update;patch;delete
@@ -90,7 +104,13 @@ func (r *WorkerPoolReconciler) reconcileWorkerPool(ctx context.Context, wp *atev
 }
 
 func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alpha1.WorkerPool) error {
-	depAC := buildDeploymentApplyConfig(wp)
+	depAC := buildDeploymentApplyConfig(wp, ateomOTelSettings{
+		Endpoint:             r.OTelEndpoint,
+		MetricExportInterval: r.OTelMetricExportInterval,
+		MetricExportTimeout:  r.OTelMetricExportTimeout,
+		TracesSampler:        r.OTelTracesSampler,
+		TracesSamplerArg:     r.OTelTracesSamplerArg,
+	})
 	if err := r.Apply(ctx, depAC, client.FieldOwner(workerPoolFieldOwner), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply Deployment: %w", err)
 	}
@@ -98,7 +118,15 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alp
 }
 
 func (r *WorkerPoolReconciler) syncStatus(ctx context.Context, wp *atev1alpha1.WorkerPool, dep *appsv1.Deployment) error {
-	want := atev1alpha1.WorkerPoolStatus{Replicas: dep.Status.Replicas}
+	selector, err := metav1.LabelSelectorAsSelector(dep.Spec.Selector)
+	if err != nil {
+		return fmt.Errorf("failed to convert Deployment selector: %w", err)
+	}
+
+	want := atev1alpha1.WorkerPoolStatus{
+		Replicas: dep.Status.Replicas,
+		Selector: selector.String(),
+	}
 	if equality.Semantic.DeepEqual(wp.Status, want) {
 		return nil
 	}

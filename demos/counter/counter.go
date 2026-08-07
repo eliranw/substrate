@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -41,20 +42,18 @@ var (
 	fileMutex    sync.Mutex
 )
 
-const fileCounterPath = "/home/counter/a.txt"
-
-func incrementFileCounter() int {
+func incrementFileCounter(filePath string) int {
 	fileMutex.Lock()
 	defer fileMutex.Unlock()
 	counter := 0
-	data, err := os.ReadFile(fileCounterPath)
+	data, err := os.ReadFile(filePath)
 	if err == nil {
 		if i, err := strconv.Atoi(string(data)); err == nil {
 			counter = i
 		}
 	}
 	counter++
-	err = os.WriteFile(fileCounterPath, []byte(strconv.Itoa(counter)), 0o644)
+	err = os.WriteFile(filePath, []byte(strconv.Itoa(counter)), 0o644)
 	if err != nil {
 		return -1
 	}
@@ -62,6 +61,9 @@ func incrementFileCounter() int {
 }
 
 func main() {
+	fileCounterDirectory := pflag.String("file-counter-directory", "/home/counter", "Directory for file counter")
+	secondFileCounterDirectory := pflag.String("second-file-counter-directory", "", "Directory for a second file counter; empty disables it. Used to exercise an Actor with more than one durable volume")
+	validateExistingFilePath := pflag.String("validate-existing-file-path", "", "Path to existing file to validate reading")
 	pflag.Parse()
 	ctx := context.Background()
 
@@ -70,11 +72,31 @@ func main() {
 	defaultMux := http.NewServeMux()
 	defaultMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		fileCounter := incrementFileCounter()
-
+		fileCounter := incrementFileCounter(filepath.Join(*fileCounterDirectory, "a.txt"))
 		memoryCounter := atomic.AddUint64(&requestCount, 1)
 		currentIP := getCurrentIP()
-		response := fmt.Sprintf("hello from: %s | preserved memory count: %d | preserved file counter: %d\n", currentIP, memoryCounter, fileCounter)
+
+		fileContentStr := ""
+		if *validateExistingFilePath != "" {
+			fileContent, err := os.ReadFile(*validateExistingFilePath)
+			if err != nil {
+				fileResponse := fmt.Sprintf("failed to read test file: %s\n", err.Error())
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(fileResponse))
+				return
+			}
+			fileContentStr = fmt.Sprintf(" | file content: %s", string(fileContent))
+		}
+
+		// A second counter in another directory, so an Actor with more than one
+		// durable volume can show each of them persisting independently.
+		secondFileCounterStr := ""
+		if *secondFileCounterDirectory != "" {
+			secondFileCounter := incrementFileCounter(filepath.Join(*secondFileCounterDirectory, "a.txt"))
+			secondFileCounterStr = fmt.Sprintf(" | preserved second file counter: %d", secondFileCounter)
+		}
+
+		response := fmt.Sprintf("hello from: %s | preserved memory count: %d | preserved file counter: %d%s%s\n", currentIP, memoryCounter, fileCounter, secondFileCounterStr, fileContentStr)
 		slog.InfoContext(ctx, "Handled request", slog.String("response", response))
 
 		w.WriteHeader(http.StatusOK)

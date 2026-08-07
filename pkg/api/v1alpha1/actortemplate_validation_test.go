@@ -21,8 +21,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/envtestbins"
+	"github.com/agent-substrate/substrate/internal/testenv"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -31,48 +32,32 @@ import (
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
 var (
-	testEnv   *envtest.Environment
 	cfg       *rest.Config
 	k8sClient client.Client
 )
 
 func TestMain(m *testing.M) {
-	binaryAssetsDirectory, err := envtestbins.BinaryAssetsDir()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
-
-	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{"../../../manifests/ate-install/generated"},
-		BinaryAssetsDirectory: binaryAssetsDirectory,
-	}
-
-	cfg, err = testEnv.Start()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "envtest start failed: %v\n", err)
-		testEnv.Stop()
-		os.Exit(1)
-	}
+	var stopEnv func()
+	cfg, stopEnv = testenv.Start()
 
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(AddToScheme(scheme))
 
+	var err error
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "k8s client creation failed: %v\n", err)
-		testEnv.Stop()
+		stopEnv()
 		os.Exit(1)
 	}
 
 	code := m.Run()
 
-	_ = testEnv.Stop()
+	stopEnv()
 	os.Exit(code)
 }
 
@@ -106,6 +91,9 @@ func TestActorTemplateValidation(t *testing.T) {
 		mutate  func(*ActorTemplate)
 		wantErr bool
 		errMsg  string
+		// verify runs on the created object for cases that assert what the API
+		// server stored rather than whether it accepted the create.
+		verify func(*testing.T, *ActorTemplate)
 	}{{
 		name:    "base template",
 		mutate:  func(at *ActorTemplate) {},
@@ -195,6 +183,29 @@ func TestActorTemplateValidation(t *testing.T) {
 		mutate: func(at *ActorTemplate) {
 			for range 65 {
 				at.Spec.Containers[0].Command = append(at.Spec.Containers[0].Command, "x")
+			}
+		},
+		wantErr: true,
+		errMsg:  "Too many",
+	}, {
+		name: "valid container Args",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].Args = []string{"arg"}
+		},
+		wantErr: false,
+	}, {
+		name: "long container Args",
+		mutate: func(at *ActorTemplate) {
+			for range 64 {
+				at.Spec.Containers[0].Args = append(at.Spec.Containers[0].Args, "x")
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "too-many container Args",
+		mutate: func(at *ActorTemplate) {
+			for range 65 {
+				at.Spec.Containers[0].Args = append(at.Spec.Containers[0].Args, "x")
 			}
 		},
 		wantErr: true,
@@ -468,6 +479,65 @@ func TestActorTemplateValidation(t *testing.T) {
 		wantErr: true,
 		errMsg:  "should match",
 	}, {
+		// A probe that declares only a port reads back with the omitted fields
+		// filled in, so a template author can see the effective readiness
+		// settings on the object rather than having to know what the ateom
+		// would substitute.
+		name: "Readyz omitted fields are defaulted by the API server",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].Readyz = &ContainerReadyz{
+				HTTPGet: &HTTPGetAction{Port: 80},
+			}
+		},
+		wantErr: false,
+		verify: func(t *testing.T, at *ActorTemplate) {
+			readyz := at.Spec.Containers[0].Readyz
+			if want, got := "/readyz", readyz.HTTPGet.Path; got != want {
+				t.Errorf("Readyz.HTTPGet.Path = %q, want %q (CRD default)", got, want)
+			}
+			if want, got := int32(30), readyz.TimeoutSeconds; got != want {
+				t.Errorf("Readyz.TimeoutSeconds = %d, want %d (CRD default)", got, want)
+			}
+		},
+	}, {
+		name: "valid Readyz TimeoutSeconds",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].Readyz = &ContainerReadyz{
+				HTTPGet:        &HTTPGetAction{Port: 80},
+				TimeoutSeconds: 300,
+			}
+		},
+		wantErr: false,
+		verify: func(t *testing.T, at *ActorTemplate) {
+			if want, got := int32(300), at.Spec.Containers[0].Readyz.TimeoutSeconds; got != want {
+				t.Errorf("Readyz.TimeoutSeconds = %d, want %d (explicit value must survive defaulting)", got, want)
+			}
+		},
+	}, {
+		// A zero deadline could never be met. The field omits its zero value,
+		// so 0 from a Go client is indistinguishable from unset and defaults to
+		// 30; a manifest that spells out 0 is rejected by the same bound this
+		// case exercises.
+		name: "Readyz TimeoutSeconds below the minimum",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].Readyz = &ContainerReadyz{
+				HTTPGet:        &HTTPGetAction{Port: 80},
+				TimeoutSeconds: -1,
+			}
+		},
+		wantErr: true,
+		errMsg:  "should be greater than or equal to 1",
+	}, {
+		name: "Readyz TimeoutSeconds above the maximum",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].Readyz = &ContainerReadyz{
+				HTTPGet:        &HTTPGetAction{Port: 80},
+				TimeoutSeconds: 3601,
+			}
+		},
+		wantErr: true,
+		errMsg:  "should be less than or equal to 3600",
+	}, {
 		name: "valid SandboxClass microvm",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.SandboxClass = SandboxClassMicroVM
@@ -537,6 +607,45 @@ func TestActorTemplateValidation(t *testing.T) {
 		wantErr: true,
 		errMsg:  "Unsupported value",
 	}, {
+		name: "SnapshotsConfig: onResume.fromData=Golden, microvm",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.SnapshotsConfig.OnCommit = SnapshotScopeData
+			at.Spec.SnapshotsConfig.OnResume = OnResumeConfig{FromData: ResumeSourceGolden}
+		},
+		wantErr: false,
+	}, {
+		name: "SnapshotsConfig: onResume.fromData=ColdBoot, gvisor",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SnapshotsConfig.OnResume = OnResumeConfig{FromData: ResumeSourceColdBoot}
+		},
+		wantErr: false,
+	}, {
+		name: "SnapshotsConfig: onResume.fromData invalid enum value",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.SnapshotsConfig.OnResume = OnResumeConfig{FromData: ResumeSource("bogus")}
+		},
+		wantErr: true,
+		errMsg:  "Unsupported value",
+	}, {
+		name: "SnapshotsConfig: onResume.fromData=Golden, explicit gvisor (invalid)",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassGvisor
+			at.Spec.SnapshotsConfig.OnCommit = SnapshotScopeData
+			at.Spec.SnapshotsConfig.OnResume = OnResumeConfig{FromData: ResumeSourceGolden}
+		},
+		wantErr: true,
+		errMsg:  "onResume.fromData: Golden is not supported when sandboxClass is 'gvisor'",
+	}, {
+		name: "SnapshotsConfig: onResume.fromData=Golden, SandboxClass unset (defaults to gvisor, invalid)",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SnapshotsConfig.OnCommit = SnapshotScopeData
+			at.Spec.SnapshotsConfig.OnResume = OnResumeConfig{FromData: ResumeSourceGolden}
+		},
+		wantErr: true,
+		errMsg:  "onResume.fromData: Golden is not supported when sandboxClass is 'gvisor'",
+	}, {
 		name: "Volumes: 1 DurableDir mount is valid",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.Volumes = []Volume{
@@ -548,7 +657,7 @@ func TestActorTemplateValidation(t *testing.T) {
 		},
 		wantErr: false,
 	}, {
-		name: "Volumes: 2 DurableDir volumes in template is invalid",
+		name: "Volumes: 2 DurableDir volumes in template is valid",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.Volumes = []Volume{
 				{Name: "vol1", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
@@ -559,10 +668,9 @@ func TestActorTemplateValidation(t *testing.T) {
 				{Name: "vol2", MountPath: "/home2"},
 			}
 		},
-		wantErr: true,
-		errMsg:  "At most one DurableDir-typed volume is supported per ActorTemplate",
+		wantErr: false,
 	}, {
-		name: "Volumes: 2 DurableDir volumes spread across containers is invalid",
+		name: "Volumes: 2 DurableDir volumes spread across containers is valid",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.Volumes = []Volume{
 				{Name: "vol1", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
@@ -579,10 +687,9 @@ func TestActorTemplateValidation(t *testing.T) {
 				{Name: "vol1", MountPath: "/home1"},
 			}
 		},
-		wantErr: true,
-		errMsg:  "At most one DurableDir-typed volume is supported per ActorTemplate",
+		wantErr: false,
 	}, {
-		name: "Volumes: same DurableDir volume mounted twice in one container is invalid",
+		name: "Volumes: same DurableDir volume mounted twice in one container is valid",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.Volumes = []Volume{
 				{Name: "vol1", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
@@ -592,8 +699,7 @@ func TestActorTemplateValidation(t *testing.T) {
 				{Name: "vol1", MountPath: "/home2"},
 			}
 		},
-		wantErr: true,
-		errMsg:  "A container may mount at most one DurableDir-typed volume",
+		wantErr: false,
 	}, {
 		name: "Volumes: same DurableDir volume mounted across two containers is valid",
 		mutate: func(at *ActorTemplate) {
@@ -613,6 +719,96 @@ func TestActorTemplateValidation(t *testing.T) {
 		},
 		wantErr: false,
 	}, {
+		name: "Volumes: 1 ExternalVolumeTemplate mount is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "vol1",
+					VolumeSource: VolumeSource{
+						ExternalVolumeTemplate: &ExternalVolumeTemplate{
+							Capacity:         resource.MustParse("10Gi"),
+							StorageClassName: "standard",
+						},
+					},
+				},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "vol1", MountPath: "/mnt/data"},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "Volumes: multiple ExternalVolumeTemplate mounts are valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "vol1",
+					VolumeSource: VolumeSource{
+						ExternalVolumeTemplate: &ExternalVolumeTemplate{
+							Capacity:         resource.MustParse("10Gi"),
+							StorageClassName: "standard",
+						},
+					},
+				},
+				{
+					Name: "vol2",
+					VolumeSource: VolumeSource{
+						ExternalVolumeTemplate: &ExternalVolumeTemplate{
+							Capacity:         resource.MustParse("20Gi"),
+							StorageClassName: "pd-ssd",
+						},
+					},
+				},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "vol1", MountPath: "/mnt/vol1"},
+				{Name: "vol2", MountPath: "/mnt/vol2"},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "Volumes: 1 DurableDir and 1 ExternalVolumeTemplate on same ActorTemplate is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{Name: "home", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
+				{
+					Name: "ext",
+					VolumeSource: VolumeSource{
+						ExternalVolumeTemplate: &ExternalVolumeTemplate{
+							Capacity:         resource.MustParse("10Gi"),
+							StorageClassName: "standard",
+						},
+					},
+				},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "home", MountPath: "/home"},
+				{Name: "ext", MountPath: "/mnt/ext"},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "Volumes: VolumeSource with both DurableDir and ExternalVolumeTemplate set is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "vol1",
+					VolumeSource: VolumeSource{
+						DurableDir: &DurableDirVolumeSource{},
+						ExternalVolumeTemplate: &ExternalVolumeTemplate{
+							Capacity:         resource.MustParse("10Gi"),
+							StorageClassName: "standard",
+						},
+					},
+				},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "vol1", MountPath: "/mnt/data"},
+			}
+		},
+		wantErr: true,
+		errMsg:  "exactly one of the fields in [durableDir externalVolumeTemplate] must be set",
+	}, {
 		name: "Volumes: VolumeSource with no source set is invalid",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.Volumes = []Volume{
@@ -620,7 +816,7 @@ func TestActorTemplateValidation(t *testing.T) {
 			}
 		},
 		wantErr: true,
-		errMsg:  "exactly one of the fields in [durableDir] must be set",
+		errMsg:  "exactly one of the fields in [durableDir externalVolumeTemplate] must be set",
 	}, {
 		name: "Volumes: VolumeSource with no source set is invalid (mixed with a valid DurableDir volume)",
 		mutate: func(at *ActorTemplate) {
@@ -634,7 +830,7 @@ func TestActorTemplateValidation(t *testing.T) {
 			}
 		},
 		wantErr: true,
-		errMsg:  "exactly one of the fields in [durableDir] must be set",
+		errMsg:  "exactly one of the fields in [durableDir externalVolumeTemplate] must be set",
 	}, {
 		name: "Volumes: DurableDir MountPath with nested absolute path is valid",
 		mutate: func(at *ActorTemplate) {
@@ -884,7 +1080,7 @@ func TestActorTemplateValidation(t *testing.T) {
 		wantErr: true,
 		errMsg:  "Name must be a valid DNS label",
 	}, {
-		name: "Volumes: DurableDir volume with SandboxClass microvm is invalid",
+		name: "Volumes: DurableDir volume with SandboxClass microvm is valid",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.SandboxClass = SandboxClassMicroVM
 			at.Spec.Volumes = []Volume{
@@ -894,8 +1090,54 @@ func TestActorTemplateValidation(t *testing.T) {
 				{Name: "vol1", MountPath: "/home/user"},
 			}
 		},
-		wantErr: true,
-		errMsg:  "DurableDir volumes are not supported when sandboxClass is 'microvm'",
+		wantErr: false,
+	}, {
+		name: "Volumes: 2 DurableDir volumes with SandboxClass microvm is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Volumes = []Volume{
+				{Name: "vol1", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
+				{Name: "vol2", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "vol1", MountPath: "/home1"},
+				{Name: "vol2", MountPath: "/home2"},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "Volumes: 2 DurableDir volumes spread across containers with SandboxClass microvm is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Volumes = []Volume{
+				{Name: "vol1", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
+				{Name: "vol2", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
+			}
+			at.Spec.Containers = append(at.Spec.Containers, Container{
+				Name:  "sidecar",
+				Image: "busybox@sha256:326e0e090a9a4057e62a1b94236e7a2df2f2f76722f67232e0e47854e4df9c53",
+				VolumeMounts: []VolumeMount{
+					{Name: "vol2", MountPath: "/home2"},
+				},
+			})
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "vol1", MountPath: "/home1"},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "Volumes: same DurableDir volume mounted twice in one container with SandboxClass microvm is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Volumes = []Volume{
+				{Name: "vol1", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "vol1", MountPath: "/home1"},
+				{Name: "vol1", MountPath: "/home2"},
+			}
+		},
+		wantErr: false,
 	}, {
 		name: "Volumes: DurableDir volume with SandboxClass gvisor is valid",
 		mutate: func(at *ActorTemplate) {
@@ -909,11 +1151,90 @@ func TestActorTemplateValidation(t *testing.T) {
 		},
 		wantErr: false,
 	}, {
+		name: "Volumes: ExternalVolumeTemplate volume with SandboxClass microvm is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "vol1",
+					VolumeSource: VolumeSource{
+						ExternalVolumeTemplate: &ExternalVolumeTemplate{
+							Capacity:         resource.MustParse("10Gi"),
+							StorageClassName: "standard",
+						},
+					},
+				},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "vol1", MountPath: "/mnt/data"},
+			}
+		},
+		wantErr: true,
+		errMsg:  "ExternalVolumes are not supported when sandboxClass is 'microvm'",
+	}, {
+		name: "Volumes: ExternalVolumeTemplate volume with SandboxClass gvisor is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassGvisor
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "vol1",
+					VolumeSource: VolumeSource{
+						ExternalVolumeTemplate: &ExternalVolumeTemplate{
+							Capacity:         resource.MustParse("10Gi"),
+							StorageClassName: "standard",
+						},
+					},
+				},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "vol1", MountPath: "/mnt/data"},
+			}
+		},
+		wantErr: false,
+	}, {
 		name: "Volumes: SandboxClass microvm without DurableDir volumes is valid",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.SandboxClass = SandboxClassMicroVM
 		},
 		wantErr: false,
+	}, {
+		name: "Volumes: volume without volumeMount is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{Name: "vol1", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
+			}
+		},
+		wantErr: true,
+		errMsg:  "All volumes defined in spec.volumes must be mounted by at least one container",
+	}, {
+		name: "Volumes: multiple volumes with one unmounted is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "vol1",
+					VolumeSource: VolumeSource{
+						ExternalVolumeTemplate: &ExternalVolumeTemplate{
+							Capacity:         resource.MustParse("10Gi"),
+							StorageClassName: "standard",
+						},
+					},
+				},
+				{
+					Name: "vol2",
+					VolumeSource: VolumeSource{
+						ExternalVolumeTemplate: &ExternalVolumeTemplate{
+							Capacity:         resource.MustParse("20Gi"),
+							StorageClassName: "pd-ssd",
+						},
+					},
+				},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "vol1", MountPath: "/mnt/vol1"},
+			}
+		},
+		wantErr: true,
+		errMsg:  "All volumes defined in spec.volumes must be mounted by at least one container",
 	}}
 
 	for _, tt := range tests {
@@ -932,44 +1253,14 @@ func TestActorTemplateValidation(t *testing.T) {
 				t.Errorf("wrong error:\n  wanted: %q\n     got: %q", tt.errMsg, err.Error())
 			}
 			if err == nil {
+				// Create writes the API server's response back into at, so
+				// verify sees the object as stored — defaults included.
+				if tt.verify != nil {
+					tt.verify(t, at)
+				}
 				_ = k8sClient.Delete(ctx, at)
 			}
 		})
-	}
-}
-
-func TestActorTemplateReadyzPathDefault(t *testing.T) {
-	ctx := t.Context()
-
-	at := &ActorTemplate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "readyz-default",
-			Namespace: "default",
-		},
-		Spec: ActorTemplateSpec{
-			PauseImage: "gcr.io/gke-release/pause@sha256:bcbd57ba5653580ec647b16d8163cdd1112df3609129b01f912a8032e48265da",
-			Containers: []Container{{
-				Name:  "main",
-				Image: "busybox@sha256:326e0e090a9a4057e62a1b94236e7a2df2f2f76722f67232e0e47854e4df9c53",
-				Readyz: &ContainerReadyz{
-					HTTPGet: &HTTPGetAction{Port: 8080},
-				},
-			}},
-			SnapshotsConfig: SnapshotsConfig{Location: "gs://test-bucket/test-folder"},
-			WorkerSelector:  &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "test-pool"}},
-		},
-	}
-	if err := k8sClient.Create(ctx, at); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	defer func() { _ = k8sClient.Delete(ctx, at) }()
-
-	got := &ActorTemplate{}
-	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(at), got); err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if want, gotPath := "/readyz", got.Spec.Containers[0].Readyz.HTTPGet.Path; gotPath != want {
-		t.Errorf("Readyz.HTTPGet.Path = %q, want %q (CRD default)", gotPath, want)
 	}
 }
 

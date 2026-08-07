@@ -16,27 +16,18 @@ package router
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
-	"time"
 
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -53,6 +44,10 @@ import (
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
+// dataPlaneTraceRatio is the default root sampling fraction for parentless
+// data plane requests; OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG override it.
+const dataPlaneTraceRatio = 0.01
+
 var (
 	scheme = runtime.NewScheme()
 )
@@ -62,37 +57,9 @@ func init() {
 	utilruntime.Must(v1alpha1.AddToScheme(scheme))
 }
 
-// RouterConfig holds deployment setup and endpoint options for the router node instance.
-type RouterConfig struct {
-	Standalone     bool
-	Namespace      string
-	Kubeconfig     string
-	AteapiAddr     string
-	HttpPort       int
-	XdsPort        int
-	ExtprocPort    int
-	ExtprocAddr    string
-	EnvoyImage     string
-	TemplatesFile  string
-	StatusPort     int
-	HealthInterval time.Duration
-	HttpsPort      int
-	EnvoyCertPath  string
-	LogLevel       string
-	MetricsAddr    string
-	// OtlpCollectorAddress is the host:port of the OTLP gRPC collector that
-	// Envoy reports tracing spans to. Empty disables Envoy-side tracing.
-	OtlpCollectorAddress string
-
-	AteapiAuthMode   string
-	AteapiCAFile     string
-	AteapiServerName string
-	AteapiTokenFile  string
-}
-
 // RouterServer instantiates and coordinates runtime threads executing system modules.
 type RouterServer struct {
-	cfg RouterConfig
+	cfg routerConfig
 
 	Cmd        *cobra.Command
 	k8sClient  client.Client
@@ -103,7 +70,7 @@ type RouterServer struct {
 	atStore    atStore
 }
 
-func NewRouterServer(cfg RouterConfig) (*RouterServer, error) {
+func NewRouterServer(cfg routerConfig) (*RouterServer, error) {
 	var k8sClient client.Client
 	var clientset kubernetes.Interface
 
@@ -160,25 +127,29 @@ func (s *RouterServer) Run(ctx context.Context) error {
 		cancel()
 	}()
 
-	var level slog.Level
-	switch strings.ToLower(s.cfg.LogLevel) {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		level = slog.LevelInfo
+	// Validate the configuration before doing any other work, so a bad flag
+	// combination fails fast — no tracing, metrics, or connections are set up
+	// for a router that is about to refuse to start. The parking config is
+	// resolved once here so every consumer — the resumer's retry loop and the
+	// Envoy ext_proc timeout — sees the same effective values.
+	if err := s.cfg.validate(); err != nil {
+		return fmt.Errorf("invalid router configuration: %w", err)
 	}
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
+	parkCfg := s.cfg.ParkedRequest.normalized()
+
+	serverboot.InitLogger()
+	if err := serverboot.SetLogLevel(s.cfg.LogLevel); err != nil {
+		return err
+	}
 
 	// Tracing must be initialized before constructing the ateapi gRPC client
 	// below, because otelgrpc.NewClientHandler captures the global
-	// TracerProvider at construction time.
+	// TracerProvider at construction time. Resolved once so the router's SDK
+	// sampler and Envoy's RandomSampling percent cannot drift.
+	sampling := serverboot.ResolveTraceSampling(ctx, serverboot.ParentRatioSampling(dataPlaneTraceRatio))
 	tp, err := serverboot.InitTracing(ctx, serverboot.TracingOptions{
 		ServiceName: routerServiceName,
-		Sampler:     sdktrace.ParentBased(sdktrace.NeverSample()),
+		Sampling:    sampling,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize tracing: %w", err)
@@ -193,15 +164,12 @@ func (s *RouterServer) Run(ctx context.Context) error {
 
 	go serverboot.StartMetricsServer(ctx, serverboot.MetricsServerOptions{Addr: s.cfg.MetricsAddr})
 
-	authMode, err := ateapiauth.ParseMode(s.cfg.AteapiAuthMode)
-	if err != nil {
-		return fmt.Errorf("invalid --ateapi-auth: %w", err)
-	}
 	dialOpts, err := ateapiauth.DialOptions(ateapiauth.ClientConfig{
-		Mode:       authMode,
-		CAFile:     s.cfg.AteapiCAFile,
-		ServerName: s.cfg.AteapiServerName,
-		TokenFile:  s.cfg.AteapiTokenFile,
+		UseTokenAuth:     s.cfg.Auth.AteapiUseTokenAuth,
+		CAFile:           s.cfg.Auth.AteapiCAFile,
+		ServerName:       s.cfg.Auth.AteapiServerName,
+		TokenFile:        s.cfg.Auth.AteapiTokenFile,
+		ClientCredBundle: s.cfg.Auth.AteapiClientCertPath,
 	})
 	if err != nil {
 		return fmt.Errorf("building ateapi dial options: %w", err)
@@ -214,64 +182,37 @@ func (s *RouterServer) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to establish grpc channel to ateapi client: %w", err)
 	}
-	slog.InfoContext(ctx, "Connecting to ateapi", slog.String("address", s.cfg.AteapiAddr), slog.String("auth", string(authMode)))
+	slog.InfoContext(ctx, "Connecting to ateapi", slog.String("address", s.cfg.AteapiAddr), slog.Bool("use-api-token-auth", s.cfg.Auth.AteapiUseTokenAuth))
 	s.apiClient = ateapipb.NewControlClient(conn)
 
-	slog.InfoContext(ctx, "Starting substrate router subsystem", slog.Bool("standalone", s.cfg.Standalone))
+	slog.InfoContext(ctx, "Starting substrate router subsystem",
+		slog.Bool("standalone", s.cfg.Standalone),
+		slog.String("atenet_router", string(s.cfg.atenetRouter())))
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	xdsSrv := NewXdsServer(s.cfg.XdsPort)
-	xdsSrv.SetConfig(s.cfg.HttpPort, s.cfg.ExtprocPort, s.cfg.ExtprocAddr)
-	if err := xdsSrv.SetOtlpCollector(s.cfg.OtlpCollectorAddress); err != nil {
-		return fmt.Errorf("configure OTLP collector: %w", err)
-	}
-
-	var certContent, keyContent string
-	if s.cfg.EnvoyCertPath == "" {
-		slog.InfoContext(ctx, "No Envoy certificate path provided, generating self-signed certificate for testing")
-		var err error
-		certContent, keyContent, err = generateSelfSignedCert()
-		if err != nil {
-			return fmt.Errorf("failed to generate self-signed cert: %w", err)
-		}
-	}
-
-	xdsSrv.SetTlsConfig(s.cfg.HttpsPort, s.cfg.EnvoyCertPath, certContent, keyContent)
 	if s.extprocSrv == nil {
 		routeDuration, err := newRouteDurationHistogram()
 		if err != nil {
 			return fmt.Errorf("failed to create route-duration histogram: %w", err)
 		}
-		s.extprocSrv = NewExtProcServer(s.cfg.ExtprocPort, s.apiClient, routeDuration)
+		parkMetrics, err := newParkingMetrics()
+		if err != nil {
+			return fmt.Errorf("failed to create parking metrics: %w", err)
+		}
+		s.extprocSrv = NewExtProcServer(s.cfg.ExtprocPort, s.apiClient, routeDuration, parkCfg, parkMetrics, s.cfg.atenetRouter().routeViaAuthority())
 	}
-	ctrl := NewController(s.k8sClient, s.clientset, s.cfg, xdsSrv, s.extprocSrv)
-
 	s.health = newRouterHealth(s.cfg.HealthInterval, s.clientset, s.apiClient, s.cfg)
 
-	// Start Controller / Watcher
-	g.Go(func() error {
-		slog.InfoContext(ctx, "Starting ActorTemplate controller")
-		return ctrl.Start(ctx)
-	})
+	if err := s.startDataplane(ctx, g, parkCfg, sampling.RootSamplingPercent()); err != nil {
+		return err
+	}
 
 	// Start periodic service checking logic
 	g.Go(func() error {
 		slog.InfoContext(ctx, "Starting periodic health checker", slog.Duration("interval", s.cfg.HealthInterval))
 		s.health.Start(ctx)
 		return nil
-	})
-
-	// Start xDS Server
-	g.Go(func() error {
-		slog.InfoContext(ctx, "Starting Envoy xDS Server", slog.Int("port", s.cfg.XdsPort))
-		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.XdsPort))
-		if err != nil {
-			return fmt.Errorf("failed to listen on port %d: %w", s.cfg.XdsPort, err)
-		}
-		defer lis.Close()
-
-		return xdsSrv.Serve(ctx, lis)
 	})
 
 	// Start ExtProc Server
@@ -314,38 +255,20 @@ func (s *RouterServer) Run(ctx context.Context) error {
 	return g.Wait()
 }
 
-func generateSelfSignedCert() (string, string, error) {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return "", "", err
+// setOtlpCollector points Envoy's tracer at the configured collector, and
+// gives up on Envoy-side tracing if the address is one Envoy cannot use.
+//
+// It never fails the router. The address defaults to
+// OTEL_EXPORTER_OTLP_ENDPOINT, which the router's own exporter reads too and
+// which legitimately carries forms Envoy's plaintext tracer cluster cannot
+// reach — an https collector, most of all. Refusing to start would take the
+// xDS control plane for every Envoy in the mesh down over a tracing endpoint
+// that works fine for its other reader. Losing Envoy's spans is the smaller
+// failure, so take it and say so loudly.
+func setOtlpCollector(ctx context.Context, xdsSrv *XdsServer, addr string) {
+	if err := xdsSrv.SetOtlpCollector(addr); err != nil {
+		slog.WarnContext(ctx, "Envoy-side tracing disabled: the OTLP collector address is not one Envoy can use. The router's own spans are unaffected; set --otlp-collector-address to point Envoy at a plaintext collector",
+			slog.String("address", addr), slog.Any("err", err))
+		xdsSrv.DisableOtlpCollector()
 	}
-
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"Substrate Local Test"},
-		},
-		NotBefore: time.Now(),
-		NotAfter:  time.Now().Add(time.Hour * 24 * 365),
-
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-	}
-
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		return "", "", err
-	}
-
-	certPem := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-
-	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		return "", "", err
-	}
-	keyPem := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
-
-	return string(certPem), string(keyPem), nil
 }

@@ -27,25 +27,28 @@ import (
 )
 
 func (s *Service) PauseActor(ctx context.Context, req *ateapipb.PauseActorRequest) (*ateapipb.PauseActorResponse, error) {
-	if err := validatePauseActorRequest(req); err != nil {
-		return nil, err
+	if errs := validatePauseActorRequest(req); len(errs) > 0 {
+		return nil, toGRPCStatusError(errs)
 	}
+	actorRef := resources.ActorRefFromObjectRef(req.GetActor())
+	setSpanActorRefAttributes(ctx, actorRef)
 
-	actor, err := s.actorWorkflow.PauseActor(ctx, req.GetActor().GetAtespace(), req.GetActor().GetName())
+	actor, err := s.actorWorkflow.PauseActor(ctx, actorRef)
 	if err != nil {
-		if errors.Is(err, store.ErrPersistenceRetry) {
+		if errors.Is(err, store.ErrVersionConflict) {
 			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
 		}
 		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "Actor %s not found", req.GetActor().GetName())
+			return nil, status.Errorf(codes.NotFound, "Actor %s not found", actorRef)
 		}
 		return nil, err
 	}
 
+	setSpanActorAttributes(ctx, actor)
 	return &ateapipb.PauseActorResponse{Actor: actor}, nil
 }
 
-func validatePauseActorRequest(req *ateapipb.PauseActorRequest) error {
+func validatePauseActorRequest(req *ateapipb.PauseActorRequest) field.ErrorList {
 	var fldPath *field.Path
 	var errs field.ErrorList
 
@@ -55,8 +58,5 @@ func validatePauseActorRequest(req *ateapipb.PauseActorRequest) error {
 		errs = append(errs, resources.ValidateObjectRef(val, fldPath)...)
 	}
 
-	if len(errs) > 0 {
-		return status.Error(codes.InvalidArgument, errs.ToAggregate().Error())
-	}
-	return nil
+	return errs
 }

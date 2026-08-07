@@ -15,12 +15,20 @@
 package controlapi
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"slices"
 
+	"github.com/agent-substrate/substrate/internal/credbundle"
+	"github.com/agent-substrate/substrate/internal/substratex509"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/lru"
@@ -28,19 +36,39 @@ import (
 
 var ErrWorkerPodNotFound = errors.New("worker pod not found")
 
+// The SPIFFE identity that atelet serving certs carry, as minted by the
+// podidentity signer (cmd/podcertcontroller/internal/podidentitysigner).
+// The namespace part is ateletNamespace, declared in informer.go.
+const (
+	trustDomainName = "cluster.local"
+	ateletSA        = "atelet"
+)
+
 // AteletDialer handles gRPC connections to Atelet pods.
 type AteletDialer struct {
 	workerIndexer cache.Indexer
 	ateletIndexer cache.Indexer
 	ateletConns   *lru.Cache
+	// dialCredentials builds the transport credentials used to dial a given
+	// atelet, keyed on the atelet's expected pod UID. Production wires this to
+	// per-atelet mTLS; tests can override it with insecure credentials.
+	dialCredentials func(expectedPodUID string) (credentials.TransportCredentials, error)
 }
 
-// NewAteletDialer creates a new AteletDialer.
-func NewAteletDialer(workerIndexer cache.Indexer, ateletIndexer cache.Indexer) *AteletDialer {
+// NewAteletDialer creates a new AteletDialer. clientBundlePath and serverCAPath
+// are used to build the per-atelet mTLS credentials used for every atelet connection.
+func NewAteletDialer(workerIndexer cache.Indexer, ateletIndexer cache.Indexer, clientBundlePath, serverCAPath string) *AteletDialer {
 	return &AteletDialer{
 		workerIndexer: workerIndexer,
 		ateletIndexer: ateletIndexer,
 		ateletConns:   lru.New(1024),
+		dialCredentials: func(expectedPodUID string) (credentials.TransportCredentials, error) {
+			tlsConfig, err := buildTLSConfig(clientBundlePath, serverCAPath, expectedPodUID)
+			if err != nil {
+				return nil, err
+			}
+			return credentials.NewTLS(tlsConfig), nil
+		},
 	}
 }
 
@@ -73,7 +101,7 @@ func (d *AteletDialer) DialForWorker(workerPodNamespace, workerPodName string) (
 	}
 
 	selectedAtelet := matchingAtelets[0].(*corev1.Pod)
-	ateletKey := selectedAtelet.ObjectMeta.Namespace + "/" + selectedAtelet.ObjectMeta.Name
+	ateletKey := string(selectedAtelet.ObjectMeta.UID)
 
 	ateletConnAny, ok := d.ateletConns.Get(ateletKey)
 	if ok {
@@ -81,12 +109,17 @@ func (d *AteletDialer) DialForWorker(workerPodNamespace, workerPodName string) (
 	}
 
 	if len(selectedAtelet.Status.PodIPs) == 0 {
-		return nil, fmt.Errorf("selected atelet %q has no assigned IPs: %w", selectedAtelet.ObjectMeta.Namespace+"/"+selectedAtelet.ObjectMeta.Name, err)
+		return nil, fmt.Errorf("selected atelet %q has no assigned IPs", selectedAtelet.ObjectMeta.Namespace+"/"+selectedAtelet.ObjectMeta.Name)
+	}
+
+	creds, err := d.dialCredentials(string(selectedAtelet.ObjectMeta.UID))
+	if err != nil {
+		return nil, fmt.Errorf("while building atelet credentials: %w", err)
 	}
 
 	ateletConn, err := grpc.NewClient(
 		selectedAtelet.Status.PodIPs[0].IP+":8085",
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
 	if err != nil {
@@ -96,4 +129,74 @@ func (d *AteletDialer) DialForWorker(workerPodNamespace, workerPodName string) (
 	d.ateletConns.Add(ateletKey, ateletConn)
 
 	return ateletConn, nil
+}
+
+func buildTLSConfig(clientBundlePath, serverCAPath, expectedPodUID string) (*tls.Config, error) {
+	trustDomain, err := spiffeid.TrustDomainFromString(trustDomainName)
+	if err != nil {
+		return nil, fmt.Errorf("while parsing trust domain %q: %w", trustDomainName, err)
+	}
+	bundle, err := x509bundle.Load(trustDomain, serverCAPath)
+	if err != nil {
+		return nil, fmt.Errorf("while loading CA bundle from %s: %w", serverCAPath, err)
+	}
+	expectedID, err := spiffeid.FromSegments(trustDomain, "ns", ateletNamespace, "sa", ateletSA)
+	if err != nil {
+		return nil, fmt.Errorf("while building expected atelet SPIFFE ID: %w", err)
+	}
+
+	verify, err := verifyAteletServerCert(bundle, expectedID, expectedPodUID)
+	if err != nil {
+		return nil, fmt.Errorf("while creating atelet server cert verifier: %w", err)
+	}
+
+	tlsConfig := tls.Config{
+		MinVersion:           tls.VersionTLS13,
+		GetClientCertificate: credbundle.ClientLoader(clientBundlePath),
+		// Skip the default verification because the peer is dialed by IP and its
+		// certificate has no DNS/IP SAN.
+		InsecureSkipVerify: true,
+		VerifyConnection:   verify,
+	}
+
+	return &tlsConfig, nil
+}
+
+func verifyAteletServerCert(bundle *x509bundle.Bundle, expectedID spiffeid.ID, expectedPodUID string) (func(tls.ConnectionState) error, error) {
+	if expectedPodUID == "" {
+		return nil, fmt.Errorf("expected pod UID must not be empty")
+	}
+	if expectedID.IsZero() {
+		return nil, fmt.Errorf("expected pod spiffe ID must not be empty")
+	}
+	return func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return fmt.Errorf("server presented no certificate")
+		}
+		id, _, err := x509svid.Verify(cs.PeerCertificates, bundle)
+		if err != nil {
+			return fmt.Errorf("verifying server certificate chain: %w", err)
+		}
+		if id != expectedID {
+			return fmt.Errorf("server SPIFFE ID %q does not match expected %q", id, expectedID)
+		}
+
+		leaf := cs.PeerCertificates[0]
+		if !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
+			return fmt.Errorf("server certificate lacks the serverAuth extended key usage")
+		}
+
+		identity, err := substratex509.PodIdentityFromCertificate(leaf)
+		if err != nil {
+			return fmt.Errorf("failed to parse PodIdentity extension: %w", err)
+		}
+		if identity == nil {
+			return fmt.Errorf("server certificate has no PodIdentity extension, expected pod UID %q", expectedPodUID)
+		}
+		if identity.PodUID != expectedPodUID {
+			return fmt.Errorf("pod UID %q does not match expected %q", identity.PodUID, expectedPodUID)
+		}
+
+		return nil
+	}, nil
 }
