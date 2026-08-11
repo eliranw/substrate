@@ -1,0 +1,88 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A micro-VM actor with a passthrough GPU, suspended and resumed.
+#
+# The workload is a CUDA base image rather than one of the in-memory demo apps,
+# and that is the point of the fixture: an actor that never opens the device
+# passes every step below while the GPU is entirely unusable. nvidia-smi inside
+# the actor is the load-bearing assertion, not the actor reaching Ready.
+#
+# Prereqs (see docs/.../microvm-gpu-e2e.md for the full runbook):
+#   - a GPU node with IOMMU on and the GPU Operator in vm-passthrough mode, so
+#     the GPU is bound to vfio-pci and the sandbox device plugin advertises it
+#   - the GPU assets staged and the microvm-gpu SandboxConfig applied
+#
+# NB: in vm-passthrough mode the advertised resource is MODEL-SPECIFIC
+# (nvidia.com/<PCI_MODEL>), NOT nvidia.com/gpu. On the T4 host it is
+# nvidia.com/TU104GL_TESLA_T4 -- confirm with `kubectl describe node` and adjust.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo-gpu-microvm
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: gpu-microvm
+  namespace: ate-demo-gpu-microvm
+  labels:
+    workload: gpu-microvm
+spec:
+  # One replica, one GPU. ateom hands the actor's VM every device the pod was
+  # granted, and one actor runs per worker, so the pod's allocation IS the
+  # actor's allocation.
+  replicas: 1
+  sandboxClass: microvm
+  sandboxConfigName: microvm-gpu
+  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-microvm
+  template:
+    resources:
+      requests:
+        nvidia.com/TU104GL_TESLA_T4: "1"
+      limits:
+        nvidia.com/TU104GL_TESLA_T4: "1"
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: gpu-microvm
+  namespace: ate-demo-gpu-microvm
+spec:
+  sandboxClass: microvm
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  containers:
+  - name: cuda
+    # A CUDA base image carries the driver userspace (nvidia-smi, libcuda), so
+    # the container can actually open the device. The guest supplies the kernel
+    # driver; the kata-agent injects the device nodes and libraries from the CDI
+    # spec NVRC generated at boot.
+    image: ${GPU_WORKLOAD_IMAGE}
+    command: ["/bin/sh", "-c", "sleep infinity"]
+    # No readyz: this image serves no HTTP. Readiness here would only prove the
+    # container started, which is exactly the false signal the fixture avoids --
+    # the GPU checks in the runbook are the real assertion.
+  workerSelector:
+    matchLabels:
+      workload: gpu-microvm
+  snapshotsConfig:
+    # Full on pause: the GPU is detached before the guest is frozen and
+    # re-attached on resume, so a GPU actor snapshots like any other.
+    onPause: Full
+    location: gs://${BUCKET_NAME}/ate-demo-gpu-microvm/

@@ -1,0 +1,57 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The micro-VM sandbox for actors that get a passthrough GPU.
+#
+# Only the guest differs from the stock "microvm" config: cloud-hypervisor and
+# virtiofsd are guest-agnostic and are the same binaries. The guest swap is not
+# just a different rootfs -- NVIDIA's guest is EROFS where the stock one is ext4,
+# and it needs PCI reallocation parameters the stock guest never wanted -- so the
+# kata-config is swapped too. ateom reads rootfs_type from it to build the root=
+# / rootflags= / rootfstype= parameters, and passes its kernel_params through.
+#
+# amd64 only: NVIDIA publishes this guest for x86_64.
+#
+# Produce all three GPU assets with hack/microvm-assets/assemble-gpu.sh, stage
+# them into the bucket, and paste the sha256 sums it prints.
+
+apiVersion: ate.dev/v1alpha1
+kind: SandboxConfig
+metadata:
+  name: microvm-gpu
+spec:
+  sandboxClass: microvm
+  assets:
+    amd64:
+      # Guest-agnostic, shared with the stock microvm config.
+      cloud-hypervisor:
+        url: "gs://${BUCKET_NAME}/kata-assets/cloud-hypervisor"
+        sha256: "829af01ff075bb96c4f183905134c453a88d68cbabdc6b87df21098842581ee9"
+      virtiofsd:
+        url: "gs://${BUCKET_NAME}/kata-assets/virtiofsd"
+        sha256: "${VIRTIOFSD_SHA256}"
+      # NVIDIA's GPU guest: the driver and NVRC's bring-up are baked in. NVRC
+      # generates the guest CDI spec at boot, which is what lets the kata-agent
+      # inject /dev/nvidia* into the actor container.
+      kata-kernel:
+        url: "gs://${BUCKET_NAME}/kata-gpu-assets/vmlinux-gpu"
+        sha256: "${GPU_KERNEL_SHA256}"
+      kata-image:
+        url: "gs://${BUCKET_NAME}/kata-gpu-assets/rootfs-gpu.img"
+        sha256: "${GPU_ROOTFS_SHA256}"
+      # Derived by assemble-gpu.sh: upstream ships no clh flavour of its GPU
+      # config, because kata's own GPU support is QEMU-only.
+      kata-config:
+        url: "gs://${BUCKET_NAME}/kata-gpu-assets/configuration-clh-gpu.toml"
+        sha256: "${GPU_CONFIG_SHA256}"
