@@ -225,6 +225,39 @@ has to survive (table below). It does **not** collapse the injection itself.
 > creation. §12 step 5 still decides whether that injection must be *repeated* after
 > re-attach, which is the separate question the table below answers.
 
+**Resolution (verified against kata-containers source).** The guest's kata-agent does
+the injection itself, driven by one annotation — so C5 is an annotation, not a device
+subsystem:
+
+- `handle_cdi_devices` (`src/agent/src/device/mod.rs:430`) is called unconditionally from
+  `create_container` (`src/agent/src/rpc.rs:278`). Present since kata **3.11.0**; we ship
+  4.0.0. It scans the OCI spec's annotations for the `cdi.k8s.io/` prefix — the suffix is
+  free-form — and injects every CDI device named in the value.
+- It reads **only** `/var/run/cdi` in the guest (hardcoded at `rpc.rs:281`; `/etc/cdi` is
+  deliberately not scanned because `/etc` may be read-only).
+- The spec there is generated **inside the guest, at boot**: NVRC runs
+  `nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml` (`nvrc/src/toolkit.rs:31-46`)
+  and blocks on it before forking the agent (`main.rs:63` then `main.rs:126`), so there is
+  no race with the first `CreateContainer`.
+- CDI injection adds the device-cgroup entries too — `container_edits.rs:104-109` calls
+  `add_linux_resources_device` for every injected node. **We hand-write neither the nodes
+  nor the allowlist**; doing so would duplicate the agent's work with host-side numbers
+  that are wrong inside the guest.
+- Guest-generated means major/minor are already guest-native, so the host→guest rewriting
+  in `update_spec_devices` (`device/mod.rs:703`) does not apply to this path.
+
+Two constraints this imposes on the rest of the design:
+
+1. **Inherited `cdi.k8s.io/` annotations must be stripped.** The host's sandbox device
+   plugin advertises kind `nvidia.com/pgpu`, which does not exist in the guest's spec, and
+   an unresolvable CDI device *fails* `CreateContainer` rather than being ignored. Kata's
+   own shim clears them for exactly this reason (commit `1561d7fb`).
+2. **NVRC generates the CDI spec exactly once, at boot** — there is no udev/inotify
+   rescan. A GPU attached *after* boot never appears in `/var/run/cdi/nvidia.yaml`. This
+   is why the container must be created while the GPU is present (D7), and it means the
+   re-attach path must not depend on a fresh CDI resolution. *(Inferred from the code
+   paths; not yet observed on hardware.)*
+
 Those artifacts then **survive the whole cycle**:
 
 | Artifact | Lives in | Survives snapshot/restore? |
