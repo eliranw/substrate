@@ -321,6 +321,13 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		return fmt.Errorf("while resuming restored guest: %w", err)
 	}
 
+	// Give the actor its passthrough device(s) back before waiting on readyz: a
+	// container that needs the GPU cannot report ready without it, so attaching
+	// after the wait would deadlock against our own timeout.
+	if err := s.attachPassthrough(ctx, client, actorUID); err != nil {
+		return err
+	}
+
 	// Block until every readyz-enabled container reports 200.
 	if err := readyz.WaitAll(ctx, containers, ateomnet.ActorVethIP); err != nil {
 		return fmt.Errorf("while waiting for container readyz: %w", err)

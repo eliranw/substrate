@@ -192,3 +192,67 @@ func TestDeviceIDsEmptyTreeIsNotAnError(t *testing.T) {
 		t.Errorf("ids = %v, want none", ids)
 	}
 }
+
+// The device tree lists every device the VM has, so the passthrough ones have to
+// be picked out of the virtio noise. Cold-plugged devices are named by the same
+// allocator as hot-plugged ones, which is what makes reading them back possible
+// at all -- we never see an add-device reply for a device passed at vm.create.
+func TestVFIOPassthroughIDsFiltersTheDeviceTree(t *testing.T) {
+	c := serveUnix(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// _vfio_user0 is a DIFFERENT device class that shares the prefix, and the
+		// ids are not _vfio0/_vfio1: the name counter is global across every
+		// auto-named device, so virtio devices consume the low numbers first.
+		_, _ = w.Write([]byte(`{"device_tree":{"_net0":{},"_fs1":{},"_vfio3":{},"_vfio2":{},"_vfio_user0":{},"__rng":{}}}`))
+	}))
+	got, err := c.VFIOPassthroughIDs(context.Background())
+	if err != nil {
+		t.Fatalf("VFIOPassthroughIDs: %v", err)
+	}
+	if len(got) != 2 || got[0] != "_vfio2" || got[1] != "_vfio3" {
+		t.Fatalf("got %v, want [_vfio2 _vfio3] (sorted; virtio and vfio-user excluded)", got)
+	}
+}
+
+// vfio-user shares the "_vfio" prefix but is a different device class with a
+// different teardown. Ejecting one as if it were a passthrough device would be
+// wrong, and counting one would wedge the snapshot gate closed forever.
+func TestVFIOPassthroughIDsExcludesVfioUser(t *testing.T) {
+	c := serveUnix(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"device_tree":{"_vfio_user0":{},"_vfio_user12":{}}}`))
+	}))
+	got, err := c.VFIOPassthroughIDs(context.Background())
+	if err != nil {
+		t.Fatalf("VFIOPassthroughIDs: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %v, want none -- vfio-user is not VFIO passthrough", got)
+	}
+}
+
+func TestVFIOPassthroughIDsEmptyWhenNoneAttached(t *testing.T) {
+	c := serveUnix(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"device_tree":{"_net0":{},"_fs1":{},"__rng":{}}}`))
+	}))
+	got, err := c.VFIOPassthroughIDs(context.Background())
+	if err != nil {
+		t.Fatalf("VFIOPassthroughIDs: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %v, want none", got)
+	}
+}
+
+// An unreadable tree must propagate as an error, never as "none attached" --
+// the snapshot gate reads this to decide it is safe to freeze the guest.
+func TestVFIOPassthroughIDsPropagatesAnUnreadableTree(t *testing.T) {
+	c := serveUnix(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"config":{}}`))
+	}))
+	if _, err := c.VFIOPassthroughIDs(context.Background()); err == nil {
+		t.Fatal("a missing device_tree must be an error, not an empty list")
+	}
+}

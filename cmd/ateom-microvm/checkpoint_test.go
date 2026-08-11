@@ -17,48 +17,86 @@
 package main
 
 import (
+	"context"
+	"net"
+	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 )
 
-func TestSnapshotRejectedWithPassthroughDevice(t *testing.T) {
-	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
-	err := errIfPassthroughSnapshot()
+// fakeVMInfo serves one canned /api/v1/vm.info body on a unix socket and
+// returns a client pointed at it.
+func fakeVMInfo(t *testing.T, body string) *ch.Client {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "ch.sock")
+	lis, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return ch.NewClient(sock)
+}
+
+// The device tree always carries the VM's ordinary virtio devices, so "no
+// passthrough attached" means no _vfio entries -- not an empty tree.
+func TestSnapshotAllowedWhenNoPassthroughAttached(t *testing.T) {
+	c := fakeVMInfo(t, `{"device_tree":{"__virtio-net0":{},"__virtio-blk0":{},"__fs0":{}}}`)
+	if err := errIfPassthroughSnapshot(context.Background(), c); err != nil {
+		t.Fatalf("a VM with only virtio devices should be snapshottable, got %v", err)
+	}
+}
+
+func TestSnapshotRejectedWhilePassthroughAttached(t *testing.T) {
+	c := fakeVMInfo(t, `{"device_tree":{"__virtio-net0":{},"_vfio0":{}}}`)
+	err := errIfPassthroughSnapshot(context.Background(), c)
 	if err == nil {
-		t.Fatal("expected snapshot of an actor holding a passthrough device to be rejected")
+		t.Fatal("expected a refusal while a passthrough device is still attached")
 	}
-	if !strings.Contains(err.Error(), "passthrough device") {
-		t.Errorf("error should name the blocking condition, got %q", err.Error())
-	}
-}
-
-func TestSnapshotAllowedWithoutPassthroughDevice(t *testing.T) {
-	// No PCI_RESOURCE_* env -> no passthrough device -> snapshots allowed.
-	if err := errIfPassthroughSnapshot(); err != nil {
-		t.Fatalf("a worker with no passthrough device should be snapshottable, got %v", err)
+	// The id is the operator's only handle on which device did not eject.
+	if !strings.Contains(err.Error(), "_vfio0") {
+		t.Errorf("error should name the attached device, got %q", err)
 	}
 }
 
-// The gate must not depend on per-actor in-memory state. Two holes existed when
-// it keyed off per-actor state: RestoreWorkload never set it (so every restored
-// actor sailed through), and a nil runningActor after an ateom restart was
-// treated as device-free. Keying off the worker's own allocation closes both --
-// these cases are indistinguishable from a fresh actor here, by construction.
-func TestSnapshotGateIndependentOfActorState(t *testing.T) {
-	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
-	// No runningActor exists at all (restored actor / post-restart ateom).
-	if err := errIfPassthroughSnapshot(); err == nil {
-		t.Fatal("gate must reject even with no tracked actor state")
-	}
-}
-
-func TestSnapshotGateRejectsMultipleDevices(t *testing.T) {
-	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:61:00.0,0000:da:00.0")
-	err := errIfPassthroughSnapshot()
+func TestSnapshotRejectionCountsEveryAttachedDevice(t *testing.T) {
+	c := fakeVMInfo(t, `{"device_tree":{"_vfio0":{},"_vfio1":{}}}`)
+	err := errIfPassthroughSnapshot(context.Background(), c)
 	if err == nil {
-		t.Fatal("expected rejection when several devices are allocated")
+		t.Fatal("expected a refusal on a multi-device worker")
 	}
 	if !strings.Contains(err.Error(), "2 passthrough device(s)") {
-		t.Errorf("error should report both devices, got %q", err.Error())
+		t.Errorf("error should report both devices, got %q", err)
+	}
+}
+
+// An unreadable device tree must not read as "nothing attached". This is the
+// last check before the memory image is written, and treating an unanswerable
+// VMM as clear is exactly how a torn snapshot gets produced.
+func TestSnapshotRejectedWhenTheDeviceTreeCannotBeRead(t *testing.T) {
+	c := fakeVMInfo(t, `{"config":{"devices":[]}}`) // no device_tree at all
+	if err := errIfPassthroughSnapshot(context.Background(), c); err == nil {
+		t.Fatal("an unreadable device tree must fail the gate, not pass it")
+	}
+}
+
+// vmmPID gates the eject confirmation: without the pid, WaitDeviceRemoved cannot
+// check that the VMM dropped its /dev/vfio group fd, so the detach must refuse
+// rather than proceed on an unconfirmed eject.
+func TestVMMPIDUnknownWithoutATrackedProcess(t *testing.T) {
+	if got := vmmPID(nil); got != 0 {
+		t.Errorf("vmmPID(nil) = %d, want 0", got)
+	}
+	if got := vmmPID(&runningActor{}); got != 0 {
+		t.Errorf("vmmPID with no process = %d, want 0", got)
 	}
 }

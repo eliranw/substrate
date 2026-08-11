@@ -46,26 +46,31 @@ import (
 // into guest RAM while the memory ranges are written out. The result is a TORN
 // memory image, not merely one missing the device state.
 //
-// The check reads the worker's device allocation rather than per-actor state:
-// one actor runs per worker and ateom passes it everything the pod was granted,
-// so "this worker has a passthrough device" == "this actor has one". Keying off
-// the worker keeps the gate correct for restored actors and after an ateom
-// restart, neither of which has reliable in-memory actor state.
+// It asks the VMM what it still holds rather than consulting our own record of
+// what we detached. Bookkeeping would agree with itself even when the eject
+// silently failed, and this is the last check before the memory image is
+// written — so it reads observed state, and an unreadable device tree is an
+// error rather than an assumed-empty one. That also keeps it correct for an
+// actor restored by a different ateom process, which has no bookkeeping at all.
 //
 // It rejects BOTH scopes. Full is unarguable — it serializes the guest RAM the
 // device is writing into. Data is rejected conservatively rather than provably:
 // it captures only the host-backed durable share, so it never serializes guest
 // RAM, but the guest is still paused with the device live, and a paused vCPU
-// does not stop DMA into a page backing a durable-share mapping. Until the
-// quiesce-before-eject path exists, "device attached" stays a blanket refusal.
-func errIfPassthroughSnapshot() error {
-	devs, err := resolveWorkerDevices()
+// does not stop DMA into a page backing a durable-share mapping.
+//
+// Reaching this with a device still attached means detachPassthrough returned
+// success without finishing, so the message says so: by this point a caller has
+// no remaining action, and the value of the check is that it fails loudly
+// instead of producing a corrupt snapshot.
+func errIfPassthroughSnapshot(ctx context.Context, client *ch.Client) error {
+	ids, err := client.VFIOPassthroughIDs(ctx)
 	if err != nil {
-		return fmt.Errorf("while checking for passthrough devices: %w", err)
+		return fmt.Errorf("while checking for attached passthrough devices: %w", err)
 	}
-	if len(devs) > 0 {
+	if len(ids) > 0 {
 		return status.Errorf(codes.FailedPrecondition,
-			"cannot snapshot an actor holding %d passthrough device(s); such actors are run-only", len(devs))
+			"refusing to snapshot: %d passthrough device(s) still attached after detach (%v)", len(ids), ids)
 	}
 	return nil
 }
@@ -133,13 +138,19 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	if ra != nil && ra.apiSocket != "" {
 		chSocket = ra.apiSocket
 	}
-	if err := errIfPassthroughSnapshot(); err != nil {
-		return nil, err
-	}
-
 	client := ch.NewClient(chSocket)
 	if _, err := client.WaitReady(ctx, 10*time.Second); err != nil {
 		return nil, fmt.Errorf("while waiting for CH api-socket: %w", err)
+	}
+
+	// Give the device back before freezing the guest. Both scopes pause, and a
+	// paused vCPU does not stop a bus-mastering device, so this runs for Data as
+	// well as Full.
+	if err := s.detachPassthrough(ctx, client, ra, actorUID); err != nil {
+		return nil, err
+	}
+	if err := errIfPassthroughSnapshot(ctx, client); err != nil {
+		return nil, err
 	}
 
 	tPause := time.Now()

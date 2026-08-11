@@ -17,6 +17,8 @@ package ch
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 )
 
 // AddedDevice is cloud-hypervisor's answer to vm.add-device. The ID is assigned
@@ -60,6 +62,73 @@ func (c *Client) RemoveDevice(ctx context.Context, id string) error {
 		return fmt.Errorf("vm.remove-device %s: %w", id, err)
 	}
 	return nil
+}
+
+// vfioIDPrefix is how cloud-hypervisor names VFIO passthrough devices:
+// VFIO_DEVICE_NAME_PREFIX plus a counter. Devices passed at vm.create and
+// devices hot-plugged later run through the same allocator, so a cold-plugged
+// device carries an id of this shape even though we never saw an add-device
+// reply for it.
+//
+// Reading the id back matters because cold-plug is not optional here: the guest
+// builds its CDI spec once at boot, before the agent starts, so a device added
+// afterwards would be invisible to the container. There is no add-device reply
+// to remember, and this is the only handle for the later eject.
+//
+// The counter is GLOBAL across every auto-named device, not per-prefix, so the
+// first passthrough device is not necessarily _vfio0 -- auto-named virtio
+// devices are created first and consume lower numbers. Never assume an index.
+const vfioIDPrefix = "_vfio"
+
+// isVFIOID reports whether a device-tree key names a VFIO passthrough device.
+//
+// The digit check is load-bearing rather than tidiness: cloud-hypervisor also
+// allocates ids under the prefix "_vfio_user" for vfio-user devices, which a
+// plain prefix match would sweep up. Those are a different device class with a
+// different teardown, and ejecting one as if it were a passthrough device would
+// be wrong. Requiring the suffix to be all digits separates them exactly.
+func isVFIOID(id string) bool {
+	rest, ok := strings.CutPrefix(id, vfioIDPrefix)
+	if !ok || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// VFIOPassthroughIDs returns the ids of the VFIO passthrough devices the VMM
+// currently holds, filtered out of the full device tree (which also lists
+// virtio-net, virtio-blk, virtio-fs, vsock and friends).
+//
+// It reads device_tree rather than config.devices, even though config.devices is
+// by definition the passthrough list and needs no name matching. config is the
+// wrong source for this question: cloud-hypervisor drops a device from config
+// the moment an eject is REQUESTED, while the device is still being torn down,
+// so config would report a device gone during exactly the window this exists to
+// detect. device_tree only loses the entry once the guest has completed the
+// eject.
+//
+// This is observed VMM state, not our own bookkeeping, which is what makes it
+// usable as a safety assertion: it stays correct for an actor restored by a
+// different ateom process, and it reports what the VMM actually still has
+// rather than what we believe we detached.
+func (c *Client) VFIOPassthroughIDs(ctx context.Context) ([]string, error) {
+	ids, err := c.DeviceIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var vfio []string
+	for _, id := range ids {
+		if isVFIOID(id) {
+			vfio = append(vfio, id)
+		}
+	}
+	sort.Strings(vfio)
+	return vfio, nil
 }
 
 // DeviceIDs returns the ids present in the VM's device tree. This is the
