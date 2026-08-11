@@ -711,8 +711,14 @@ func startOverlayContainer(ctx context.Context, ac *kata.AgentClient, vsockPath 
 	}
 
 	upperBase := kata.OverlayUpperBase(c.name)
+	// Only the workload gets the passthrough device: the carrier above is created
+	// from the unannotated spec, so the agent does no CDI injection for it.
+	wlSpec, err := withGuestCDIDevices(workloadSpec(c))
+	if err != nil {
+		return fmt.Errorf("while preparing devices for %q: %w", c.name, err)
+	}
 	wlCtx, wlCancel := context.WithTimeout(ctx, 30*time.Second)
-	err = ac.StartOverlayWorkload(wlCtx, c.name, overlayWorkloadID(c.name), upperBase, workloadSpec(c))
+	err = ac.StartOverlayWorkload(wlCtx, c.name, overlayWorkloadID(c.name), upperBase, wlSpec)
 	wlCancel()
 	if err != nil {
 		dump := kata.DebugConsoleDump(ctx, vsockPath,
