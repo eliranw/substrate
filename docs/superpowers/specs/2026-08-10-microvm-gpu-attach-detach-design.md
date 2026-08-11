@@ -284,6 +284,51 @@ confirm a container's pre-existing `/dev/nvidia*` work after re-attach. If they 
 the fallback is the previous plan: create nodes into `/proc/<pid>/root/dev/` from the
 guest and widen the cgroup via `UpdateContainer`, both driven by the guest CDI spec.
 
+
+### 4.4 Booting the GPU guest — root parameters and PCI
+
+The GPU guest is not a drop-in for the stock one. From upstream's own
+`configuration-qemu-nvidia-gpu.toml` (kata-static 4.0.0):
+
+| | stock guest | NVIDIA GPU guest |
+|---|---|---|
+| `rootfs_type` | `ext4` | **`erofs`** |
+| `kernel_params` | `cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1` | **`cgroup_no_v1=all pci=realloc pci=nocrs pci=assign-busses`** |
+| root params | `root=/dev/vda1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4` | `root=/dev/vda1 rootflags=ro rootfstype=erofs` |
+
+Three things this settles, all verified against kata source rather than inferred:
+
+- **The root parameters are not in `kernel_params`.** Kata assembles them per
+  filesystem in `GetKernelRootParams` (`virtcontainers/hypervisor.go:132-216`), so
+  passing the config's `kernel_params` through — which ateom already does — does
+  not carry them. `rootfs_type` is the only key that says which layout applies,
+  which is why ateom now parses it.
+- **`root=/dev/vda1` is right for both.** The erofs image is not a raw filesystem
+  at offset 0: `create_erofs_rootfs_image` builds an MBR label and `dd`s the
+  filesystem into **p1** (`osbuilder/image-builder/image_builder.sh:581-633`).
+  Independent arithmetic check: `data_blocks × data_block_size = 123392 × 4096` is
+  exactly 482 MiB, consistent with p1 starting at the 1 MiB boundary.
+- **dm-verity is optional, and we skip it.** `veritysetup format --no-superblock`
+  writes the hash tree to a *separate* p2 and never touches p1
+  (`image_builder.sh:511-529`), so p1 is a self-contained mountable filesystem.
+  Booting it directly is valid. We skip the verity mapping deliberately: the image
+  is fetched under a sha256 pinned in its SandboxConfig and attached read-only, so
+  a verity chain would add a `root_hash` that changes on **every image rebuild**
+  (the salt is freshly random per `veritysetup` run) without covering a threat
+  those two do not. The fallback, if it is ever needed, is
+  `dm-mod.create="dm-verity,,,ro,0 <sectors> verity 1 /dev/vda1 /dev/vda2 4096 4096 <data_blocks> 0 sha256 <root_hash> <salt>" root=/dev/dm-0`.
+
+`pci=realloc pci=nocrs pci=assign-busses` deserves note: it is BAR reallocation
+and bus reassignment, which is what a passed-through GPU with large BARs needs.
+The stock config has none of it because it never sees a passthrough device, so
+this is a boot/enumeration difference the guest swap alone would not have caught.
+
+**Open risk (UNVERIFIED).** NVRC is the guest init, not systemd. Whether it
+refuses to proceed when root is not a dm-verity device has not been confirmed —
+no kata-side code requires it, but NVRC is an external binary. If it does, the
+verity cmdline above becomes mandatory and the `root_hash` must be read from the
+config shipped with that image build.
+
 ---
 
 ## 5. Design decisions
