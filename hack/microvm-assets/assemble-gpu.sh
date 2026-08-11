@@ -52,10 +52,17 @@ curl -fSL -o kata-static.tar.zst \
 # kata-containers-nvidia-gpu.img are the stable symlink names upstream keeps
 # pointing at the current driver/kernel build, so following them avoids pinning a
 # version string that changes every release.
+#
+# The member glob needs --wildcards on GNU tar; bsdtar (the macOS default) globs
+# by default and rejects the flag outright, so pass it only where it exists.
 echo ">> Extracting the NVIDIA GPU guest..."
 mkdir -p kata
+wildcards=()
+if tar --version 2>&1 | grep -qi 'gnu tar'; then
+  wildcards=(--wildcards)
+fi
 tar --zstd -xf kata-static.tar.zst -C kata \
-  --wildcards './opt/kata/share/kata-containers/*nvidia-gpu*'
+  "${wildcards[@]}" './opt/kata/share/kata-containers/*nvidia-gpu*'
 
 KROOT="kata/opt/kata/share/kata-containers"
 kernel="$(readlink -f "${KROOT}/vmlinux-nvidia-gpu.container")"
