@@ -40,6 +40,18 @@ const (
 	enumerateTimeout = 30 * time.Second
 )
 
+// Seams for the guest and eject steps, so the ORDER this file imposes can be
+// tested without a live guest or a VMM-shaped /proc. The sequencing is the part
+// that carries the correctness argument -- the steps themselves are covered in
+// internal/kata and internal/ch -- and it is invisible to any test that cannot
+// observe the calls interleave.
+var (
+	guestGPUBDFs     = kata.GuestGPUBDFs
+	guestDetachGPU   = kata.GuestDetachGPU
+	guestVerifyBound = kata.GuestVerifyGPUBound
+	waitDeviceGone   = (*ch.Client).WaitDeviceRemoved
+)
+
 // vmmPID returns the pid of the cloud-hypervisor process ateom launched for an
 // actor, or 0 when it is not known (ra lost across an ateom restart).
 //
@@ -88,12 +100,12 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 
 	tDetach := time.Now()
 	vsockPath := kata.VsockSocketPath(actorUID)
-	bdfs, err := kata.GuestGPUBDFs(ctx, vsockPath)
+	bdfs, err := guestGPUBDFs(ctx, vsockPath)
 	if err != nil {
 		return fmt.Errorf("while listing guest GPUs: %w", err)
 	}
 	for _, bdf := range bdfs {
-		if err := kata.GuestDetachGPU(ctx, vsockPath, bdf); err != nil {
+		if err := guestDetachGPU(ctx, vsockPath, bdf); err != nil {
 			return fmt.Errorf("while releasing guest GPU %s: %w", bdf, err)
 		}
 	}
@@ -104,7 +116,7 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 		}
 	}
 	for _, id := range ids {
-		if err := client.WaitDeviceRemoved(ctx, id, pid, ejectTimeout); err != nil {
+		if err := waitDeviceGone(client, ctx, id, pid, ejectTimeout); err != nil {
 			return fmt.Errorf("while confirming eject of %s: %w", id, err)
 		}
 	}
@@ -151,7 +163,7 @@ func (s *AteomService) attachPassthrough(ctx context.Context, client *ch.Client,
 		return err
 	}
 	for _, bdf := range bdfs {
-		if err := kata.GuestVerifyGPUBound(ctx, vsockPath, bdf, bindTimeout); err != nil {
+		if err := guestVerifyBound(ctx, vsockPath, bdf, bindTimeout); err != nil {
 			return fmt.Errorf("while waiting for guest GPU %s to bind: %w", bdf, err)
 		}
 	}
@@ -171,7 +183,7 @@ func (s *AteomService) attachPassthrough(ctx context.Context, client *ch.Client,
 func waitGuestGPUs(ctx context.Context, vsockPath string, want int, deadline time.Duration) ([]string, error) {
 	end := time.Now().Add(deadline)
 	for {
-		bdfs, err := kata.GuestGPUBDFs(ctx, vsockPath)
+		bdfs, err := guestGPUBDFs(ctx, vsockPath)
 		// A scan error means we could not ask the guest at all; keep trying until
 		// the deadline, since the agent may still be coming back after the restore.
 		if err == nil && len(bdfs) >= want {
