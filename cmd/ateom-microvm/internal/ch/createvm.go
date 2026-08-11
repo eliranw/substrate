@@ -33,6 +33,23 @@ type VmConfig struct {
 	Console  *ConsoleConfig  `json:"console,omitempty"`
 	Vsock    *VsockConfig    `json:"vsock,omitempty"`
 	Platform *PlatformConfig `json:"platform,omitempty"`
+	Devices  []DeviceConfig  `json:"devices,omitempty"`
+}
+
+// DeviceConfig is one VFIO PCI passthrough device (the REST-API equivalent of
+// cloud-hypervisor's `--device path=...`). Path is the host device's sysfs dir,
+// e.g. /sys/bus/pci/devices/0000:01:00.0/, and the device must already be bound
+// to vfio-pci on the host.
+//
+// Iommu false places the device directly on the guest PCI bus, so the guest's
+// ordinary driver claims it. Setting it true puts the device behind an emulated
+// IOMMU instead, which only helps a guest that itself does VFIO (nested
+// passthrough, or a userspace driver rebinding the device inside the guest).
+// The host IOMMU is in play either way — it is what makes passthrough safe — and
+// is not affected by this field.
+type DeviceConfig struct {
+	Path  string `json:"path"`
+	Iommu bool   `json:"iommu,omitempty"`
 }
 
 // FsConfig is a virtio-fs device backed by a vhost-user (virtiofsd) socket. The
@@ -66,7 +83,7 @@ type MemoryConfig struct {
 }
 
 // PayloadConfig points at the guest kernel + its cmdline (initramfs/firmware
-// unused: the kata guest boots from a virtio-blk image disk, root=/dev/vda1).
+// unused: every kata guest we boot has its rootfs on a virtio-blk image disk).
 type PayloadConfig struct {
 	Kernel  string `json:"kernel"`
 	Cmdline string `json:"cmdline"`

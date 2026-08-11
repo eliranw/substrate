@@ -426,7 +426,13 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	// writable upper is a guest tmpfs). serialLog is also read on a failed agent dial
 	// below, so keep it here.
 	serialLog := filepath.Join(kata.VMDir(actorUID), "serial.log")
-	vmCfg := buildVMConfig(actorUID, kernel, image, kparams, serialLog, memMiB, vcpus, durable)
+	// Cold-plug the VFIO passthrough device(s) a device plugin granted this worker
+	// pod (one actor per worker, so the actor gets all of them).
+	passthrough, err := resolveWorkerDevices()
+	if err != nil {
+		return fmt.Errorf("while resolving worker passthrough devices: %w", err)
+	}
+	vmCfg := buildVMConfig(actorUID, kernel, image, kparams, serialLog, memMiB, vcpus, durable, passthrough)
 	if err := client.CreateVM(ctx, vmCfg); err != nil {
 		return fmt.Errorf("while creating VM: %w", err)
 	}
@@ -602,7 +608,10 @@ func (s *AteomService) guestConfig(rr resolvedRuntime) (memMiB, vcpus int, kpara
 //
 // withDurable adds a second virtio-fs device for the actor's writable durable-dir
 // volumes (see durable.go), served by its own virtiofsd on the same PCI segment.
-func buildVMConfig(id, kernel, image, kparams, serialLog string, memMiB, vcpus int, withDurable bool) ch.VmConfig {
+//
+// passthrough cold-plugs the VFIO PCI device(s) a device plugin allocated to this
+// worker pod, so the guest's own driver claims them on the guest PCI bus.
+func buildVMConfig(id, kernel, image, kparams, serialLog string, memMiB, vcpus int, withDurable bool, passthrough []ch.DeviceConfig) ch.VmConfig {
 	console := "ttyS0"
 	if runtime.GOARCH == "arm64" {
 		console = "ttyAMA0"
@@ -625,6 +634,7 @@ func buildVMConfig(id, kernel, image, kparams, serialLog string, memMiB, vcpus i
 		Rng:      &ch.RngConfig{Src: "/dev/urandom"},
 		Serial:   &ch.ConsoleConfig{Mode: "File", File: serialLog},
 		Vsock:    &ch.VsockConfig{Cid: 3, Socket: kata.VsockSocketPath(id)},
+		Devices:  passthrough,
 	}
 }
 

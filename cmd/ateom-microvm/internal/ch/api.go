@@ -124,6 +124,38 @@ func (c *apiClient) put(ctx context.Context, path string, body any) error {
 	return nil
 }
 
+// putJSON issues a PUT with a JSON body and decodes the 2xx JSON response into
+// out. Unlike put, it keeps the response body: vm.add-device answers 200 with
+// the id cloud-hypervisor assigned, which the caller needs in order to eject the
+// device later.
+func (c *apiClient) putJSON(ctx context.Context, path string, body any, out any) error {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, apiBase+path, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("PUT %s: status %d: %s", path, resp.StatusCode, bytes.TrimSpace(raw))
+	}
+	if out == nil || len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	return json.Unmarshal(raw, out)
+}
+
 // snapshotConfig is the body of /api/v1/vm.snapshot.
 type snapshotConfig struct {
 	DestinationURL string `json:"destination_url"`
