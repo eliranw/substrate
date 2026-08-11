@@ -35,6 +35,11 @@ type KataConfig struct {
 	// etc.). ateom appends these to the cloud-hypervisor payload cmdline, since
 	// there is no kata shim to inject them.
 	KernelParams string
+	// RootfsType is the guest image's filesystem ([hypervisor.clh] rootfs_type):
+	// "ext4" for the stock guest, "erofs" for NVIDIA's GPU guest. It decides the
+	// root= / rootflags= / rootfstype= parameters, which differ per filesystem
+	// and are NOT part of kernel_params. Empty when the key is absent.
+	RootfsType string
 }
 
 // clhConfigTOML mirrors the subset of a kata configuration.toml ateom reads.
@@ -45,6 +50,7 @@ type clhConfigTOML struct {
 			DefaultMemory int    `toml:"default_memory"`
 			DefaultVCPUs  int    `toml:"default_vcpus"`
 			KernelParams  string `toml:"kernel_params"`
+			RootfsType    string `toml:"rootfs_type"`
 		} `toml:"clh"`
 	} `toml:"hypervisor"`
 }
@@ -62,6 +68,7 @@ func ParseConfig(base []byte, memDefault, vcpuDefault int) (KataConfig, error) {
 		MemoryMiB:    c.Hypervisor.CLH.DefaultMemory,
 		VCPUs:        c.Hypervisor.CLH.DefaultVCPUs,
 		KernelParams: c.Hypervisor.CLH.KernelParams,
+		RootfsType:   c.Hypervisor.CLH.RootfsType,
 	}
 	if cfg.MemoryMiB <= 0 {
 		cfg.MemoryMiB = memDefault

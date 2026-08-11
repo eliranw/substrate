@@ -88,18 +88,46 @@ func equalStrings(a, b []string) bool {
 
 func TestBuildVMConfigIncludesPassthroughDevices(t *testing.T) {
 	devs := []ch.DeviceConfig{{Path: "/sys/bus/pci/devices/0000:01:00.0/"}}
-	cfg := buildVMConfig("uid", "vmlinux", "rootfs.img", "", "/tmp/serial.log", 2048, 2, false, devs)
+	cfg := buildVMConfig("uid", "vmlinux", "rootfs.img", "", "ext4", "/tmp/serial.log", 2048, 2, false, devs)
 	if len(cfg.Devices) != 1 || cfg.Devices[0].Path != devs[0].Path {
 		t.Fatalf("buildVMConfig Devices = %v, want %v", cfg.Devices, devs)
 	}
 }
 
 func TestBuildVMConfigDiskBoot(t *testing.T) {
-	cfg := buildVMConfig("uid", "vmlinux", "rootfs.img", "", "/tmp/serial.log", 2048, 2, false, nil)
+	cfg := buildVMConfig("uid", "vmlinux", "rootfs.img", "", "ext4", "/tmp/serial.log", 2048, 2, false, nil)
 	if len(cfg.Disks) != 1 || cfg.Disks[0].Path != "rootfs.img" {
 		t.Errorf("disk boot Disks = %v, want the rootfs.img disk", cfg.Disks)
 	}
 	if !strings.Contains(cfg.Payload.Cmdline, "root=/dev/vda1") {
 		t.Errorf("disk boot cmdline missing root=/dev/vda1: %q", cfg.Payload.Cmdline)
+	}
+}
+
+// The guest image's filesystem decides root=/rootflags=/rootfstype=, and those
+// are not part of the config's kernel_params, so they cannot be passed through.
+// Booting NVIDIA's erofs guest with the stock ext4 params fails in the kernel
+// before anything we could log.
+func TestBuildVMConfigRootParamsFollowRootfsType(t *testing.T) {
+	for _, tc := range []struct{ rootfsType, want, reject string }{
+		{"ext4", "rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4", "erofs"},
+		{"erofs", "rootflags=ro rootfstype=erofs", "ext4"},
+		// An absent key must keep the stock guest booting.
+		{"", "rootfstype=ext4", "erofs"},
+	} {
+		t.Run("rootfs_type="+tc.rootfsType, func(t *testing.T) {
+			cmdline := buildVMConfig("uid", "vmlinux", "rootfs.img", "",
+				tc.rootfsType, "/tmp/serial.log", 2048, 2, false, nil).Payload.Cmdline
+			if !strings.Contains(cmdline, tc.want) {
+				t.Errorf("cmdline missing %q:\n  %s", tc.want, cmdline)
+			}
+			if strings.Contains(cmdline, "rootfstype="+tc.reject) {
+				t.Errorf("cmdline has the wrong filesystem %q:\n  %s", tc.reject, cmdline)
+			}
+			// Every layout puts the filesystem in the first MBR partition.
+			if !strings.Contains(cmdline, "root=/dev/vda1") {
+				t.Errorf("cmdline missing root=/dev/vda1:\n  %s", cmdline)
+			}
+		})
 	}
 }

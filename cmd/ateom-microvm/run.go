@@ -371,7 +371,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	}
 
 	// Guest sizing + agent kernel params from the kata config.
-	memMiB, vcpus, kparams, err := s.guestConfig(rr)
+	memMiB, vcpus, kparams, rootfsType, err := s.guestConfig(rr)
 	if err != nil {
 		return err
 	}
@@ -442,7 +442,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	if err != nil {
 		return fmt.Errorf("while resolving worker passthrough devices: %w", err)
 	}
-	vmCfg := buildVMConfig(actorUID, kernel, image, kparams, serialLog, memMiB, vcpus, durable, passthrough)
+	vmCfg := buildVMConfig(actorUID, kernel, image, kparams, rootfsType, serialLog, memMiB, vcpus, durable, passthrough)
 	if err := client.CreateVM(ctx, vmCfg); err != nil {
 		return fmt.Errorf("while creating VM: %w", err)
 	}
@@ -602,20 +602,46 @@ func (s *AteomService) stageOverlayLowers(ctx context.Context, rr resolvedRuntim
 // guestConfig reads guest sizing + agent kernel params from the resolved kata
 // config, enabling the debug console (vsock 1026) for in-guest diagnostics and,
 // with kataDebug, raising the agent log level.
-func (s *AteomService) guestConfig(rr resolvedRuntime) (memMiB, vcpus int, kparams string, err error) {
+func (s *AteomService) guestConfig(rr resolvedRuntime) (memMiB, vcpus int, kparams, rootfsType string, err error) {
 	var cfgBytes []byte
 	if rr.configFile != "" {
 		cfgBytes, _ = os.ReadFile(rr.configFile)
 	}
 	cfg, err := kata.ParseConfig(cfgBytes, 2048, 1)
 	if err != nil {
-		return 0, 0, "", fmt.Errorf("while parsing kata config: %w", err)
+		return 0, 0, "", "", fmt.Errorf("while parsing kata config: %w", err)
 	}
 	kparams = kata.WithDebugConsole(cfg.KernelParams)
 	if s.kataDebug {
 		kparams = kata.WithAgentDebug(kparams)
 	}
-	return cfg.MemoryMiB, cfg.VCPUs, kparams, nil
+	return cfg.MemoryMiB, cfg.VCPUs, kparams, cfg.RootfsType, nil
+}
+
+// rootKernelParams returns the root= / rootflags= / rootfstype= parameters for a
+// guest image's filesystem, mirroring kata's own GetKernelRootParams
+// (virtcontainers/hypervisor.go). They are NOT part of the config's
+// kernel_params, so they cannot simply be passed through.
+//
+// Both layouts put the filesystem in the first MBR partition, so root= is
+// /dev/vda1 either way; only the flags and type differ. ext4 wants its journal
+// options and takes a separate ro, while erofs is read-only by construction and
+// takes ro as its only rootflag.
+//
+// EROFS images are built with an appended dm-verity hash tree, but in a SEPARATE
+// second partition -- veritysetup writes the tree to /dev/vda2 and does not touch
+// /dev/vda1 -- so the first partition is a self-contained, mountable filesystem
+// and booting it directly is valid. We deliberately do not set up the verity
+// mapping: the image is fetched under a sha256 pinned in its SandboxConfig and
+// attached read-only, so a verity chain would add a root hash that changes with
+// every image rebuild without covering a threat those two do not.
+//
+// An unrecognized or absent type falls back to ext4, the stock guest's layout.
+func rootKernelParams(rootfsType string) string {
+	if rootfsType == "erofs" {
+		return "root=/dev/vda1 rootflags=ro rootfstype=erofs"
+	}
+	return "root=/dev/vda1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4"
 }
 
 // buildVMConfig assembles the cloud-hypervisor VmConfig. The kernel cmdline replicates
@@ -630,12 +656,12 @@ func (s *AteomService) guestConfig(rr resolvedRuntime) (memMiB, vcpus int, kpara
 //
 // passthrough cold-plugs the VFIO PCI device(s) a device plugin allocated to this
 // worker pod, so the guest's own driver claims them on the guest PCI bus.
-func buildVMConfig(id, kernel, image, kparams, serialLog string, memMiB, vcpus int, withDurable bool, passthrough []ch.DeviceConfig) ch.VmConfig {
+func buildVMConfig(id, kernel, image, kparams, rootfsType, serialLog string, memMiB, vcpus int, withDurable bool, passthrough []ch.DeviceConfig) ch.VmConfig {
 	console := "ttyS0"
 	if runtime.GOARCH == "arm64" {
 		console = "ttyAMA0"
 	}
-	cmdline := "root=/dev/vda1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4 " +
+	cmdline := rootKernelParams(rootfsType) + " " +
 		"panic=1 no_timer_check noreplace-smp console=" + console + ",115200n8 " +
 		"systemd.unit=kata-containers.target systemd.mask=systemd-networkd.service systemd.mask=systemd-networkd.socket"
 	if kparams != "" {
