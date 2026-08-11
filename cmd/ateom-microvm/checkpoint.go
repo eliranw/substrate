@@ -37,6 +37,39 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// errIfPassthroughSnapshot rejects snapshotting a VM that holds a VFIO
+// passthrough device.
+//
+// This guards correctness, not just completeness: cloud-hypervisor does NOT
+// refuse the snapshot. VfioPciDevice's Pausable impl is empty, so vm.pause stops
+// the vCPUs but never quiesces the device — a bus-mastering device keeps DMA-ing
+// into guest RAM while the memory ranges are written out. The result is a TORN
+// memory image, not merely one missing the device state.
+//
+// The check reads the worker's device allocation rather than per-actor state:
+// one actor runs per worker and ateom passes it everything the pod was granted,
+// so "this worker has a passthrough device" == "this actor has one". Keying off
+// the worker keeps the gate correct for restored actors and after an ateom
+// restart, neither of which has reliable in-memory actor state.
+//
+// It rejects BOTH scopes. Full is unarguable — it serializes the guest RAM the
+// device is writing into. Data is rejected conservatively rather than provably:
+// it captures only the host-backed durable share, so it never serializes guest
+// RAM, but the guest is still paused with the device live, and a paused vCPU
+// does not stop DMA into a page backing a durable-share mapping. Until the
+// quiesce-before-eject path exists, "device attached" stays a blanket refusal.
+func errIfPassthroughSnapshot() error {
+	devs, err := resolveWorkerDevices()
+	if err != nil {
+		return fmt.Errorf("while checking for passthrough devices: %w", err)
+	}
+	if len(devs) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot snapshot an actor holding %d passthrough device(s); such actors are run-only", len(devs))
+	}
+	return nil
+}
+
 // CheckpointWorkload suspends the actor and writes a portable snapshot.
 //
 // Contract with atelet: after we return, atelet uploads the checkpoint dir to object
@@ -100,6 +133,10 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	if ra != nil && ra.apiSocket != "" {
 		chSocket = ra.apiSocket
 	}
+	if err := errIfPassthroughSnapshot(); err != nil {
+		return nil, err
+	}
+
 	client := ch.NewClient(chSocket)
 	if _, err := client.WaitReady(ctx, 10*time.Second); err != nil {
 		return nil, fmt.Errorf("while waiting for CH api-socket: %w", err)
