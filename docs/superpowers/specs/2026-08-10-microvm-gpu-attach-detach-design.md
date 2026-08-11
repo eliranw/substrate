@@ -306,12 +306,26 @@ Three things this settles, all verified against kata source rather than inferred
 - **`root=/dev/vda1` is right for both.** The erofs image is not a raw filesystem
   at offset 0: `create_erofs_rootfs_image` builds an MBR label and `dd`s the
   filesystem into **p1** (`osbuilder/image-builder/image_builder.sh:581-633`).
-  Independent arithmetic check: `data_blocks × data_block_size = 123392 × 4096` is
-  exactly 482 MiB, consistent with p1 starting at the 1 MiB boundary.
+  Confirmed by reading the shipped image
+  (`kata-ubuntu-noble-nvidia-gpu-595.58.03.image`, 511,705,088 bytes) rather than
+  from the builder alone:
+
+  | | start | size | contents |
+  |---|---|---|---|
+  | MBR | 0 | 512 B | signature `0x55AA` |
+  | p1 | 1.0 MiB (LBA 2048) | 482.0 MiB (987,136 sectors) | superblock magic `0xe0f5e1e2` = **EROFS** |
+  | p2 | 483.0 MiB | 5.0 MiB | dm-verity hash tree |
+
+  The sector count is the load-bearing number: `987136 = 8 × 123392` is exactly
+  the `dataSectors` kata computes from `data_blocks`, so the config's verity
+  parameters describe precisely this image build. `root_hash_nvidia-gpu.txt`
+  ships beside the image carrying the same hash as the toml, which is the
+  per-build coupling made concrete.
 - **dm-verity is optional, and we skip it.** `veritysetup format --no-superblock`
   writes the hash tree to a *separate* p2 and never touches p1
   (`image_builder.sh:511-529`), so p1 is a self-contained mountable filesystem.
-  Booting it directly is valid. We skip the verity mapping deliberately: the image
+  Booting it directly is valid -- the EROFS superblock magic read at p1's own
+  offset above is that claim checked directly, not inferred. We skip the verity mapping deliberately: the image
   is fetched under a sha256 pinned in its SandboxConfig and attached read-only, so
   a verity chain would add a `root_hash` that changes on **every image rebuild**
   (the salt is freshly random per `veritysetup` run) without covering a threat
