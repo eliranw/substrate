@@ -502,6 +502,14 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 		t.Log("=== cycling the device: detach -> snapshot -> restore -> re-attach ===")
 	}
 
+	// Quiesce exactly as production does. nvidia-persistenced keeps the device
+	// open for as long as it runs, and the driver's removal path spins on
+	// usage_count, so an eject requested without this never completes. Skipping
+	// it here would make the test fail on a path production does not take.
+	if err := clearGPUPersistence(ctx, id, []string{cid}); err != nil {
+		t.Fatalf("clearGPUPersistence: %v", err)
+	}
+
 	// The agent's connection dies with the VMM; production re-dials after restore.
 	_ = agent.Close()
 
@@ -517,11 +525,10 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	for _, did := range ids {
 		if err := client.WaitDeviceRemoved(ctx, did, chCmd.Process.Pid, 60*time.Second); err != nil {
 			t.Fatalf("WaitDeviceRemoved(%s): %v\n"+
-				"  The VM-only test ejects fine, so what changed is that a container has USED\n"+
-				"  the GPU. If this fails even in the probe's quiet window, then any prior use\n"+
-				"  blocks the eject, not just a live handle -- which means the guest must release\n"+
-				"  the device before a snapshot, and that cannot be done over the debug console\n"+
-				"  on this guest (no shell). Re-opens design 4.2b.", did, err)
+				"  Persistence was cleared above, so the usual holder is already gone. What\n"+
+				"  remains is a live handle on the device: a process in the container with\n"+
+				"  /dev/nvidia* still open keeps usage_count non-zero and the driver's removal\n"+
+				"  path spins until it drops. Suspend expects an idle GPU.", did, err)
 		}
 	}
 	if err := errIfPassthroughSnapshot(ctx, client); err != nil {
