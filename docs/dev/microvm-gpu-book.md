@@ -5,7 +5,7 @@ snapshotted, and how it comes back. Written after the whole cycle was proven on 
 Tesla T4, and structured so the *reasoning* survives even where the code changes.
 
 Two bugs in this document were found only by running it on real hardware, and
-both came from the same mistake. That story is section 5; it is the most useful
+both came from the same mistake. That story is section 7; it is the most useful
 part of this file.
 
 ---
@@ -29,17 +29,99 @@ Verified end to end on hardware:
 | **Container still uses the GPU afterwards** | `nvidia-smi` again, same UUID |
 
 What is *not* yet proven is the layer above: the real `SuspendActor` /
-`ResumeActor` path. See section 8.
+`ResumeActor` path. See section 11.
 
 ---
 
-## 2. Why this is harder than "pass the device through"
+## 2. Vocabulary
+
+Nine terms carry most of this document. Skim now, refer back later.
+
+| Term | What it is |
+|---|---|
+| **VFIO** | The Linux framework for handing a physical PCI device to userspace (here, a VMM) safely. Appears as `/dev/vfio/<group>`. |
+| **IOMMU** | Hardware that translates device DMA addresses. Without it, a passed-through device could DMA anywhere in host memory, so passthrough requires it. |
+| **BAR** | Base Address Register. The field on a PCI device that says *where in the physical address space* its registers and memory live. The driver reads it, then talks to the device at that address. |
+| **MMIO** | Memory-Mapped I/O. Reading and writing device registers by reading and writing memory addresses — the thing BARs point at. |
+| **`_CRS`** | An ACPI table where the platform declares which address ranges a PCI host bridge actually routes. Linux uses it to decide where it may place BARs. Central to §7.2. |
+| **ACPI eject** | The mechanism by which a VMM asks a guest to surrender a hot-plugged device. The *guest* performs the removal; the VMM only requests it. |
+| **CDI** | Container Device Interface. A vendor-neutral spec describing everything a container needs for a device: node paths, library mounts, env, cgroup entries. |
+| **NVRC** | NVIDIA's init binary inside their Kata GPU guest. Loads the driver, starts daemons, generates the guest's CDI spec, then execs kata-agent. |
+| **memfd** | An anonymous memory-backed file. cloud-hypervisor backs guest RAM with one so `vm.snapshot` can write a **sparse** image — only the pages actually touched. |
+
+---
+
+## 3. The road to this design
+
+The shape of the solution is mostly a record of what was ruled out.
+
+### Kata's own GPU support does not apply
+
+Kata Containers supports NVIDIA GPUs, but **only under QEMU**. There is no
+`configuration-clh-nvidia-gpu.toml` anywhere in the kata-static tarball — only
+`qemu-nvidia-gpu` and its tdx/snp variants. Kata's clh driver has no GPU path.
+
+That was the first correction of the project: *cloud-hypervisor supports GPU
+passthrough* and *Kata+clh+GPU works* are different claims. The first is true —
+clh's `--device path=...` has worked for years. The second is not.
+
+So ateom drives cloud-hypervisor's own VFIO passthrough directly, bypassing
+Kata's GPU integration entirely. Internally this was "Option B", and it is why
+`internal/ch` has device code at all.
+
+### A migration-capable driver would have been easier, and does not exist
+
+The clean answer to "snapshot a VM with a device" is VFIO **migration v2**,
+where the device itself serialises its state. Investigated and rejected:
+
+- **No NVIDIA GPU offers migration v2 for full passthrough.**
+  `nvgrace-gpu-vfio-pci`, the only in-tree NVIDIA variant driver, contains
+  **zero migration code** and is ARM64/Grace-only.
+- **`nvidia-vgpu-vfio` (vGPU/mdev) does implement it**, but the vGPU guest
+  driver **has never loaded under cloud-hypervisor** — failures spanning clh
+  v29→v50, drivers 470→580, kernels 5.15 and 6.8, on V100/T4/L40S, in both mdev
+  and SR-IOV modes, while the identical setup works under QEMU. Unowned by
+  either vendor for three years.
+- Newer silicon does not help: the constraint is the driver↔VMM pairing.
+
+Hence detach-and-reattach rather than migrate.
+
+### GKE could not host this at all
+
+Every GKE node image reports **zero IOMMU groups** — GCE exposes no vIOMMU to
+its VMs, so nested VFIO passthrough is impossible. Not a configuration problem;
+there is nothing to configure. The work moved to a bare-metal T4 host, which is
+why every result in this document comes from one machine.
+
+### The initrd path was removed before any of this
+
+The earlier GPU guest was an **initrd**. An initrd unpacks into guest RAM, so
+all 876 MB of it would land in **every memory snapshot**. The current guest is a
+disk image, demand-paged from virtio-blk, which never enters the snapshot. That
+change (`ch.PayloadConfig.Initramfs` deleted) is a prerequisite for snapshots
+being a sane size at all.
+
+### Rejected alternatives, in one table
+
+| Alternative | Why rejected |
+|---|---|
+| Snapshot with the GPU attached | Torn memory image, and no device state captured |
+| `nvidia-vgpu-vfio` (vGPU/mdev) for migration v2 | Guest driver has never loaded under clh; three years, zero successes, unowned |
+| `nvgrace-gpu-vfio-pci` | Zero migration code; ARM64/Grace only |
+| Newer GPU (A100/H100/Grace) | Same generic `vfio-pci`; the constraint is driver↔VMM, not silicon |
+| `cuda-checkpoint` instead of detach | Releases a CUDA context, not the *device*; the VMM-level attachment is what blocks the snapshot |
+| Snapshot before containers start | Loses application warmth, which is the whole point of substrate's snapshots |
+| Broad "allow all" device cgroup | Unnecessary — CDI supplies exact majors |
+
+---
+
+## 4. Why this is harder than "pass the device through"
 
 Passing a GPU into a VM is routine. The difficulty is that substrate's actors
 are **snapshotted**, and a passthrough device is hostile to that in three
 separate ways.
 
-### 2.1 A snapshot with a live device is silently corrupt
+### 4.1 A snapshot with a live device is silently corrupt
 
 cloud-hypervisor's `VfioPciDevice` has an **empty `Pausable` implementation**.
 `vm.pause` stops the vCPUs and does nothing to the device. A GPU is a bus
@@ -54,13 +136,13 @@ this.** It returns success.
 That single fact shapes the whole design: the device must be *gone*, verifiably,
 before the guest is frozen.
 
-### 2.2 "Eject requested" is not "ejected"
+### 4.2 "Eject requested" is not "ejected"
 
 `vm.remove-device` returns **204**, meaning the request was accepted. The actual
 teardown happens later, when the guest executes the ACPI `_EJ0` method. Treating
 the 204 as completion races the device straight back into the corruption above.
 
-### 2.3 The guest cannot be asked anything
+### 4.3 The guest cannot be asked anything
 
 NVIDIA's Kata GPU guest rootfs contains `/bin/busybox` and **no `/bin/sh` or
 `/bin/bash`**; `/init` points straight at NVRC. kata-agent's debug console
@@ -70,13 +152,13 @@ agent RPC fills the gap either — `ExecProcess` is container-scoped and
 
 **Nothing can run a command in that guest.** Any design step of the form "then
 the guest does X" is unimplementable. This invalidated an entire component
-(section 7).
+(section 9).
 
 ---
 
-## 3. The design
+## 5. The design
 
-### 3.1 Lifecycle
+### 5.1 Lifecycle
 
 ```
 RUN       resolve PCI_RESOURCE_* → cold-plug at vm.create → boot
@@ -94,7 +176,7 @@ RESUME    relaunch VMM → restore (EAGER memory) → resume
           confirm they are back in the device tree
 ```
 
-### 3.2 Decisions worth knowing
+### 5.2 Decisions worth knowing
 
 **Cold-plug at boot, not hot-plug.** NVRC generates the guest's CDI spec exactly
 once, *before* it forks the kata-agent. A device added afterwards never appears
@@ -118,7 +200,7 @@ answer is an error rather than an assumed-empty one.
 
 ---
 
-## 4. The code
+## 6. The code
 
 ~700 lines of production code across 14 files.
 
@@ -139,7 +221,7 @@ answer is an error rather than an assumed-empty one.
 | `hack/microvm-assets/assemble-gpu.sh` | +146 | Builds the GPU guest **and** generates a clh config |
 | `manifests/.../sandboxconfig-microvm-gpu.yaml.tmpl` | +57 | The GPU sandbox class |
 
-### 4.1 The eject oracle
+### 6.1 The eject oracle
 
 `vm.remove-device` returns 204 = "requested". `WaitDeviceRemoved` polls **two
 independent signals** before any caller may proceed:
@@ -156,7 +238,7 @@ This was written after a hand-run of the same logic reported "EJECT COMPLETE"
 while the device was still attached — both checks were vacuous (a wrong id, and
 the `sudo` wrapper's PID instead of the VMM's). Hence `assertIsVMM`.
 
-### 4.2 Identifying VFIO devices
+### 6.2 Identifying VFIO devices
 
 Cold-plugged devices never produce an `add-device` reply, so their ids must be
 read back from the device tree. Two traps, both from cloud-hypervisor's source:
@@ -167,7 +249,7 @@ read back from the device tree. Two traps, both from cloud-hypervisor's source:
   passthrough device is *not* necessarily `_vfio0`. Observed on hardware:
   `_vfio3`, becoming `_vfio4` after a detach/re-attach.
 
-### 4.3 Giving the container the GPU
+### 6.3 Giving the container the GPU
 
 This turned out to be one annotation, not a subsystem:
 
@@ -199,7 +281,62 @@ major 195 minor 254  nvidia-modeset
 major 239 minor 0    nvidia-uvm
 ```
 
-### 4.4 The guest image
+### 6.4 The snapshot gate
+
+The last check before the memory image is written:
+
+```go
+func errIfPassthroughSnapshot(ctx, client) error   // checkpoint.go
+```
+
+Three properties, each chosen against a specific failure:
+
+- **It asks the VMM, not us.** An earlier version keyed off the worker's
+  allocation; that cannot see a detach, so once detach existed it would have
+  refused every snapshot. Bookkeeping was the other option and is worse — it
+  agrees with itself even when an eject silently failed.
+- **`device_tree`, not `config.devices`.** clh drops a device from `config` the
+  moment an eject is *requested*, so `config` reports it gone during exactly the
+  in-flight window this exists to catch.
+- **Unreadable is an error, never assumed-empty.** A malformed `vm.info` must
+  not read as "nothing attached".
+
+It rejects **both** snapshot scopes. FULL is unarguable — it serialises the guest
+RAM the device is writing into. DATA is rejected conservatively rather than
+provably: it captures only the host-backed durable share and never serialises
+guest RAM, but the guest is still paused with the device live, and a paused vCPU
+does not stop DMA into a page backing a durable-share mapping.
+
+### 6.5 Ordering, and why it is the correctness argument
+
+`detachPassthrough` does four things, and the order is the whole point:
+
+```
+1. release the guest's hold      nvidia-smi -pm 0 in the container
+2. request every eject           vm.remove-device × N
+3. confirm every eject           WaitDeviceRemoved × N
+4. assert nothing remains        errIfPassthroughSnapshot
+```
+
+Step 1 before step 2 because the eject is *accepted* either way and then blocks
+in the driver's remove callback — an eject requested first simply waits for the
+timeout (§7.1). All of step 2 before any of step 3 because the guest can process
+ejects concurrently; interleaving them turns one slow device into a timeout for
+all of them.
+
+Both properties are mutation-tested: swapping steps 1 and 2, or interleaving 2
+and 3, each fails a test.
+
+### 6.6 The `(deleted)` trap
+
+`WaitDeviceRemoved` reads `/proc/<pid>/fd` and matches `/dev/vfio/<group>`. The
+kernel appends `" (deleted)"` to a `/proc/<pid>/fd` symlink whose backing file
+has been unlinked — so a regex anchored with `$` silently stops matching, the
+check passes vacuously, and the snapshot proceeds with the device attached.
+This was reproduced during review, not theorised. The matcher is
+`/dev/vfio/[0-9]+( \(deleted\))?$`.
+
+### 6.7 The guest image
 
 NVIDIA's GPU guest ships in the **same** kata-static tarball as the stock one,
 so this is a file-selection difference rather than a second supply chain. But it
@@ -220,12 +357,12 @@ QEMU-only — so `assemble-gpu.sh` derives one, lifting `rootfs_type` and
 
 ---
 
-## 5. The two production bugs
+## 7. The two production bugs
 
 Both were invisible to every unit test, and both came from **adopting NVIDIA's
 guest configuration wholesale**.
 
-### 5.1 `nvidia-persistenced` holds the device open
+### 7.1 `nvidia-persistenced` holds the device open
 
 **Symptom.** With a container that had used the GPU, `vm.remove-device` was
 accepted and the eject *never completed*. The VM-only test ejected fine, because
@@ -263,7 +400,7 @@ the `--uvm-persistence-mode` flag and leaves the daemon's own default intact; no
 NVRC tag handles unplug — the code that did was removed in `fd395ac`
 ("switching to cold-plug per default").
 
-### 5.2 `pci=nocrs` breaks hot-plug MMIO
+### 7.2 `pci=nocrs` breaks hot-plug MMIO
 
 **Symptom.** After a re-attach the GPU was unusable. Device nodes present, BARs
 apparently correct, driver bound, `/proc/driver/nvidia/gpus/` entry present —
@@ -297,7 +434,7 @@ out of NVIDIA's config. With it gone the kernel picks `0xc0000000`, inside clh's
 aperture, and the GPU works after a hot-plug. `pci=realloc` is kept — stripping
 it alone reproduced the failure identically, so it is not implicated.
 
-### 5.3 A third, found the same way
+### 7.3 A third, found the same way
 
 `restoreFullScope` hardcoded `OnDemand` memory restore. Re-attaching a VFIO
 device maps guest memory into the IOMMU, and VFIO must **pin** those pages;
@@ -311,7 +448,7 @@ which costs the ~75ms restore and the sparse memfd that `OnDemand` was buying.
 
 ---
 
-## 6. The debugging journey
+## 8. The debugging journey
 
 Fifteen hardware runs. Almost every one found something, and the *order* matters
 — several conclusions were wrong until a later run corrected them.
@@ -321,15 +458,15 @@ Fifteen hardware runs. Almost every one found something, and the *order* matters
 | 1 | `arm64` binaries on an x86 host | `assemble.sh` defaults to `ARCH=arm64` and neither script checks against the host |
 | 2 | Guest booted; debug console `EOF` | **Claim A settled** — NVRC boots on a non-verity EROFS root |
 | 3 | `ls /mnt/gpuroot/bin/` — no `/bin/sh` | The guest can never be asked anything |
-| 4 | Eject-only detach **worked** | Led to deleting the guest-side layer — correct code, wrong reason (see §7) |
+| 4 | Eject-only detach **worked** | Led to deleting the guest-side layer — correct code, wrong reason (see §9) |
 | 5–7 | Restore 500s: spent virtiofsd, pid-file `flock`, bound vsock socket | All artifacts of reusing one actor id; production restores under a new one |
 | 8 | `VfioDmaMap … Error(14)` | **Real bug**: `OnDemand` restore is incompatible with VFIO |
 | 9–13 | Container spec rejected: capabilities, pid ns, read-only root, dynamic busybox, blocking reads | The cost of driving `CreateContainer` without atelet's pipeline |
 | 13 | `nvidia-smi` runs in a bare ubuntu container | **CDI injection proven** — every NVIDIA bit came from the guest |
-| 14 | Eject hangs once a container has used the GPU | Persistence mode. §7's deletion was premature |
+| 14 | Eject hangs once a container has used the GPU | Persistence mode. §9's deletion was premature |
 | 15 | `pci=nocrs` stripped → **claim B passes** | The last bug |
 
-### 6.1 Five diagnostics that asserted their own hypothesis
+### 8.1 Five diagnostics that asserted their own hypothesis
 
 The single most costly recurring mistake, worth naming because it kept
 recurring in different disguises:
@@ -349,7 +486,7 @@ The rule that would have prevented all five: **a failure message may state what
 was attempted and what was observed, but may only state *why* when the
 observation itself distinguishes the causes.**
 
-### 6.2 Measuring the wrong thing
+### 8.2 Measuring the wrong thing
 
 `/sys/.../resource` is the kernel's *record* of a BAR assignment. After a
 restore that record comes back with the rest of guest memory — so comparing it
@@ -359,7 +496,7 @@ space** is the device.
 More generally: after a restore, *anything read from guest memory is a memory of
 the past, not an observation of the present.*
 
-### 6.3 What actually cracked it
+### 8.3 What actually cracked it
 
 Two moves, neither of which was more instrumentation:
 
@@ -374,7 +511,7 @@ Two moves, neither of which was more instrumentation:
 
 ---
 
-## 7. What was deleted
+## 9. What was deleted
 
 An entire component — `GuestGPUBDFs`, `GuestDetachGPU`, `GuestVerifyGPUBound`,
 their seams and twelve tests. **574 lines out, 64 in.**
@@ -400,7 +537,64 @@ mounted `nvidia-smi`. The lesson is narrow and sharp:
 
 ---
 
-## 8. What is proven, and what is not
+## 10. How this is tested
+
+Three layers, each catching a different class of problem.
+
+### Unit tests with fakes
+
+A stand-in cloud-hypervisor on a unix socket, a stubbed guest console, a fixture
+`/proc` tree. They are fast, run in CI, and are **blind to the environment** —
+every bug in §7 was invisible to them, because a fake console always answers and
+a fixture `/proc` has no persistence mode.
+
+What they *are* good at is ordering and contracts, which is why the seams exist:
+
+```go
+var (
+    waitDeviceGone     = (*ch.Client).WaitDeviceRemoved
+    releasePersistence = clearGPUPersistence
+)
+```
+
+Thin orchestration is exactly where the correctness argument lives and exactly
+what unit tests skip as "too trivial to test".
+
+### Mutation testing
+
+Every non-trivial change here was checked by breaking it deliberately and
+confirming a test fails. It found real holes that coverage would have reported
+as green:
+
+- An unconditional CDI annotation **survived** the suite — the only
+  no-allocation test hit an early return and never reached the annotate line.
+- A literal (non-quote-split) scan sentinel **survived** — no test covered "the
+  console echoed the command but never ran it".
+
+Both were fixed by tightening the test, not the code. A line can be *executed*
+by one test and *checked* by none.
+
+### Hardware tests (`-tags gpuhw`)
+
+Two, both build-tagged so they never run in CI or on a laptop:
+
+| Test | Needs | Covers |
+|---|---|---|
+| `TestGPUCycleOnHardware` | GPU + assets | boot, detach, snapshot, restore, re-attach — VM level only, ~20s |
+| `TestGPUContainerSeesDeviceOnHardware` | + a container rootfs | CDI injection and whether the **container** can use the GPU across the cycle |
+
+Neither needs Kubernetes, atelet, ateapi or OCI bundles. That was the decision
+that made this tractable: the risky code is ~400 lines of VM lifecycle, and the
+runbook wraps it in a cluster, a scheduler and an image registry — none of which
+was uncertain. Splitting the *hardware* dependency from the *orchestration*
+dependency turned one blocked test into one runnable immediately.
+
+The cost is visible in §8: nine iterations were spent rebuilding, by hand, the
+OCI spec that atelet supplies for free.
+
+---
+
+## 11. What is proven, and what is not
 
 ### Proven on hardware
 
@@ -423,7 +617,7 @@ it has **no virtio-net**, no overlay rootfs, no durable dirs, no `base-id`
 lineage, and it restores under the *same* actor id rather than a new one. The
 missing virtio-net is the notable one: production re-attaches a GPU into a VM
 where another device is competing for the same MMIO aperture, and MMIO
-allocation is precisely what §5.2 was about.
+allocation is precisely what §7.2 was about.
 
 **Multi-GPU.** The code handles N devices; only N=1 has ever run.
 
@@ -442,7 +636,7 @@ the hardware probe clears persistence itself.
 
 ---
 
-## 9. Running it
+## 12. Running it
 
 ```bash
 # Assets (~2GB). Note ARCH: assemble.sh defaults to arm64.
@@ -474,9 +668,9 @@ Useful knobs:
 
 ---
 
-## 10. If you are picking this up
+## 13. If you are picking this up
 
-Read in this order: §2 (why it is hard), §5 (the two bugs), §7 (the deletion).
+Read in this order: §4 (why it is hard), §7 (the two bugs), §9 (the deletion).
 Everything else is reference.
 
 The highest-value next step is the **production path** — deploy substrate on a
@@ -493,3 +687,71 @@ Two things to be careful of, both learned expensively here:
   stubs in this package are faithful to the transports and blind to the
   environment — no shell in the guest, persistence mode on, MMIO apertures.
   Those are only visible on hardware.
+
+---
+
+## 14. What we would do differently
+
+**Restore under a second actor id.** Three separate failures — a spent
+virtiofsd, a held pid-file `flock`, a bound vsock socket — were all one root
+cause: the hardware test reuses a single actor id where production always uses a
+fresh one. `rewriteSnapshotSocketPaths` exists precisely to repoint a snapshot
+at new paths. Collapsing that lifecycle saved setup and cost three rounds of
+debugging.
+
+**Mount the guest image on day one.** It was downloadable from the start.
+Thirty seconds with `mount -o loop,offset=1048576` would have shown no
+`/bin/sh`, and invalidated an entire component *before* it was written, along
+with the design section that specified it.
+
+**Wire every subprocess's output immediately.** `LaunchVMMOptions.Stdout` and
+`VirtiofsdOptions.Log` both existed and both were left nil. A 500 from clh and
+an exit from virtiofsd each cost a hardware round-trip to diagnose something the
+process had already printed.
+
+**Read the first successful output as carefully as the failures.**
+`Persistence-M: On` was printed in the run that first proved `nvidia-smi`
+worked. It was the cause of the next two failures, sitting in a column nobody
+read.
+
+---
+
+## 15. Appendix — the commit trail
+
+41 commits. The ones that changed production behaviour:
+
+| Commit | |
+|---|---|
+| `98017645` | VFIO passthrough with attach/detach primitives |
+| `bf5ef9f1` | The CDI annotation — the actor container gets its GPU |
+| `2d236b2c` | Boot the guest with its own root parameters (EROFS) |
+| `bf5571a4` | Detach for snapshots, re-attach on restore |
+| `965ede1d` | **Restore eagerly when a passthrough device is attached** |
+| `ddde5f25` | Drop the guest-side detach (574 lines out) |
+| `afd11a6b` | **Release the guest's GPU hold before ejecting** |
+| `129c7fc4` | **Drop `pci=nocrs` from the generated GPU config** |
+
+The other 33 are tests, diagnostics and documentation — including the
+instrumentation that found the three bold entries above. That ratio is the
+honest shape of the work: the fixes are small, and finding them was not.
+
+---
+
+## 16. Sources
+
+Claims in this document that came from reading source, not from inference:
+
+| Claim | Where |
+|---|---|
+| `VfioPciDevice`'s `Pausable` is empty | cloud-hypervisor `vmm/src/device_manager.rs` |
+| VFIO ids are `_vfio<N>`, counter global, never reset | clh `device_manager.rs:176`, `:3844-3865` |
+| `config` is cleared on eject request; `device_tree` is not | clh `device_manager.rs:5101`, `:5136-5139` |
+| kata-agent does in-guest CDI injection since 3.11.0 | kata `src/agent/src/device/mod.rs:430`, `rpc.rs:278` |
+| CDI adds cgroup entries, not just nodes | `container_edits.rs:104-109` |
+| NVRC writes the CDI spec before forking the agent | nvrc `src/toolkit.rs:31-46`, `main.rs:63`→`:126` |
+| NVRC starts `nvidia-persistenced` unconditionally | nvrc `src/main.rs:55`, `daemon.rs:15-21` |
+| The daemon defaults to persistence **enabled** | nvidia-persistenced `options.c:100`, `option-table.h:87-93` |
+| The driver spins waiting for `usage_count` | `kernel-open/nvidia/nv-pci.c:2324-2350` |
+| Persistence must be off before removal | NVML docs, `nvmlDeviceRemoveGpu_v2` |
+| No `nvrc.*` param disables persistence | nvrc `src/kernel_params.rs:31-38` (complete list) |
+| The guest image is MBR, p1 EROFS, p2 verity | read directly from the shipped image |
