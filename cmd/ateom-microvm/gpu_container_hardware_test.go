@@ -146,9 +146,16 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 		// It loops afterwards so the same container can still answer claim B once
 		// the device is back.
 		quiet := envOr("ATE_PROBE_QUIET_SECS", "90")
+		// Persistence mode keeps the driver initialised and the device claimed with
+		// no client processes, which is why the eject blocked after first use and
+		// why going quiet did not help. nvidia-smi reported Persistence-M: On.
+		// Turning it off here tests exactly that: if the eject then succeeds,
+		// persistence was the holder and production must clear it before detaching.
 		return rootfs, []string{"/bin/sh", "-c",
 			"echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
-				"nvidia-smi -L 2>&1 | head -3; echo '--- PROBE DONE ---'; " +
+				"nvidia-smi -L 2>&1 | head -3; " +
+				"echo '--- persistence off ---'; nvidia-smi -pm 0 2>&1 | head -3; " +
+				"echo '--- PROBE DONE ---'; " +
 				"sleep " + quiet + "; " +
 				"while true; do echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
 				"nvidia-smi -L 2>&1 | head -3; echo '--- PROBE DONE ---'; sleep 3; done"}
