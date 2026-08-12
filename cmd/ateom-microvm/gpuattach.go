@@ -190,20 +190,73 @@ func retriggerHotplug(ctx context.Context, client *ch.Client) error {
 	return waitDevicesAttached(ctx, client, len(devices), attachSettleTimeout)
 }
 
+// rebindGuestDriver makes the guest driver probe the device again WITHOUT the
+// guest re-assigning its BARs first.
+//
+// That distinction is the whole fix. The guest's hot-plug path assigns BARs and
+// probes immediately, and the probe fails; ejecting and re-adding the device
+// just repeats it. Writing the address to the driver's bind file re-probes a
+// device whose BARs are already settled, and that binds the same GPU with the
+// same UUID.
+//
+// It runs in a container because the guest rootfs has no shell. The bind file is
+// writable only for actors holding a GPU, via withNVIDIADriverBindMount.
+func rebindGuestDriver(ctx context.Context, actorUID string, containerIDs []string) error {
+	if len(containerIDs) == 0 {
+		return fmt.Errorf("no containers to rebind the driver from")
+	}
+	agent, err := dialAgentRetry(ctx, kata.VsockSocketPath(actorUID), 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("dialing the agent: %w", err)
+	}
+	defer agent.Close()
+
+	// The guest BDF is not the host's, so the container finds it by vendor id.
+	// unbind can legitimately fail -- a probe that failed leaves no driver link to
+	// remove -- but a bind that cannot be written is the whole mechanism missing.
+	const script = `for d in /sys/bus/pci/devices/*/; do
+[ "$(cat "$d/vendor" 2>/dev/null)" = 0x10de ] || continue
+b=$(basename "$d")
+echo "$b" > /sys/bus/pci/drivers/nvidia/unbind 2>/dev/null
+echo "$b" > /sys/bus/pci/drivers/nvidia/bind 2>/dev/null || exit 10
+done
+exit 0`
+
+	var lastErr error
+	for _, cid := range containerIDs {
+		code, err := agent.ExecProcess(ctx, cid, cid+"_rebind", []string{"/bin/sh", "-c", script})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if code == 10 {
+			lastErr = fmt.Errorf("%s cannot write /sys/bus/pci/drivers/nvidia/bind", cid)
+			continue
+		}
+		if code != 0 {
+			lastErr = fmt.Errorf("rebind in %s exited %d", cid, code)
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
 // ensureActorGPUUsable makes the actor's re-attached GPU usable, or reports why
 // it could not.
 //
-// Checking first keeps the cost off actors that do not need it, and keeps the
-// remedy honest: a re-trigger that runs unconditionally would look like it was
-// doing something even on a resume that never needed it.
+// Checking first keeps the cost off actors that do not need it. The remedy is a
+// driver rebind rather than another hot-plug: re-adding the device makes the
+// guest assign its BARs and probe all over again, which fails the same way --
+// measured, not assumed.
 func ensureActorGPUUsable(ctx context.Context, client *ch.Client, actorUID string, containerIDs []string) error {
 	if err := actorGPUUsable(ctx, actorUID, containerIDs, 3); err == nil {
 		return nil
 	}
-	slog.InfoContext(ctx, "The re-attached GPU is not bound yet; re-triggering hot-plug so the guest probes again",
+	slog.InfoContext(ctx, "The re-attached GPU is not bound; re-probing the guest driver",
 		slog.String("id", actorUID))
-	if err := retriggerHotplug(ctx, client); err != nil {
-		return fmt.Errorf("while re-triggering hot-plug: %w", err)
+	if err := rebindGuestDriver(ctx, actorUID, containerIDs); err != nil {
+		return fmt.Errorf("while re-probing the guest driver: %w", err)
 	}
 	return actorGPUUsable(ctx, actorUID, containerIDs, 25)
 }

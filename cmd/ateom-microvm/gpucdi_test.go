@@ -19,6 +19,8 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -191,5 +193,47 @@ func TestGuestCDIAnnotationAbsentForAnSRIOVWorker(t *testing.T) {
 	if v, ok := got.Annotations[guestCDIAnnotation]; ok {
 		t.Errorf("an SR-IOV NIC was annotated %s=%q; the guest cannot resolve that "+
 			"CDI device and CreateContainer would fail", guestCDIAnnotation, v)
+	}
+}
+
+// A GPU actor gets the driver's bind file made writable, because a re-attached
+// device is unusable until something re-probes it and nothing outside the guest
+// can. It must layer OVER the read-only /sys, so it has to be last.
+func TestGuestCDIMakesTheDriverBindFileWritable(t *testing.T) {
+	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
+	fakePCIDevice(t, "0000:da:00.0", "0x10de", "0x030200")
+	spec := &specs.Spec{Mounts: []specs.Mount{
+		{Destination: "/sys", Type: "sysfs", Options: []string{"ro"}},
+	}}
+	got, err := withGuestCDIDevices(spec)
+	if err != nil {
+		t.Fatalf("withGuestCDIDevices: %v", err)
+	}
+	last := got.Mounts[len(got.Mounts)-1]
+	if last.Destination != "/sys/bus/pci/drivers/nvidia" {
+		t.Fatalf("the bind mount must come after /sys or the read-only mount hides it; got %q last",
+			last.Destination)
+	}
+	if !slices.Contains(last.Options, "rw") {
+		t.Errorf("mount options = %v, want rw", last.Options)
+	}
+	if len(spec.Mounts) != 1 {
+		t.Error("the caller's mounts were mutated; the carrier would inherit the writable sysfs")
+	}
+}
+
+// An actor without a GPU must not get a writable sysfs path it has no use for.
+func TestGuestCDILeavesMountsAloneWithoutAGPU(t *testing.T) {
+	spec := &specs.Spec{Mounts: []specs.Mount{
+		{Destination: "/sys", Type: "sysfs", Options: []string{"ro"}},
+	}}
+	got, err := withGuestCDIDevices(spec)
+	if err != nil {
+		t.Fatalf("withGuestCDIDevices: %v", err)
+	}
+	for _, m := range got.Mounts {
+		if strings.Contains(m.Destination, "drivers/nvidia") {
+			t.Errorf("a non-GPU actor was given %q", m.Destination)
+		}
 	}
 }

@@ -137,6 +137,37 @@ func withGuestCDIDevices(spec *specs.Spec) (*specs.Spec, error) {
 	}
 	if gpus > 0 {
 		out.Annotations[guestCDIAnnotation] = guestCDIDevices
+		out.Mounts = withNVIDIADriverBindMount(spec.Mounts)
 	}
 	return &out, nil
+}
+
+// withNVIDIADriverBindMount makes the NVIDIA driver's bind/unbind pair writable
+// for an actor that was granted a GPU.
+//
+// A re-attached device is unusable until the driver probes it again, and the
+// only thing that produces such a probe is writing the device's address to
+// /sys/bus/pci/drivers/nvidia/bind. The guest's own hot-plug probe cannot be
+// used: it runs immediately after re-assigning the device's BARs and fails, and
+// ejecting and re-adding the device only repeats that -- measured, both times.
+// Nothing at the VMM level re-probes without re-assigning.
+//
+// Actors mount /sys read-only, so this layers one writable directory over it,
+// only for actors holding an NVIDIA GPU. What that grants is the ability to
+// unbind and rebind the actor's own GPU driver -- inside its own micro-VM, whose
+// kernel and sysfs belong to that actor alone. The isolation boundary substrate
+// enforces is the VM, and this does not cross it.
+//
+// Appended so it layers over the read-only /sys from defaultKataMounts; the
+// agent applies mounts in order.
+func withNVIDIADriverBindMount(mounts []specs.Mount) []specs.Mount {
+	const driverDir = "/sys/bus/pci/drivers/nvidia"
+	out := make([]specs.Mount, len(mounts), len(mounts)+1)
+	copy(out, mounts)
+	return append(out, specs.Mount{
+		Destination: driverDir,
+		Source:      driverDir,
+		Type:        "bind",
+		Options:     []string{"bind", "rw", "nosuid", "noexec", "nodev"},
+	})
 }
