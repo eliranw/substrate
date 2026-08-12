@@ -153,17 +153,25 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 		// persistence was the holder and production must clear it before detaching.
 		return rootfs, []string{"/bin/sh", "-c",
 			"echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
-				"echo '--- BARs ---'; for d in /sys/bus/pci/devices/*/; do " +
-				"[ \"$(cat $d/vendor 2>/dev/null)\" = 0x10de ] && { echo \"$d\"; " +
-				"head -3 $d/resource; }; done; " +
+				"echo '--- pci ---'; for d in /sys/bus/pci/devices/*/; do " +
+				"[ \"$(cat $d/vendor 2>/dev/null)\" = 0x10de ] || continue; echo \"$d\"; " +
+				"head -3 $d/resource; " +
+				"echo \"  driver: $(readlink $d/driver 2>&1)\"; " +
+				"echo \"  enable: $(cat $d/enable 2>&1) power: $(cat $d/power/runtime_status 2>&1)\"; " +
+				"done; " +
+				"echo '--- driver view ---'; ls /proc/driver/nvidia/gpus/ 2>&1; " +
 				"nvidia-smi -L 2>&1 | head -3; " +
 				"echo '--- persistence off ---'; nvidia-smi -pm 0 2>&1 | head -3; " +
 				"echo '--- PROBE DONE ---'; " +
 				"sleep " + quiet + "; " +
 				"while true; do echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
-				"echo '--- BARs ---'; for d in /sys/bus/pci/devices/*/; do " +
-				"[ \"$(cat $d/vendor 2>/dev/null)\" = 0x10de ] && { echo \"$d\"; " +
-				"head -3 $d/resource; }; done; " +
+				"echo '--- pci ---'; for d in /sys/bus/pci/devices/*/; do " +
+				"[ \"$(cat $d/vendor 2>/dev/null)\" = 0x10de ] || continue; echo \"$d\"; " +
+				"head -3 $d/resource; " +
+				"echo \"  driver: $(readlink $d/driver 2>&1)\"; " +
+				"echo \"  enable: $(cat $d/enable 2>&1) power: $(cat $d/power/runtime_status 2>&1)\"; " +
+				"done; " +
+				"echo '--- driver view ---'; ls /proc/driver/nvidia/gpus/ 2>&1; " +
 				"nvidia-smi -L 2>&1 | head -3; echo '--- PROBE DONE ---'; sleep 3; done"}
 	}
 
