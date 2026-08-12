@@ -560,6 +560,14 @@ directory fails rather than passing: a check that cannot tell 'absent' from
 
 ### Task 3: guest-side detach and attach-verify
 
+> **SUPERSEDED — do not implement.** This task was built and then deleted after
+> the hardware run. NVIDIA's guest rootfs has no shell (`/bin/busybox` only,
+> `/init` → NVRC), so kata-agent's debug console cannot spawn one and none of
+> these functions can execute there; and the eject alone unbinds the driver, so
+> they are not needed. See §4.2b of the design. It also calls `lspci`, which is
+> not in that rootfs. Kept as a record of what was tried.
+
+
 **Files:**
 - Create: `cmd/ateom-microvm/internal/kata/gpuguest.go`
 - Create: `cmd/ateom-microvm/internal/kata/gpuguest_test.go`

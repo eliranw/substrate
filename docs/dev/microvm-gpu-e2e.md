@@ -139,13 +139,10 @@ kubectl -n ate-demo-gpu-microvm exec <worker-pod> -c ateom -- \
   cat /run/ateom/vm/<actor-uid>/serial.log | grep -i cdi
 ```
 
-and confirm the guest generated a spec at all (NVRC writes it before forking the
-agent, so an empty file means NVRC's GPU mode did not run):
-
-```bash
-# via the guest debug console
-ls -l /var/run/cdi/
-```
+The guest cannot be inspected directly to confirm NVRC wrote a spec: its rootfs
+has `/bin/busybox` and no `/bin/sh`, so kata-agent's debug console cannot spawn a
+shell and no command runs there. The container is the only vantage point, which
+is why every check in this runbook is made from inside the actor.
 
 `Permission denied` opening `/dev/nvidia0` rather than "no devices" would mean
 the device cgroup was not widened — CDI does that itself, so that would be a
@@ -158,14 +155,15 @@ kubectl-ate suspend actor -n ate-demo-gpu-microvm gpu-1
 kubectl -n ate-demo-gpu-microvm logs <worker-pod> -c ateom | grep -i detach
 ```
 
-Expect `Detached passthrough devices for snapshot` with the guest BDFs and a
-duration. Failure modes, in the order they are checked:
+Expect `Detached passthrough devices for snapshot` with a device count and a
+duration. ateom asks the guest nothing here: `vm.remove-device` raises an ACPI
+eject and the guest kernel's hotplug path calls the driver's `.remove()` itself
+(verified on a T4). Failure modes, in the order they are checked:
 
-- `still bound to a driver after unbind` — the guest would not release it.
-  Usually something still holds the device; `nvidia-persistenced` is stopped
-  first, but a live CUDA context in the workload would also do it.
 - `while confirming eject` — the VMM never dropped its `/dev/vfio` group fd
-  within 30s. The eject was requested but the guest did not complete it.
+  within 30s. The eject was requested and the guest did not complete it. The
+  likeliest cause is a live CUDA context in the workload pinning the device,
+  which is why suspend expects an idle GPU.
 - `refusing to snapshot: N passthrough device(s) still attached` — the detach
   reported success without finishing. This is the assertion that stops a torn
   snapshot; it should be unreachable.
@@ -184,10 +182,15 @@ kubectl-ate resume actor -n ate-demo-gpu-microvm gpu-1
 kubectl -n ate-demo-gpu-microvm logs <worker-pod> -c ateom | grep -i "Re-attached"
 ```
 
-`guest enumerated 0 of 1` means the hot-plugged device never appeared on the
-guest PCI bus — the guest did not process the hot-plug event. `did not bind to
-the nvidia driver` means it appeared but the driver would not claim it, even
-after the explicit bind.
+`only 0 of 1 passthrough device(s) came back` means the VMM never took the
+device. If it 500s with `VfioDmaMap(IommuDmaMap(Error(14)))`, the actor was
+restored with `OnDemand` memory: VFIO must pin guest memory to map it into the
+IOMMU and userfaultfd-backed pages cannot be pinned, so `restoreFullScope`
+selects `Copy` whenever the worker holds a passthrough device.
+
+ateom can only confirm the device returned to the VMM. Whether the guest driver
+rebound is not observable from the host on this image — step 8 is what settles
+it.
 
 ## 8. The GPU works again — decides claim B
 
@@ -202,17 +205,18 @@ to it.
 
 The fallback is design §4.3 / C5: after re-attach, create the nodes into
 `/proc/<pid>/root/dev/` from the guest and widen the cgroup via
-`UpdateContainer`, driven by the guest CDI spec. Capture the evidence first —
-inside the actor, and via the debug console:
+`UpdateContainer`, driven by the guest CDI spec. Capture the evidence from
+inside the actor, which is the only place that can be asked:
 
 ```bash
-ls -l /dev/nvidia*                    # in the actor: do the nodes still exist?
-cat /proc/devices | grep nvidia       # in the guest: what major does the driver hold now?
+kubectl-ate exec -n ate-demo-gpu-microvm gpu-1 -- ls -l /dev/nvidia*
+kubectl-ate exec -n ate-demo-gpu-microvm gpu-1 -- cat /proc/devices   # nvidia majors
 ```
 
-If the major changed across the cycle, that is the mechanism, and it is worth
-recording: the design argues `nvidia-uvm`'s dynamic major is stable *because the
-modules stay resident*, and a changed major would falsify that.
+Compare the majors against the same commands run at step 5, before the cycle. If
+they changed, that is the mechanism: the design argues `nvidia-uvm`'s dynamic
+major is stable *because the modules stay resident*, and a changed major would
+falsify that.
 
 ## 9. Repeat the cycle
 
