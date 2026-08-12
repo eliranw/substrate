@@ -137,12 +137,18 @@ config actually says `erofs`.
 
 ## 5. The GPU is usable in the actor — the real assertion
 
+There is no `exec` into an actor, so the workload reports on itself: it prints
+its device nodes and `nvidia-smi` every five seconds, and ateom forwards that
+into the worker pod's log.
+
 ```bash
-kubectl-ate exec -n ate-demo-gpu-microvm gpu-1 -- nvidia-smi
+kubectl-ate logs actors -n ate-demo-gpu-microvm gpu-1 --follow
 ```
 
 Expect the T4 listed with a driver version. This is the step the whole change
-exists for, and the one a non-GPU workload would have skipped.
+exists for, and the one a non-GPU workload would have skipped. Leave the follow
+running through steps 6–8: the log going quiet at suspend and resuming after is
+the same evidence, seen once.
 
 If `nvidia-smi` is missing, the image lacks the driver userspace. If it runs but
 reports **no devices**, the CDI injection did not happen — check the annotation
@@ -177,7 +183,9 @@ eject and the guest kernel's hotplug path calls the driver's `.remove()` itself
 - `while confirming eject` — the VMM never dropped its `/dev/vfio` group fd
   within 30s. The eject was requested and the guest did not complete it. The
   likeliest cause is a live CUDA context in the workload pinning the device,
-  which is why suspend expects an idle GPU.
+  which is why suspend expects an idle GPU. The fixture's `nvidia-smi` holds the
+  device for well under a second between five-second sleeps, so a suspend that
+  lands on one still completes inside the timeout.
 - `refusing to snapshot: N passthrough device(s) still attached` — the detach
   reported success without finishing. This is the assertion that stops a torn
   snapshot; it should be unreachable.
@@ -208,29 +216,29 @@ it.
 
 ## 8. The GPU works again — decides claim B
 
+The same log stream answers this: after resume, the loop's lines come back.
+
 ```bash
-kubectl-ate exec -n ate-demo-gpu-microvm gpu-1 -- nvidia-smi
+kubectl-ate logs actors -n ate-demo-gpu-microvm gpu-1 | tail -20
 ```
 
-**Claim B fails here** if `nvidia-smi` reports no devices *while* step 7 logged
-a successful bind. That combination is the specific signal: the driver owns the
-device, but the container's pre-existing `/dev/nvidia*` nodes no longer resolve
-to it.
+**Claim B fails here** if the loop prints `nvidia-smi FAILED` *while* step 7
+logged a successful bind. That combination is the specific signal: the driver
+owns the device, but the container's pre-existing `/dev/nvidia*` nodes no longer
+resolve to it.
 
 The fallback is design §4.3 / C5: after re-attach, create the nodes into
 `/proc/<pid>/root/dev/` from the guest and widen the cgroup via
-`UpdateContainer`, driven by the guest CDI spec. Capture the evidence from
-inside the actor, which is the only place that can be asked:
+`UpdateContainer`, driven by the guest CDI spec.
 
-```bash
-kubectl-ate exec -n ate-demo-gpu-microvm gpu-1 -- ls -l /dev/nvidia*
-kubectl-ate exec -n ate-demo-gpu-microvm gpu-1 -- cat /proc/devices   # nvidia majors
-```
+Compare the `major:minor` pairs the loop prints against the ones from before the
+cycle. If they changed, that is the mechanism: the design argues `nvidia-uvm`'s
+dynamic major is stable *because the modules stay resident*, and a changed major
+would falsify that.
 
-Compare the majors against the same commands run at step 5, before the cycle. If
-they changed, that is the mechanism: the design argues `nvidia-uvm`'s dynamic
-major is stable *because the modules stay resident*, and a changed major would
-falsify that.
+No output at all after resume means the forwarding did not re-attach rather than
+the GPU failing — `restore.go` reopens `ReadStdout`/`ReadStderr` per container,
+so check the worker log for that before suspecting the device.
 
 ## 9. Repeat the cycle
 

@@ -78,7 +78,25 @@ spec:
     # tag that moves under a snapshot would restore a guest whose rootfs no
     # longer matches its image.
     image: nvcr.io/nvidia/cuda:12.6.2-base-ubuntu24.04@sha256:631ec7090c36ab846cf021073ff4a64fb9cffa90b4f9f0083799288c607073ce
-    command: ["/bin/sh", "-c", "sleep infinity"]
+    # The workload polls the GPU and prints what it finds, because that is the
+    # only way to observe it: there is no exec into an actor, and the guest has
+    # no shell. ateom forwards container stdout into the worker pod's log, and
+    # re-attaches that forwarding after a restore, so one `kubectl logs` covers
+    # the whole cycle -- the gap while suspended and the lines that follow it.
+    #
+    # stat prints each node's major:minor. Those are the numbers a broken
+    # re-attach would change while nvidia-smi still worked, so they are logged
+    # alongside rather than checked separately.
+    command:
+    - /bin/sh
+    - -c
+    - |
+      while :; do
+        date -Is
+        stat -c '%n %t:%T' /dev/nvidia* 2>&1
+        nvidia-smi --query-gpu=name,driver_version --format=csv,noheader || echo 'nvidia-smi FAILED'
+        sleep 5
+      done
     # No readyz: this image serves no HTTP. Readiness here would only prove the
     # container started, which is exactly the false signal the fixture avoids --
     # the GPU checks in the runbook are the real assertion.
