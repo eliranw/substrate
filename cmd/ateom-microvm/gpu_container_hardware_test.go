@@ -113,14 +113,25 @@ func containerSpec(t *testing.T, args []string) *specs.Spec {
 			Args: args,
 			Cwd:  "/",
 			Env:  []string{"PATH=/bin:/usr/bin"},
+			User: specs.User{UID: 0, GID: 0},
 			Capabilities: &specs.LinuxCapabilities{
 				Bounding: caps, Effective: caps, Permitted: caps,
 			},
 		},
-		Mounts: defaultKataMounts(),
+		Hostname: "gpuprobe",
+		Mounts:   defaultKataMounts(),
 		Linux: &specs.Linux{
 			Resources:   defaultKataResources(),
 			CgroupsPath: "/ateomchv/gpuprobe",
+			// The agent rejects a spec with no pid namespace ("cannot find the pid
+			// ns"). specconv drops network/cgroup/time and forwards the rest with an
+			// empty Path, so these are the four the guest actually sets up.
+			Namespaces: []specs.LinuxNamespace{
+				{Type: specs.PIDNamespace},
+				{Type: specs.IPCNamespace},
+				{Type: specs.UTSNamespace},
+				{Type: specs.MountNamespace},
+			},
 		},
 	}
 	// The point of the test: this is what asks the guest agent to inject the GPU.
