@@ -49,21 +49,96 @@ kubectl describe node <gpu-node> | grep -i nvidia.com
 Note the exact resource name; `nvidia.com/gpu` is the *time-slicing* name and
 will not be present. Put whatever you see into the WorkerPool.
 
+### The podCertificate feature gate
+
+Substrate's components authenticate to each other with certificates delivered by
+a `podCertificate` projected volume. That API is alpha, and **a disabled alpha
+field is pruned at admission rather than rejected** — the projection vanishes
+from the pod spec, no signing request is ever filed, and every component that
+reads a credential bundle exits on a file that was never written. Enabling it on
+the kubelet alone does nothing; the API server does the pruning.
+
 ```bash
-# The worker's identity certificate arrives through a podCertificate projection.
-kubectl get pod -n ate-system -l app=atelet -o json | grep -c podCertificate  # > 0
+# Must list PodCertificateRequest=true.
+kubectl -n kube-system get pod -l component=kube-apiserver \
+  -o jsonpath='{.items[0].spec.containers[0].command}' | tr ',' '\n' | grep feature-gates
 ```
 
-`PodCertificateRequest` is alpha, and a disabled alpha field is *pruned* at
-admission rather than rejected: the projection disappears from the pod spec, no
-signing request is ever filed, and ateom exits reading a credential bundle that
-was never written. Enabling it on the kubelet alone is not enough. On kubeadm,
-add `PodCertificateRequest=true` to `--feature-gates` in
-`/etc/kubernetes/manifests/kube-apiserver.yaml`; `hack/create-kind-cluster.sh`
-does the equivalent for kind. Workloads applied while it was off keep their
-pruned spec and must be re-applied.
+On kubeadm, add it to `--feature-gates` in
+`/etc/kubernetes/manifests/kube-apiserver.yaml` (back the file up first — a bad
+flag leaves you with no API server) and the static pod restarts itself.
+`hack/create-kind-cluster.sh:80` does the equivalent for kind. This is a
+cluster-level setting and survives reinstalling substrate.
+
+The decisive check is whether the field survives a round trip, not whether the
+flag is spelled right:
+
+```bash
+kubectl apply --dry-run=server -o json -f - <<'EOF' | grep -c podCertificate  # want > 0
+apiVersion: v1
+kind: Pod
+metadata: {name: pcr-probe, namespace: default}
+spec:
+  containers: [{name: c, image: registry.k8s.io/pause:3.10,
+                volumeMounts: [{name: id, mountPath: /run/id}]}]
+  volumes:
+  - name: id
+    projected:
+      sources:
+      - podCertificate:
+          signerName: podidentity.podcert.ate.dev/identity
+          keyType: ECDSAP256
+          credentialBundlePath: credential-bundle.pem
+EOF
+```
+
+### Installing substrate
+
+Install rather than upgrade. A cluster installed from an older checkout fails in
+a way that is expensive to debug: each component starts, gets further than the
+last, and stops on a different missing input — a ClusterRole verb, a CRD, a
+serialized proto, a CA root. controller-runtime turns two of those into an
+indefinite cache-sync wait with no error line, which reads exactly like "the
+code doesn't do that yet." See the appendix for the specific ones.
+
+```bash
+export KUBECONFIG=/etc/kubernetes/admin.conf     # kubeadm control plane
+cd <repo>
+
+ATE_INSTALL_KIND=true KO_DOCKER_REPO=localhost:5001 \
+  ./hack/install-ate.sh --delete-ate-system
+
+ATE_INSTALL_KIND=true KO_DOCKER_REPO=localhost:5001 \
+  ./hack/install-ate.sh --deploy-ate-system
+```
+
+`ATE_INSTALL_KIND=true` is load-bearing on any off-GCP cluster, not just kind:
+it selects `manifests/ate-install/kind`, which is where rustfs and atelet's
+`ATE_STORAGE_BACKEND=s3` / `AWS_ENDPOINT_URL` env live. Without it the base
+manifests install an atelet that cannot fetch any asset.
+
+`KO_DOCKER_REPO=localhost:5001` means `ko` must run **on the node** — the
+registry is host-local and not reachable from a laptop.
+
+Note what the delete takes with it: `rustfs.yaml` in that overlay owns the
+`rustfs-data` PVC, so **every staged asset is destroyed** and step 2 is not
+optional. Nothing else in this runbook survives either — SandboxConfigs are
+cluster-scoped CRs and the CRDs are deleted.
 
 ## 1. Build and stage the guest assets
+
+Two sets: the stock micro-VM assets that every actor needs, and the GPU guest.
+
+```bash
+# Stock. ARCH defaults to arm64 -- on an x86 host that silently produces
+# binaries the node cannot execute.
+ARCH=amd64 hack/microvm-assets/assemble.sh
+OUT=bin/microvm-assets/amd64 hack/microvm-assets/stage-to-rustfs.sh
+
+export BUCKET_NAME=ate-snapshots
+export VIRTIOFSD_SHA256=$(sha256sum bin/microvm-assets/amd64/virtiofsd | cut -d' ' -f1)
+envsubst < manifests/microvm/sandboxconfig-microvm.yaml.tmpl | kubectl apply -f -
+```
 
 ```bash
 hack/microvm-assets/assemble-gpu.sh          # ~2GB download
@@ -254,3 +329,39 @@ diff that gets merged).
 kubectl-ate delete actor -n ate-demo-gpu-microvm gpu-1
 kubectl delete ns ate-demo-gpu-microvm
 ```
+
+## Appendix: what a partially-upgraded cluster looks like
+
+Deploying new binaries onto a cluster installed from an older checkout produced
+six failures in a row, each only visible once the previous was fixed. They are
+recorded because none of them names its own cause, and four of the six read as a
+bug in the component being deployed.
+
+| Symptom | Actual cause |
+|---|---|
+| ateom exits: `reading credential bundle: no such file or directory` | API server missing `PodCertificateRequest=true`; the projection was pruned |
+| Controller Running, but the WorkerPool Deployment never changes | Its NetworkPolicy informer is `403 forbidden`, so the manager never finishes cache sync. No error, no crash — it just never reconciles. The old pod stays Running and serving |
+| api-server CrashLoop, `/readyz` refused | Same shape: an informer for `csidriverconfigs.ate.dev`, a CRD the cluster never had. `ensure_crds` short-circuits on the three CRDs that do exist |
+| Client: `cannot parse invalid wire-format data` | #737 wrapped the flat `ateom_pod_*` fields into a `WorkerAssignment` message; field 5 arrives as a string where a message is expected |
+| api-server: `unknown field "ateomPodNamespace"` | Actor records in Valkey serialized before #737. `kubectl-ate admin debug-flush-redis`, then restart the workers so no VM is orphaned holding a GPU |
+| atelet: `credential bundle has no Pod identity` | Its cert predates the signer emitting the `oidPodIdentity` extension. Delete the pod to force a fresh `PodCertificateRequest` |
+
+Two immutable-field errors also block re-apply, and both want delete-then-create:
+`svc/api` (gains `clusterIP: None`) and `job/valkey-cluster-init` (its pod
+template gains the podCertificate projection that used to be pruned).
+
+The one that is a genuine bug rather than skew: `valkey-ca-certs` must contain
+**two** roots — servicedns to verify peers' server certs, podidentity to verify
+clients — and an older `install-ate.sh` built it with a single `printf` whose
+substitutions `errexit` could not see fail, silently dropping one.
+
+```bash
+kubectl -n ate-system exec valkey-cluster-0 -- grep -c BEGIN /etc/valkey-ca/ca.crt   # must be 2
+```
+
+It hides for as long as nothing uses the missing root: the api-server connects
+with its *servicedns* cert, and only `valkey-cluster-init` authenticates with
+*podidentity*. So the cluster runs fine until the pods roll and it has to
+re-form. Regenerate with `--create-valkey-ca-certs-secret`; if the nodes have
+already been initialized, `FLUSHALL` + `CLUSTER RESET HARD` each of the six
+before re-running the init Job, or it stops with `Node ... is not empty`.
