@@ -365,10 +365,23 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
 	}
+	// pci=realloc tells Linux to REASSIGN PCI BARs. It comes from NVIDIA's config
+	// verbatim, where it exists for bare-metal firmware that under-allocates large
+	// BARs. In a VM the VMM assigns the BARs, so reallocation just fights it: on
+	// hot-plug the guest moves BAR0 to 0x80000000, clh cannot allocate there and
+	// keeps 0xd2000000, and the kernel then drives MMIO at an address the device
+	// does not occupy. 0x80000000 is exactly the top of this guest's 2048MiB of
+	// RAM, which is why nothing is free there.
+	kparams := kata.WithDebugConsole(cfg.KernelParams)
+	if os.Getenv("ATE_STRIP_PCI_REALLOC") != "" {
+		kparams = strings.ReplaceAll(kparams, "pci=realloc", "")
+		t.Log("stripped pci=realloc from the guest cmdline")
+	}
 	vmCfg := buildVMConfig(id,
 		filepath.Join(env.assets, "vmlinux-gpu"), filepath.Join(env.assets, "rootfs-gpu.img"),
-		kata.WithDebugConsole(cfg.KernelParams), cfg.RootfsType, serialLog,
+		kparams, cfg.RootfsType, serialLog,
 		cfg.MemoryMiB, cfg.VCPUs, false, devices)
+	t.Logf("cmdline: %s", vmCfg.Payload.Cmdline)
 	if err := client.CreateVM(ctx, vmCfg); err != nil {
 		t.Fatalf("CreateVM: %v", err)
 	}
