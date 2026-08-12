@@ -153,11 +153,13 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 		// persistence was the holder and production must clear it before detaching.
 		return rootfs, []string{"/bin/sh", "-c",
 			"echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
+				"echo '--- BARs ---'; cat /sys/bus/pci/devices/*/resource 2>/dev/null | head -6; " +
 				"nvidia-smi -L 2>&1 | head -3; " +
 				"echo '--- persistence off ---'; nvidia-smi -pm 0 2>&1 | head -3; " +
 				"echo '--- PROBE DONE ---'; " +
 				"sleep " + quiet + "; " +
 				"while true; do echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
+				"echo '--- BARs ---'; cat /sys/bus/pci/devices/*/resource 2>/dev/null | head -6; " +
 				"nvidia-smi -L 2>&1 | head -3; echo '--- PROBE DONE ---'; sleep 3; done"}
 	}
 
@@ -508,11 +510,17 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 		t.Log("PASS claim B: the container still uses the GPU after detach and re-attach")
 		return
 	}
-	t.Errorf("CLAIM B FAILS: the container survived but can no longer use the GPU. " +
-		"design 4.3's inference is wrong and C5 (re-inject after re-attach) is required. " +
-		"Compare the nvidia majors above against the pre-cycle listing: a changed " +
-		"nvidia-uvm major would explain it, since the design argues it is stable only " +
-		"because the modules stay resident.")
+	// Deliberately does NOT name a cause. The device nodes surviving is 4.3's
+	// claim and is separately visible above; if they are present, the fault is
+	// below them and C5 (re-injecting nodes) would change nothing. Compare the
+	// BAR listings either side of the cycle, and check the clh log for
+	// "Failed moving device BAR" -- a guest that reprogrammed the BAR to an
+	// address the VMM could not allocate can see the device and not address it,
+	// which reads as a device-handle error rather than a missing GPU.
+	t.Errorf("CLAIM B FAILS: the container survived the cycle but can no longer use the GPU.\n"+
+		"  device nodes present: %v\n"+
+		"  compare the --- BARs --- blocks above, and the [clh2] lines for BAR reallocation",
+		strings.Contains(after, "nvidia0"))
 }
 
 // readProbeOutput drains the container's stdout until the probe's end marker,
