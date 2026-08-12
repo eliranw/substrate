@@ -365,17 +365,27 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
 	}
-	// pci=realloc tells Linux to REASSIGN PCI BARs. It comes from NVIDIA's config
-	// verbatim, where it exists for bare-metal firmware that under-allocates large
-	// BARs. In a VM the VMM assigns the BARs, so reallocation just fights it: on
-	// hot-plug the guest moves BAR0 to 0x80000000, clh cannot allocate there and
-	// keeps 0xd2000000, and the kernel then drives MMIO at an address the device
-	// does not occupy. 0x80000000 is exactly the top of this guest's 2048MiB of
-	// RAM, which is why nothing is free there.
+	// NVIDIA's config carries pci=realloc, pci=nocrs and pci=assign-busses, all
+	// aimed at bare-metal firmware. ATE_STRIP_KPARAMS removes any of them so their
+	// effects can be separated.
+	//
+	// pci=nocrs is the suspect. It tells Linux to IGNORE the ACPI _CRS host-bridge
+	// windows -- the ranges the VMM declares it will actually serve -- and assume
+	// MMIO begins just above top-of-RAM. This guest has 2048MiB, so that is
+	// 0x80000000, exactly the address the kernel keeps demanding and clh keeps
+	// refusing. Cold boot is unaffected because clh lays the BARs out itself and
+	// the guest only reads them; hot-plug makes the guest ASSIGN one, and nocrs
+	// has blinded it to where clh's aperture is.
+	//
+	// pci=realloc was the first guess and is not the trigger: stripping it alone
+	// reproduced the identical failure at the identical address.
 	kparams := kata.WithDebugConsole(cfg.KernelParams)
-	if os.Getenv("ATE_STRIP_PCI_REALLOC") != "" {
-		kparams = strings.ReplaceAll(kparams, "pci=realloc", "")
-		t.Log("stripped pci=realloc from the guest cmdline")
+	for _, p := range strings.Split(os.Getenv("ATE_STRIP_KPARAMS"), ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		kparams = strings.ReplaceAll(kparams, p, "")
+		t.Logf("stripped %q from the guest cmdline", p)
 	}
 	vmCfg := buildVMConfig(id,
 		filepath.Join(env.assets, "vmlinux-gpu"), filepath.Join(env.assets, "rootfs-gpu.img"),
