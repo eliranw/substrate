@@ -98,12 +98,24 @@ func stageBusyboxRootfs(t *testing.T, env hwEnv, sharedDir, cid string) string {
 // production applies, plus the CDI annotation under test.
 func containerSpec(t *testing.T, args []string) *specs.Spec {
 	t.Helper()
+	// kata-agent rejects a spec with no process capabilities ("missing process
+	// capabilities"), which production never hits because atelet's spec carries
+	// them. This is the OCI default set.
+	caps := []string{
+		"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER",
+		"CAP_MKNOD", "CAP_NET_RAW", "CAP_SETGID", "CAP_SETUID",
+		"CAP_SETFCAP", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE",
+		"CAP_SYS_CHROOT", "CAP_KILL", "CAP_AUDIT_WRITE",
+	}
 	spec := &specs.Spec{
 		Version: specs.Version,
 		Process: &specs.Process{
 			Args: args,
 			Cwd:  "/",
 			Env:  []string{"PATH=/bin:/usr/bin"},
+			Capabilities: &specs.LinuxCapabilities{
+				Bounding: caps, Effective: caps, Permitted: caps,
+			},
 		},
 		Mounts: defaultKataMounts(),
 		Linux: &specs.Linux{
@@ -219,9 +231,15 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 
 	if err := agent.CreateCarrier(ctx, cid, containerSpec(t, probe)); err != nil {
 		b, _ := os.ReadFile(serialLog)
-		t.Fatalf("CreateContainer with the CDI annotation failed: %v\n"+
-			"  this is gpucdi.go's contract: the agent could not resolve nvidia.com/gpu=all "+
-			"against the guest's /var/run/cdi spec\n=== serial ===\n%s", err, tailBytes(b, 4000))
+		hint := "  check the serial log below for what the agent objected to"
+		// Only claim CDI when the agent actually says so; the annotation is one of
+		// several things CreateContainer can reject, and blaming it for a plain
+		// spec-shaping error sends the reader to the wrong file.
+		if strings.Contains(err.Error(), "cdi") || strings.Contains(err.Error(), "CDI") {
+			hint = "  this is gpucdi.go's contract: the agent could not resolve " +
+				"nvidia.com/gpu=all against the guest's /var/run/cdi spec"
+		}
+		t.Fatalf("CreateContainer failed: %v\n%s\n=== serial ===\n%s", err, hint, tailBytes(b, 4000))
 	}
 	if err := agent.StartContainer(ctx, cid); err != nil {
 		t.Fatalf("StartContainer: %v", err)
