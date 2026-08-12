@@ -86,7 +86,7 @@ func stageBusyboxRootfs(t *testing.T, env hwEnv, sharedDir, cid string) string {
 		t.Fatalf("writing busybox: %v", err)
 	}
 	// The agent execs the process directly, so give it the usual names too.
-	for _, name := range []string{"sh", "ls", "cat", "sleep"} {
+	for _, name := range []string{"sh", "ls", "cat", "sleep", "grep", "echo"} {
 		if err := os.Symlink("busybox", filepath.Join(rootfs, "bin", name)); err != nil && !os.IsExist(err) {
 			t.Fatalf("linking %s: %v", name, err)
 		}
@@ -234,10 +234,12 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 
 	// Print what the container can see of the GPU, then idle so the process is
 	// still alive if this is extended across a suspend/resume cycle.
+	// No pipes and no applets beyond the symlinks staged above: busybox resolves
+	// each name through PATH, and one missing applet in a pipeline silently costs
+	// the whole line. Listing all of /dev also shows what CDI did NOT inject.
 	probe := []string{"/bin/busybox", "sh", "-c",
-		"echo '--- /dev/nvidia* ---'; ls -l /dev/nvidia* 2>&1; " +
-			"echo '--- nvidia majors ---'; cat /proc/devices 2>&1 | grep -i nvidia; " +
-			"echo '--- libs ---'; ls /usr/lib/x86_64-linux-gnu/libcuda* /usr/lib64/libcuda* 2>&1 | head -5; " +
+		"echo '--- dev ---'; ls -l /dev; " +
+			"echo '--- proc devices ---'; cat /proc/devices; " +
 			"echo '--- PROBE DONE ---'; sleep 600"}
 
 	if err := agent.CreateCarrier(ctx, cid, containerSpec(t, probe)); err != nil {
@@ -257,35 +259,57 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	}
 	t.Log("PASS create: the agent accepted the CDI annotation and created the container")
 
-	out := readProbeOutput(ctx, t, agent, cid, 60*time.Second)
-	t.Logf("=== container view of the GPU ===\n%s", out)
+	out, stderr := readProbeOutput(ctx, t, agent, cid, 60*time.Second)
+	t.Logf("=== container stdout (%d bytes) ===\n%s", len(out), out)
+	if stderr != "" {
+		t.Logf("=== container stderr ===\n%s", stderr)
+	}
 
-	if !strings.Contains(out, "/dev/nvidia") || strings.Contains(out, "No such file") {
-		t.Errorf("CDI injected no device nodes into the container -- gpucdi.go's annotation " +
-			"was accepted but had no effect")
+	// No output at all is a DIFFERENT failure from output without device nodes,
+	// and must not be reported as the latter: it means the probe never ran or its
+	// streams were never readable, which says nothing about what CDI injected.
+	if strings.TrimSpace(out) == "" {
+		b, _ := os.ReadFile(serialLog)
+		t.Fatalf("the probe container produced no output, so what CDI injected is unknown.\n"+
+			"  the container was created and started, so look for an exec failure below\n"+
+			"=== serial ===\n%s", tailBytes(b, 6000))
+	}
+	if strings.Contains(out, "nvidia") {
+		t.Log("PASS inject: the container can see nvidia device nodes")
 	} else {
-		t.Log("PASS inject: the container has /dev/nvidia* device nodes")
+		t.Errorf("the container ran but /dev has no nvidia nodes -- the annotation was " +
+			"accepted and had no effect")
 	}
 }
 
-// readProbeOutput drains the container's stdout until the probe's end marker.
-func readProbeOutput(ctx context.Context, t *testing.T, agent *kata.AgentClient, cid string, deadline time.Duration) string {
+// readProbeOutput drains the container's stdout until the probe's end marker,
+// and collects stderr alongside it.
+//
+// Both streams are reported: a container that fails to exec says so on stderr,
+// and reading only stdout turns that into an indistinguishable silence.
+func readProbeOutput(ctx context.Context, t *testing.T, agent *kata.AgentClient, cid string, deadline time.Duration) (string, string) {
 	t.Helper()
-	var b strings.Builder
+	var out, errOut strings.Builder
 	end := time.Now().Add(deadline)
+	reads := 0
 	for time.Now().Before(end) {
+		reads++
 		chunk, err := agent.ReadStdout(ctx, cid, cid, 8192)
 		if err != nil {
-			t.Logf("ReadStdout stopped: %v", err)
+			t.Logf("ReadStdout stopped after %d reads: %v", reads, err)
 			break
 		}
-		b.Write(chunk)
-		if strings.Contains(b.String(), "PROBE DONE") {
+		out.Write(chunk)
+		if e, err := agent.ReadStderr(ctx, cid, cid, 8192); err == nil {
+			errOut.Write(e)
+		}
+		if strings.Contains(out.String(), "PROBE DONE") {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return b.String()
+	t.Logf("drained the container streams in %d reads", reads)
+	return out.String(), errOut.String()
 }
 
 func tailBytes(b []byte, n int) string {
