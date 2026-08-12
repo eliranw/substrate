@@ -574,15 +574,8 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 			t.Fatalf("re-dialing the agent: %v", err)
 		}
 		t.Cleanup(func() { _ = agent2.Close() })
-		all := probeLog(t, sharedDir, cid, "", 60*time.Second)
-		after := all
-		if len(all) > beforeLen {
-			after = all[beforeLen:]
-		}
-		if strings.TrimSpace(after) == "" {
-			after, _ = readProbeOutput(ctx, t, agent2, cid, 60*time.Second)
-		}
-		t.Logf("=== container view after eject+re-attach, NO restore (%d bytes) ===\n%s", len(after), after)
+		after := probeLogAfter(t, sharedDir, cid, beforeLen, 60*time.Second)
+		t.Logf("=== container view after eject+re-attach, NO restore (%d NEW bytes) ===\n%s", len(after), after)
 		if strings.Contains(after, "Tesla") || strings.Contains(after, "UUID") {
 			t.Log("PASS: the GPU survives a plain eject and re-attach")
 			t.Log("  NOTE: this says nothing about the restore -- run without " +
@@ -669,15 +662,8 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = agent2.Close() })
 
-	all := probeLog(t, sharedDir, cid, "", 90*time.Second)
-	after := all
-	if len(all) > beforeLen {
-		after = all[beforeLen:]
-	}
-	if strings.TrimSpace(after) == "" {
-		after, _ = readProbeOutput(ctx, t, agent2, cid, 60*time.Second)
-	}
-	t.Logf("=== container view AFTER the cycle (%d bytes) ===\n%s", len(after), after)
+	after := probeLogAfter(t, sharedDir, cid, beforeLen, 90*time.Second)
+	t.Logf("=== container view AFTER the cycle (%d NEW bytes) ===\n%s", len(after), after)
 	if strings.Contains(after, "Tesla") || strings.Contains(after, "UUID") {
 		t.Log("PASS claim B: the container still uses the GPU after detach and re-attach")
 		return
@@ -787,6 +773,34 @@ func probeLog(t *testing.T, sharedDir, cid, want string, deadline time.Duration)
 				t.Logf("probe log has %d bytes but never contained %q", len(last), want)
 			}
 			return string(last)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// probeLogAfter returns only what the probe wrote past mark, or "" if it wrote
+// nothing new before the deadline.
+//
+// Returning "" rather than the whole file is the point. The probe reports once
+// at startup and then sleeps through its quiet window, so a read taken during
+// that window returns the PRE-cycle block -- which names the GPU, lists healthy
+// BARs, and is indistinguishable from a good post-cycle result. Stale evidence
+// that reads as success is worse than no evidence, because nothing downstream
+// can tell the difference.
+func probeLogAfter(t *testing.T, sharedDir, cid string, mark int, deadline time.Duration) string {
+	t.Helper()
+	path := filepath.Join(sharedDir, cid, "rootfs", "probe.log")
+	end := time.Now().Add(deadline)
+	for {
+		b, err := os.ReadFile(path)
+		if err == nil && len(b) > mark {
+			return string(b[mark:])
+		}
+		if time.Now().After(end) {
+			t.Logf("the probe wrote nothing new in %s -- it is probably still in its "+
+				"quiet window (ATE_PROBE_QUIET_SECS, default 90s). Deciding by exec instead.",
+				deadline)
+			return ""
 		}
 		time.Sleep(time.Second)
 	}
