@@ -10,7 +10,28 @@ containerd 2.3.1, Kubernetes v1.36.2 (kubeadm), single node, 6× Tesla T4.
 Substitute versions freely; the parts that are *not* free choices are called
 out.
 
-## 1. Host: IOMMU
+## 1. Host: kernel and IOMMU
+
+**Linux 6.5 or newer.** atelet hands ateom a layer list and ateom mounts the
+container rootfs as an overlay through the new mount API, appending one
+`lowerdir+` per layer to sidestep `mount(2)`'s single-page option cap
+(`internal/imagecache/bundle_linux.go`). Overlayfs only gained that option in
+6.5. On an older kernel `fsopen("overlay")` silently falls back to a legacy
+fs_context, every `fsconfig` call succeeds, and the mount fails at the end with
+a bare `invalid argument` — three layers away from anything that names a kernel.
+
+Ubuntu 22.04 ships 5.15 and needs the HWE stack:
+
+```bash
+uname -r                                     # must be >= 6.5
+sudo apt install -y linux-generic-hwe-22.04  # 22.04 HWE is 6.8
+sudo reboot
+```
+
+`vfio-pci` is in-tree, so passthrough survives the kernel change and the GPU
+Operator's vfio-manager re-binds on start.
+
+### IOMMU
 
 VFIO cannot isolate a device without it, so passthrough fails at the first step
 with no useful error.
