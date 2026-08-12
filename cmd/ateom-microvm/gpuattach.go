@@ -43,6 +43,7 @@ const (
 var (
 	waitDeviceGone     = (*ch.Client).WaitDeviceRemoved
 	releasePersistence = clearGPUPersistence
+	reprobeDriver      = reprobeGuestDriver
 )
 
 // clearGPUPersistence asks the guest to stop holding the GPU, so the eject can
@@ -90,6 +91,60 @@ func clearGPUPersistence(ctx context.Context, actorUID string, containerIDs []st
 		}
 		if code != 0 {
 			lastErr = fmt.Errorf("nvidia-smi -pm 0 in %s exited %d", cid, code)
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+// reprobeGuestDriver makes the guest bind its driver to the re-attached
+// device(s), which its own hot-plug probe has already failed to do.
+//
+// The guest probes the moment the hot-added device's BARs are assigned --
+// measured at 14ms after assignment on a T4 -- and reads the device before the
+// VMM has moved its MMIO mapping to the new addresses. The NVIDIA open module
+// reports that as the GPU lacking a GSP, which reads like an unsupported card
+// rather than an early read. Nothing is wrong with the device: seconds later
+// config space and the kernel's resource record agree at the relocated
+// addresses, the device answers reads, and an explicit unbind/bind brings the
+// same GPU back with the same UUID.
+//
+// Best-effort, like clearGPUPersistence: it needs a shell in the container, and
+// an actor whose image has none keeps a GPU its driver never bound. The caller
+// logs rather than failing the resume, because everything else about the actor
+// is healthy.
+func reprobeGuestDriver(ctx context.Context, actorUID string, containerIDs []string) error {
+	if len(containerIDs) == 0 {
+		return fmt.Errorf("no containers to re-probe the driver from")
+	}
+	agent, err := dialAgentRetry(ctx, kata.VsockSocketPath(actorUID), 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("dialing the agent: %w", err)
+	}
+	defer agent.Close()
+
+	// The guest BDF is not the host's, so the container finds it the only way it
+	// can: by vendor id in sysfs. unbind is best-effort -- after a failed probe
+	// there is no driver link to remove -- and bind is what re-runs the probe.
+	const script = `for d in /sys/bus/pci/devices/*/; do
+[ "$(cat "$d/vendor" 2>/dev/null)" = 0x10de ] || continue
+b=$(basename "$d")
+echo "$b" > /sys/bus/pci/drivers/nvidia/unbind 2>/dev/null
+echo "$b" > /sys/bus/pci/drivers/nvidia/bind 2>/dev/null
+done
+nvidia-smi -L`
+
+	var lastErr error
+	for _, cid := range containerIDs {
+		// A distinct exec id: the container's own id belongs to its init process.
+		code, err := agent.ExecProcess(ctx, cid, cid+"_rebind", []string{"/bin/sh", "-c", script})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if code != 0 {
+			lastErr = fmt.Errorf("driver re-probe in %s exited %d", cid, code)
 			continue
 		}
 		return nil
@@ -197,7 +252,7 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 // from the host. Whether the guest driver rebound, and whether the container's
 // /dev/nvidia* work again, is only observable from inside the container -- the
 // guest itself cannot be asked, having no shell.
-func (s *AteomService) attachPassthrough(ctx context.Context, client *ch.Client, actorUID string) error {
+func (s *AteomService) attachPassthrough(ctx context.Context, client *ch.Client, actorUID string, containerIDs []string) error {
 	devices, err := resolveWorkerDevices()
 	if err != nil {
 		return fmt.Errorf("while resolving worker passthrough devices: %w", err)
@@ -214,6 +269,13 @@ func (s *AteomService) attachPassthrough(ctx context.Context, client *ch.Client,
 	}
 	if err := waitDevicesAttached(ctx, client, len(devices), attachSettleTimeout); err != nil {
 		return err
+	}
+
+	// The VMM holding the device is not the same as the actor being able to use
+	// it: the guest's own probe has already run and failed by this point.
+	if err := reprobeDriver(ctx, actorUID, containerIDs); err != nil {
+		slog.WarnContext(ctx, "Could not re-probe the guest GPU driver after re-attach; the actor may not see its device",
+			slog.String("id", actorUID), slog.Any("err", err))
 	}
 
 	slog.InfoContext(ctx, "Re-attached passthrough devices after restore",

@@ -340,7 +340,15 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// Give the actor its passthrough device(s) back before waiting on readyz: a
 	// container that needs the GPU cannot report ready without it, so attaching
 	// after the wait would deadlock against our own timeout.
-	if err := s.attachPassthrough(ctx, client, actorUID); err != nil {
+	//
+	// The workload containers come along for the same reason the detach takes
+	// them: re-probing the guest's driver runs from inside one, the guest having
+	// no shell of its own.
+	var workloadIDs []string
+	for _, c := range containers {
+		workloadIDs = append(workloadIDs, overlayWorkloadID(c.GetName()))
+	}
+	if err := s.attachPassthrough(ctx, client, actorUID, workloadIDs); err != nil {
 		return err
 	}
 
