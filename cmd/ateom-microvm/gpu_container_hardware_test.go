@@ -574,7 +574,7 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 			t.Fatalf("re-dialing the agent: %v", err)
 		}
 		t.Cleanup(func() { _ = agent2.Close() })
-		after := probeLogAfter(t, sharedDir, cid, beforeLen, 60*time.Second)
+		after := probeLogAfter(t, sharedDir, cid, "--- PROBE DONE ---", beforeLen, 90*time.Second)
 		t.Logf("=== container view after eject+re-attach, NO restore (%d NEW bytes) ===\n%s", len(after), after)
 		if strings.Contains(after, "Tesla") || strings.Contains(after, "UUID") {
 			t.Log("PASS: the GPU survives a plain eject and re-attach")
@@ -662,7 +662,7 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = agent2.Close() })
 
-	after := probeLogAfter(t, sharedDir, cid, beforeLen, 90*time.Second)
+	after := probeLogAfter(t, sharedDir, cid, "--- PROBE DONE ---", beforeLen, 120*time.Second)
 	t.Logf("=== container view AFTER the cycle (%d NEW bytes) ===\n%s", len(after), after)
 	if strings.Contains(after, "Tesla") || strings.Contains(after, "UUID") {
 		t.Log("PASS claim B: the container still uses the GPU after detach and re-attach")
@@ -787,20 +787,35 @@ func probeLog(t *testing.T, sharedDir, cid, want string, deadline time.Duration)
 // BARs, and is indistinguishable from a good post-cycle result. Stale evidence
 // that reads as success is worse than no evidence, because nothing downstream
 // can tell the difference.
-func probeLogAfter(t *testing.T, sharedDir, cid string, mark int, deadline time.Duration) string {
+func probeLogAfter(t *testing.T, sharedDir, cid, want string, mark int, deadline time.Duration) string {
 	t.Helper()
 	path := filepath.Join(sharedDir, cid, "rootfs", "probe.log")
 	end := time.Now().Add(deadline)
+	var tail string
 	for {
 		b, err := os.ReadFile(path)
 		if err == nil && len(b) > mark {
-			return string(b[mark:])
+			tail = string(b[mark:])
+			// Wait for a COMPLETE iteration, not merely for new bytes. When the
+			// GPU looks dead the probe unbinds the driver and rebinds it, which
+			// takes five seconds; returning at the first new byte samples the
+			// middle of that, where the driver is deliberately detached. Anything
+			// asking the device during that window sees a broken GPU that our own
+			// recovery attempt broke.
+			if want == "" || strings.Contains(tail, want) {
+				return tail
+			}
 		}
 		if time.Now().After(end) {
-			t.Logf("the probe wrote nothing new in %s -- it is probably still in its "+
-				"quiet window (ATE_PROBE_QUIET_SECS, default 90s). Deciding by exec instead.",
-				deadline)
-			return ""
+			if tail == "" {
+				t.Logf("the probe wrote nothing new in %s -- it is probably still in its "+
+					"quiet window (ATE_PROBE_QUIET_SECS, default 90s). Deciding by exec instead.",
+					deadline)
+			} else {
+				t.Logf("the probe wrote %d bytes in %s but never completed an iteration "+
+					"(no %q); it may still be rebinding", len(tail), deadline, want)
+			}
+			return tail
 		}
 		time.Sleep(time.Second)
 	}
