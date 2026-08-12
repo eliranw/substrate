@@ -49,6 +49,20 @@ kubectl describe node <gpu-node> | grep -i nvidia.com
 Note the exact resource name; `nvidia.com/gpu` is the *time-slicing* name and
 will not be present. Put whatever you see into the WorkerPool.
 
+```bash
+# The worker's identity certificate arrives through a podCertificate projection.
+kubectl get pod -n ate-system -l app=atelet -o json | grep -c podCertificate  # > 0
+```
+
+`PodCertificateRequest` is alpha, and a disabled alpha field is *pruned* at
+admission rather than rejected: the projection disappears from the pod spec, no
+signing request is ever filed, and ateom exits reading a credential bundle that
+was never written. Enabling it on the kubelet alone is not enough. On kubeadm,
+add `PodCertificateRequest=true` to `--feature-gates` in
+`/etc/kubernetes/manifests/kube-apiserver.yaml`; `hack/create-kind-cluster.sh`
+does the equivalent for kind. Workloads applied while it was off keep their
+pruned spec and must be re-applied.
+
 ## 1. Build and stage the guest assets
 
 ```bash
@@ -66,10 +80,10 @@ cat bin/microvm-gpu-assets/configuration-clh-gpu.toml
 # it makes the guest ignore clh's real MMIO windows and break hot-plug
 ```
 
-Stage all three into `gs://${BUCKET_NAME}/kata-gpu-assets/`, then apply the
-sandbox config with the printed sums:
+Stage all three and apply the sandbox config with the printed sums:
 
 ```bash
+hack/microvm-assets/stage-gpu-assets.sh      # uploads, then prints the exports
 export GPU_KERNEL_SHA256=... GPU_ROOTFS_SHA256=... GPU_CONFIG_SHA256=...
 envsubst < manifests/microvm/sandboxconfig-microvm-gpu.yaml.tmpl | kubectl apply -f -
 ```
@@ -77,7 +91,6 @@ envsubst < manifests/microvm/sandboxconfig-microvm-gpu.yaml.tmpl | kubectl apply
 ## 2. Deploy ateom and the fixture
 
 ```bash
-export GPU_WORKLOAD_IMAGE=nvcr.io/nvidia/cuda:12.6.2-base-ubuntu24.04
 envsubst < demos/gpu/gpu-microvm.yaml.tmpl | ko apply -f -
 kubectl -n ate-demo-gpu-microvm get workerpool,pods -w
 ```

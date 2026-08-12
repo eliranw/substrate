@@ -73,7 +73,11 @@ spec:
     # the container can actually open the device. The guest supplies the kernel
     # driver; the kata-agent injects the device nodes and libraries from the CDI
     # spec NVRC generated at boot.
-    image: ${GPU_WORKLOAD_IMAGE}
+    #
+    # Pinned by digest because ActorTemplate rejects any image without one: a
+    # tag that moves under a snapshot would restore a guest whose rootfs no
+    # longer matches its image.
+    image: nvcr.io/nvidia/cuda:12.6.2-base-ubuntu24.04@sha256:631ec7090c36ab846cf021073ff4a64fb9cffa90b4f9f0083799288c607073ce
     command: ["/bin/sh", "-c", "sleep infinity"]
     # No readyz: this image serves no HTTP. Readiness here would only prove the
     # container started, which is exactly the false signal the fixture avoids --
