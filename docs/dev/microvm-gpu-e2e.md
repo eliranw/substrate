@@ -9,17 +9,27 @@ cloud-hypervisor v52.
 
 ## What this is actually testing
 
-Two claims in the design are **inferences that have never been observed**, and
-this runbook exists mainly to settle them. Both are called out at the step that
-decides them:
+Two claims in the design were **inferences that had never been observed**, and
+this runbook existed mainly to settle them. Both were settled on a T4 on
+2026-08-12, and both hold:
 
-| | Claim | Decided at |
-|---|---|---|
-| A | NVRC boots with a non-dm-verity root | step 4 |
-| B | A container's `/dev/nvidia*` still work after detach and re-attach | step 8 |
+| | Claim | Decided at | Result |
+|---|---|---|---|
+| A | NVRC boots with a non-dm-verity root | step 4 | holds |
+| B | A container's `/dev/nvidia*` still work after detach and re-attach | step 8 | holds, once the driver is re-probed |
 
-If either fails, the design section it belongs to (§4.4, §4.3) names the
-fallback. Neither failure means the approach is wrong.
+B needed one thing the design did not anticipate. A re-attached device stays
+unusable until its driver probes it **again**, and the two available probes are
+not equivalent: the guest's hot-plug path assigns the device's BARs and probes
+in the same pass, and that probe fails, while writing the address to
+`/sys/bus/pci/drivers/nvidia/bind` probes BARs that have already settled and
+binds the same GPU. So no VMM-level remedy substitutes for it — attaching to a
+paused guest and ejecting-then-re-adding were both tried on hardware and both
+fail, because re-adding is another assign-then-probe. Resume does the rebind
+itself; see `ensureActorGPUUsable`.
+
+Note what this means for §4.3's C5 fallback: it does not apply. The device nodes
+survive the cycle intact, with unchanged majors. The fault is underneath them.
 
 A third thing worth stating: the workload is a CUDA base image on purpose. An
 actor that never opens the device reaches Ready, suspends and resumes cleanly on
