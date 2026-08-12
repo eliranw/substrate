@@ -43,6 +43,7 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/third_party/kata/agentpb"
 )
 
 // probeSource is the container's entire userspace: a static binary that reports
@@ -109,7 +110,7 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 	// whatever the host has and point ATE_PROBE_ROOTFS at the unpacked directory:
 	//
 	//   sudo ctr -n k8s.io images pull docker.io/library/ubuntu:24.04
-	//   sudo ctr -n k8s.io images mount docker.io/library/ubuntu:24.04 /mnt/ubuntu
+	//   sudo ctr -n k8s.io images mount --rw docker.io/library/ubuntu:24.04 /mnt/ubuntu
 	//   export ATE_PROBE_ROOTFS=/mnt/ubuntu
 	//
 	// or with docker:
@@ -121,13 +122,16 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 		if err := os.MkdirAll(rootfs, 0o755); err != nil {
 			t.Fatalf("mkdir rootfs: %v", err)
 		}
-		// Bind rather than copy: virtiofsd serves files to the guest on demand, so
-		// nothing is duplicated on the host. Production stages its lowers the same
-		// way (ReconstructSharedDirFromImage).
-		if out, err := exec.Command("mount", "--bind", img, rootfs).CombinedOutput(); err != nil {
-			t.Fatalf("binding %s into the shared dir: %v: %s", img, err, out)
+		// Copied, not bind-mounted. The agent writes into the container root when
+		// it sets it up (mount points, and the device nodes CDI asks for), and an
+		// image snapshot mount is read-only -- `ctr images mount` without --rw, or
+		// a squashed layer -- which surfaces as "Read-only file system (os error
+		// 30)" from setup_rootfs. Production does bind its lowers, but it puts the
+		// writable layer in an overlay upper on a guest tmpfs; this test has no
+		// overlay, so the root itself has to be writable.
+		if out, err := exec.Command("cp", "-a", img+"/.", rootfs).CombinedOutput(); err != nil {
+			t.Fatalf("copying %s into the shared dir: %v: %s", img, err, out)
 		}
-		t.Cleanup(func() { _ = exec.Command("umount", "-l", rootfs).Run() })
 		t.Logf("probe rootfs: %s (image)", img)
 		// nvidia-smi and libcuda come from CDI's mounts, not from the image.
 		return rootfs, []string{"/bin/sh", "-c",
@@ -303,7 +307,14 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	// Print what the container can see of the GPU, then idle so the process is
 	// still alive if this is extended across a suspend/resume cycle.
 
-	if err := agent.CreateCarrier(ctx, cid, containerSpec(t, probe)); err != nil {
+	// Not CreateCarrier: that pins Root.Readonly = true, which is right for
+	// production's carrier (its rootfs is the immutable overlay lower) and wrong
+	// for a container the agent must populate.
+	pbSpec := kata.SpecToAgentPB(containerSpec(t, probe))
+	pbSpec.Root = &agentpb.Root{Path: kata.GuestSharedRootfs(cid), Readonly: false}
+	if err := agent.CreateContainer(ctx, &agentpb.CreateContainerRequest{
+		ContainerId: cid, ExecId: cid, OCI: pbSpec,
+	}); err != nil {
 		b, _ := os.ReadFile(serialLog)
 		hint := "  check the serial log below for what the agent objected to"
 		// Only claim CDI when the agent actually says so; the annotation is one of
