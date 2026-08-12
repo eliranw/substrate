@@ -53,6 +53,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -161,6 +162,7 @@ func TestGPUCycleOnHardware(t *testing.T) {
 	// --- boot -------------------------------------------------------------
 	vfsd, err := kata.StartVirtiofsd(ctx, kata.VirtiofsdOptions{
 		Binary: env.virtiofsd, SocketPath: kata.VirtiofsdSocketPath(id), SharedDir: sharedDir,
+		Log: testWriter{t, "virtiofsd"},
 	})
 	if err != nil {
 		t.Fatalf("StartVirtiofsd: %v", err)
@@ -281,13 +283,26 @@ func TestGPUCycleOnHardware(t *testing.T) {
 	// used is spent. Production restarts it on the restore path (stageOverlayLowers
 	// in restoreFullScope) for the same reason; reusing it here made vm.restore
 	// fail with a bare HTTP 500.
+	// Whether it was still alive decides what the earlier HTTP 500 meant: a dead
+	// virtiofsd explains it, a healthy one means the 500 had another cause and
+	// restarting is treating the wrong thing.
+	if err := vfsd.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Logf("virtiofsd had already exited before the restore (%v) -- consistent with it "+
+			"serving a single vhost-user connection", err)
+	} else {
+		t.Log("virtiofsd was STILL ALIVE before the restore; if the restore now succeeds, " +
+			"the earlier 500 was not a spent virtiofsd")
+	}
 	_ = vfsd.Process.Kill()
 	_, _ = vfsd.Process.Wait()
 	vfsd2, err := kata.StartVirtiofsd(ctx, kata.VirtiofsdOptions{
 		Binary: env.virtiofsd, SocketPath: kata.VirtiofsdSocketPath(id), SharedDir: sharedDir,
+		Log: testWriter{t, "virtiofsd2"},
 	})
 	if err != nil {
-		t.Fatalf("restarting virtiofsd for restore: %v", err)
+		t.Fatalf("restarting virtiofsd for restore: %v\n"+
+			"  its own output is logged above under [virtiofsd2]; an immediate exit with no "+
+			"output usually means the shared dir or socket path is gone", err)
 	}
 	t.Cleanup(func() { _ = vfsd2.Process.Kill(); _, _ = vfsd2.Process.Wait() })
 
