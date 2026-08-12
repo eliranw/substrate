@@ -157,7 +157,16 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 				"[ \"$(cat $d/vendor 2>/dev/null)\" = 0x10de ] || continue; echo \"$d\"; " +
 				"head -3 $d/resource; " +
 				"echo \"  driver: $(readlink $d/driver 2>&1)\"; " +
-				"echo \"  enable: $(cat $d/enable 2>&1) power: $(cat $d/power/runtime_status 2>&1)\"; " +
+				"echo \"  enable: $(cat $d/enable 2>&1)\"; " +
+				// resource is the kernel's RECORD of the assignment, restored from the
+				// snapshot along with the rest of guest memory. config space is the
+				// device's actual BAR registers. If those disagree, the driver is
+				// reading MMIO at an address nothing answers -- which is what a bound
+				// driver reporting Unknown Error looks like.
+				"echo '  config BARs (0x10..0x27):'; " +
+				"od -A x -t x4 -j 16 -N 24 $d/config 2>&1 | head -3; " +
+				// A device that is not responding reads back as all-ones.
+				"echo \"  vendor/device: $(cat $d/vendor 2>&1) $(cat $d/device 2>&1)\"; " +
 				"done; " +
 				"echo '--- driver view ---'; ls /proc/driver/nvidia/gpus/ 2>&1; " +
 				"nvidia-smi -L 2>&1 | head -3; " +
@@ -169,7 +178,16 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 				"[ \"$(cat $d/vendor 2>/dev/null)\" = 0x10de ] || continue; echo \"$d\"; " +
 				"head -3 $d/resource; " +
 				"echo \"  driver: $(readlink $d/driver 2>&1)\"; " +
-				"echo \"  enable: $(cat $d/enable 2>&1) power: $(cat $d/power/runtime_status 2>&1)\"; " +
+				"echo \"  enable: $(cat $d/enable 2>&1)\"; " +
+				// resource is the kernel's RECORD of the assignment, restored from the
+				// snapshot along with the rest of guest memory. config space is the
+				// device's actual BAR registers. If those disagree, the driver is
+				// reading MMIO at an address nothing answers -- which is what a bound
+				// driver reporting Unknown Error looks like.
+				"echo '  config BARs (0x10..0x27):'; " +
+				"od -A x -t x4 -j 16 -N 24 $d/config 2>&1 | head -3; " +
+				// A device that is not responding reads back as all-ones.
+				"echo \"  vendor/device: $(cat $d/vendor 2>&1) $(cat $d/device 2>&1)\"; " +
 				"done; " +
 				"echo '--- driver view ---'; ls /proc/driver/nvidia/gpus/ 2>&1; " +
 				"nvidia-smi -L 2>&1 | head -3; echo '--- PROBE DONE ---'; sleep 3; done"}
