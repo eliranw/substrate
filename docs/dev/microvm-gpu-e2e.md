@@ -62,7 +62,8 @@ generated config before staging — it is what makes the guest bootable:
 ```bash
 cat bin/microvm-gpu-assets/configuration-clh-gpu.toml
 # rootfs_type must be "erofs" (the stock guest is ext4)
-# kernel_params must carry pci=realloc pci=nocrs pci=assign-busses
+# kernel_params must NOT contain pci=nocrs -- assemble-gpu.sh strips it, because
+# it makes the guest ignore clh's real MMIO windows and break hot-plug
 ```
 
 Stage all three into `gs://${BUCKET_NAME}/kata-gpu-assets/`, then apply the
