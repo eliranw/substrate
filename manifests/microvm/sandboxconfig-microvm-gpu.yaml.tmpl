@@ -40,7 +40,11 @@ spec:
         sha256: "829af01ff075bb96c4f183905134c453a88d68cbabdc6b87df21098842581ee9"
       virtiofsd:
         url: "gs://${BUCKET_NAME}/kata-assets/virtiofsd"
-        sha256: "${VIRTIOFSD_SHA256}"
+        # The upstream x86_64-musl v1.14.0 binary, so it pins like the stock
+        # config does rather than being read out of whatever SandboxConfig
+        # happens to be in the cluster -- a stale one there is indistinguishable
+        # from a correct one until the guest fails to boot.
+        sha256: "15b2e72a78cc08a9bd8a6943e89fb69c88cb3cbeb63069efceade835342ac7d4"
       # NVIDIA's GPU guest: the driver and NVRC's bring-up are baked in. NVRC
       # generates the guest CDI spec at boot, which is what lets the kata-agent
       # inject /dev/nvidia* into the actor container.
