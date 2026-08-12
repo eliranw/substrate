@@ -574,8 +574,18 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 				"ATE_SKIP_SNAPSHOT to exercise the full cycle")
 			return
 		}
-		t.Fatal("the GPU is unusable after a plain eject+re-attach, with no snapshot or " +
-			"restore involved: hot-plug itself is the fault, and the restore is innocent")
+		// The probe's stream rarely survives the cycle, so its silence decides
+		// nothing. Ask the container directly instead of reading absence of output
+		// as a dead GPU.
+		if err := gpuUsableViaExec(ctx, agent2, cid, cid+"_post"); err != nil {
+			t.Fatalf("the GPU is unusable after a plain eject+re-attach, with no snapshot "+
+				"or restore involved: hot-plug itself is the fault and the restore is "+
+				"innocent: %v", err)
+		}
+		t.Log("PASS: the GPU survives a plain eject and re-attach (proven by exec; " +
+			"the probe's own stream did not survive)")
+		t.Log("  NOTE: this says nothing about the restore -- run without " +
+			"ATE_SKIP_SNAPSHOT to exercise the full cycle")
 	}
 
 	snapDir := filepath.Join(t.TempDir(), "snapshot")
@@ -649,12 +659,21 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	if afterErr != "" {
 		t.Logf("=== stderr after ===\n%s", afterErr)
 	}
-	if strings.TrimSpace(after) == "" {
-		t.Fatal("the container produced no output after the cycle, so claim B is unresolved: " +
-			"the probe loops every 3s, so silence means the process or its streams did not survive")
-	}
 	if strings.Contains(after, "Tesla") || strings.Contains(after, "UUID") {
 		t.Log("PASS claim B: the container still uses the GPU after detach and re-attach")
+		return
+	}
+	if strings.TrimSpace(after) == "" {
+		// Silence is the usual case: the probe's stream is opened at container
+		// start and does not survive restore. It decides nothing either way, so
+		// fall through to an exec rather than calling claim B failed OR unresolved.
+		t.Log("the probe produced no output after the cycle -- its stream did not survive; " +
+			"asking the container directly instead")
+		if err := gpuUsableViaExec(ctx, agent2, cid, cid+"_post"); err != nil {
+			t.Fatalf("claim B FAILS: the container cannot use the GPU after the cycle: %v", err)
+		}
+		t.Log("PASS claim B: the container still uses the GPU after detach and re-attach " +
+			"(proven by exec; the probe's own stream did not survive)")
 		return
 	}
 	// Deliberately does NOT name a cause. The device nodes surviving is 4.3's
@@ -716,4 +735,23 @@ func tailBytes(b []byte, n int) string {
 		b = b[len(b)-n:]
 	}
 	return string(b)
+}
+
+// gpuUsableViaExec runs nvidia-smi in the container and reports whether it found
+// a GPU, using the exit code rather than the probe's stdout.
+//
+// The probe writes to a stream opened when the container started, and that
+// stream does not survive the cycle -- ttrpc reports "message on inactive
+// stream" and reads return nothing whether the GPU works or not. Silence there
+// is a harness artefact, so it cannot decide claim B in either direction. A
+// fresh exec is independent of it.
+func gpuUsableViaExec(ctx context.Context, agent *kata.AgentClient, cid, execID string) error {
+	code, err := agent.ExecProcess(ctx, cid, execID, []string{"nvidia-smi", "-L"})
+	if err != nil {
+		return fmt.Errorf("exec nvidia-smi: %w", err)
+	}
+	if code != 0 {
+		return fmt.Errorf("nvidia-smi exited %d", code)
+	}
+	return nil
 }
