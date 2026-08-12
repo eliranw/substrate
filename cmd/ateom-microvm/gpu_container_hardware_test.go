@@ -549,7 +549,9 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 		after, _ := readProbeOutput(ctx, t, agent2, cid, 60*time.Second)
 		t.Logf("=== container view after eject+re-attach, NO restore (%d bytes) ===\n%s", len(after), after)
 		if strings.Contains(after, "Tesla") || strings.Contains(after, "UUID") {
-			t.Log("PASS: hot-plug alone is fine -- the restore is what breaks the GPU")
+			t.Log("PASS: the GPU survives a plain eject and re-attach")
+			t.Log("  NOTE: this says nothing about the restore -- run without " +
+				"ATE_SKIP_SNAPSHOT to exercise the full cycle")
 			return
 		}
 		t.Fatal("the GPU is unusable after a plain eject+re-attach, with no snapshot or " +

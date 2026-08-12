@@ -95,6 +95,24 @@ tomlval() { sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" | head -
 
 gpu_rootfs_type="$(tomlval "${DEFAULTS}/configuration-qemu-nvidia-gpu.toml" rootfs_type)"
 gpu_kernel_params="$(tomlval "${DEFAULTS}/configuration-qemu-nvidia-gpu.toml" kernel_params)"
+
+# Drop pci=nocrs. It tells Linux to ignore the ACPI _CRS host-bridge windows --
+# the address ranges the platform declares it actually routes -- and fall back to
+# assuming MMIO starts just above top-of-RAM. That is a sensible workaround for
+# bare-metal BIOSes that publish wrong windows, which is why NVIDIA ships it.
+#
+# cloud-hypervisor publishes correct windows, so ignoring them replaces good
+# information with a guess, and the guess is wrong: the guest picks an address
+# clh does not route, clh refuses ("Failed moving device BAR ... keeping old
+# BAR"), and the guest then drives MMIO where the device is not. Verified on a
+# T4: with nocrs the GPU is unusable after a hot-plug and the kernel demands
+# 0x80000000 every time (exactly the top of a 2048MiB guest); without it the
+# kernel picks 0xc0000000, inside clh's aperture, and the GPU works.
+#
+# Cold boot never noticed because clh lays the BARs out and the guest only reads
+# them. Only hot-plug makes the guest ASSIGN an address, which is what
+# re-attaching a device after a suspend does.
+gpu_kernel_params="${gpu_kernel_params//pci=nocrs/}"
 clh_memory="$(tomlval "${DEFAULTS}/configuration-clh.toml" default_memory)"
 clh_vcpus="$(tomlval "${DEFAULTS}/configuration-clh.toml" default_vcpus)"
 for v in gpu_rootfs_type gpu_kernel_params clh_memory clh_vcpus; do
