@@ -134,10 +134,13 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 		}
 		t.Logf("probe rootfs: %s (image)", img)
 		// nvidia-smi and libcuda come from CDI's mounts, not from the image.
+		// Loops rather than reporting once: the same container is asked again after
+		// the suspend/resume cycle, and a process that has already exited cannot
+		// answer. nvidia-smi -L is one line per GPU, so a MARK with no line after it
+		// is the visible failure.
 		return rootfs, []string{"/bin/sh", "-c",
-			"echo '--- dev ---'; ls -l /dev | grep -i nvidia; " +
-				"echo '--- nvidia-smi ---'; nvidia-smi 2>&1 | head -15; " +
-				"echo '--- PROBE DONE ---'; sleep 600"}
+			"while true; do echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
+				"nvidia-smi -L 2>&1 | head -3; echo '--- PROBE DONE ---'; sleep 3; done"}
 	}
 
 	t.Log("probe rootfs: static binary (set ATE_PROBE_ROOTFS to use a real image)")
@@ -356,15 +359,137 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	// and it is the difference between CDI having injected something and the
 	// container being able to USE the device.
 	switch {
-	case strings.Contains(out, "NVIDIA-SMI"):
+	case strings.Contains(out, "Tesla") || strings.Contains(out, "UUID"):
 		t.Log("PASS use: nvidia-smi ran inside the container and saw the GPU")
 	case strings.Contains(out, "open /dev/nvidiactl: OK"):
 		t.Log("PASS open: the container can open the device, so the driver is bound to it")
 	default:
-		t.Error("the device nodes are present but unusable: nothing opened them and " +
+		t.Fatal("the device nodes are present but unusable: nothing opened them and " +
 			"nvidia-smi did not report a GPU. CDI injected the nodes and the guest " +
 			"driver is not backing them")
 	}
+
+	// ---------------------------------------------------------------------
+	// Claim B: do the container's device nodes still work after the device is
+	// ejected and re-attached?
+	//
+	// The nodes are (major, minor) pairs in the container's /dev tmpfs. They ride
+	// through the memory snapshot whether or not a driver is behind them, so
+	// their presence afterwards proves nothing -- only using them does. This is
+	// the design's central unobserved inference (4.3).
+	// ---------------------------------------------------------------------
+	if os.Getenv("ATE_SKIP_CYCLE") != "" {
+		t.Log("ATE_SKIP_CYCLE set; stopping before the suspend/resume cycle")
+		return
+	}
+	t.Log("=== cycling the device: detach -> snapshot -> restore -> re-attach ===")
+
+	// The agent's connection dies with the VMM; production re-dials after restore.
+	_ = agent.Close()
+
+	ids, err := client.VFIOPassthroughIDs(ctx)
+	if err != nil {
+		t.Fatalf("VFIOPassthroughIDs: %v", err)
+	}
+	for _, did := range ids {
+		if err := client.RemoveDevice(ctx, did); err != nil {
+			t.Fatalf("RemoveDevice(%s): %v", did, err)
+		}
+	}
+	for _, did := range ids {
+		if err := client.WaitDeviceRemoved(ctx, did, chCmd.Process.Pid, 60*time.Second); err != nil {
+			t.Fatalf("WaitDeviceRemoved(%s): %v", did, err)
+		}
+	}
+	if err := errIfPassthroughSnapshot(ctx, client); err != nil {
+		t.Fatalf("gate still sees a device after a confirmed eject: %v", err)
+	}
+	t.Log("PASS detach: device ejected while the container kept running")
+
+	snapDir := filepath.Join(t.TempDir(), "snapshot")
+	if err := os.MkdirAll(snapDir, 0o700); err != nil {
+		t.Fatalf("mkdir snapshot: %v", err)
+	}
+	if err := client.Pause(ctx); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if err := client.Snapshot(ctx, snapDir); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	_ = chCmd.Process.Kill()
+	_, _ = chCmd.Process.Wait()
+	t.Log("PASS snapshot: taken with the container live and the device gone")
+
+	// Same per-actor state collisions as the other hardware test: the snapshot
+	// names this actor's vsock socket and clh binds it, and virtiofsd serves one
+	// vhost-user connection. Production avoids both by restoring under a new id.
+	if err := os.Remove(kata.VsockSocketPath(id)); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("removing the stale vsock socket: %v", err)
+	}
+	_ = vfsd.Process.Kill()
+	_, _ = vfsd.Process.Wait()
+	vfsd2, err := startVirtiofsdWaitingForLock(ctx, t, env, id, sharedDir)
+	if err != nil {
+		t.Fatalf("restarting virtiofsd: %v", err)
+	}
+	t.Cleanup(func() { _ = vfsd2.Process.Kill(); _, _ = vfsd2.Process.Wait() })
+
+	chCmd2, client2, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
+		Binary: env.chBin, APISocket: kata.CLHSocketPath(id),
+		Stdout: testWriter{t, "clh2"}, Stderr: testWriter{t, "clh2"},
+	})
+	if err != nil {
+		t.Fatalf("relaunch VMM: %v", err)
+	}
+	t.Cleanup(func() { _ = chCmd2.Process.Kill(); _, _ = chCmd2.Process.Wait() })
+	if err := client2.WaitReady(ctx, 15*time.Second); err != nil {
+		t.Fatalf("WaitReady after relaunch: %v", err)
+	}
+	// Copy, not OnDemand: VFIO pins guest memory to map it into the IOMMU and
+	// userfaultfd-backed pages cannot be pinned (restoreFullScope does the same).
+	if err := client2.RestoreWithNetFDs(ctx, snapDir, nil, "Copy"); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if err := client2.Resume(ctx); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	t.Log("PASS restore: guest resumed with the container inside it")
+
+	for _, d := range devices {
+		if _, err := client2.AddDevice(ctx, d.Path); err != nil {
+			t.Fatalf("AddDevice(%s): %v", d.Path, err)
+		}
+	}
+	if err := waitDevicesAttached(ctx, client2, len(devices), 60*time.Second); err != nil {
+		t.Fatalf("re-attach: %v", err)
+	}
+	t.Log("PASS re-attach: the VMM holds the device again")
+
+	// --- the answer ------------------------------------------------------
+	agent2, err := dialAgentRetry(ctx, vsock, 60*time.Second)
+	if err != nil {
+		t.Fatalf("re-dialing the agent after restore: %v", err)
+	}
+	t.Cleanup(func() { _ = agent2.Close() })
+
+	after, afterErr := readProbeOutput(ctx, t, agent2, cid, 60*time.Second)
+	t.Logf("=== container view AFTER the cycle (%d bytes) ===\n%s", len(after), after)
+	if afterErr != "" {
+		t.Logf("=== stderr after ===\n%s", afterErr)
+	}
+	if strings.TrimSpace(after) == "" {
+		t.Fatal("the container produced no output after the cycle, so claim B is unresolved: " +
+			"the probe loops every 3s, so silence means the process or its streams did not survive")
+	}
+	if strings.Contains(after, "Tesla") || strings.Contains(after, "UUID") {
+		t.Log("PASS claim B: the container still uses the GPU after detach and re-attach")
+		return
+	}
+	t.Errorf("CLAIM B FAILS: the container survived but can no longer use the GPU. " +
+		"design 4.3's inference is wrong and C5 (re-inject after re-attach) is required. " +
+		"Compare the nvidia majors above against the pre-cycle listing: a changed " +
+		"nvidia-uvm major would explain it, since the design argues it is stable only " +
+		"because the modules stay resident.")
 }
 
 // readProbeOutput drains the container's stdout until the probe's end marker,
