@@ -45,51 +45,84 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 )
 
-// stageBusyboxRootfs builds a container rootfs out of the guest image's own
-// busybox, at the path virtiofsd serves to the guest.
+// probeSource is the container's entire userspace: a static binary that reports
+// what the guest injected, then idles so it is still running if this is extended
+// across a suspend/resume cycle.
 //
-// A CUDA image would be the realistic workload, but it is not needed to answer
-// either question and would drag a registry pull onto the host. CDI supplies the
-// driver libraries and device nodes itself, from the guest -- that is precisely
-// the mechanism under test -- so the rootfs only has to provide a shell.
+// It prints rather than asserts. The test decides what is a failure; the probe's
+// job is to make the container's view observable, including the absence of
+// things.
+const probeSource = `package main
+
+import (
+	"fmt"
+	"os"
+	"time"
+)
+
+func main() {
+	fmt.Println("--- /dev ---")
+	ents, err := os.ReadDir("/dev")
+	if err != nil {
+		fmt.Println("readdir /dev:", err)
+	}
+	for _, e := range ents {
+		fmt.Println(" ", e.Name())
+	}
+	fmt.Println("--- /proc/devices ---")
+	if b, err := os.ReadFile("/proc/devices"); err == nil {
+		fmt.Print(string(b))
+	} else {
+		fmt.Println("read /proc/devices:", err)
+	}
+	// Opening it is the real question: a device node whose driver is not bound is
+	// present but unusable, which is exactly the state a re-attach has to undo.
+	for _, d := range []string{"/dev/nvidiactl", "/dev/nvidia0"} {
+		f, err := os.Open(d)
+		if err != nil {
+			fmt.Printf("open %s: %v\n", d, err)
+			continue
+		}
+		f.Close()
+		fmt.Printf("open %s: OK\n", d)
+	}
+	fmt.Println("--- PROBE DONE ---")
+	time.Sleep(10 * time.Minute)
+}
+`
+
+// stageProbeRootfs builds the container rootfs at the path virtiofsd serves.
 //
-// busybox comes from the guest image because it is known to be a static binary
-// that runs in this guest, which a host busybox may not be.
-func stageBusyboxRootfs(t *testing.T, env hwEnv, sharedDir, cid string) string {
+// The probe is a statically linked Go binary rather than the guest's busybox.
+// That busybox is 55KB and dynamically linked against the guest's libc, so it
+// exits 1 immediately in a rootfs that has no loader -- which is what a container
+// rootfs assembled by hand is. CGO_ENABLED=0 removes the question entirely, and
+// a CUDA image is still unnecessary: CDI supplies the driver libraries itself,
+// which is the mechanism under test.
+func stageProbeRootfs(t *testing.T, sharedDir, cid string) string {
 	t.Helper()
 	rootfs := filepath.Join(sharedDir, cid, "rootfs")
-	for _, d := range []string{"bin", "dev", "proc", "sys", "etc", "tmp"} {
+	for _, d := range []string{"dev", "proc", "sys", "etc", "tmp"} {
 		if err := os.MkdirAll(filepath.Join(rootfs, d), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
 	}
 
-	// p1 of the guest image is a plain EROFS filesystem at 1MiB (the dm-verity
-	// hash tree is a separate partition), so it mounts read-only as-is.
-	mnt := filepath.Join(t.TempDir(), "guestroot")
-	if err := os.MkdirAll(mnt, 0o755); err != nil {
-		t.Fatalf("mkdir mountpoint: %v", err)
+	src := filepath.Join(t.TempDir(), "probe")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatalf("mkdir probe src: %v", err)
 	}
-	img := filepath.Join(env.assets, "rootfs-gpu.img")
-	mount := exec.Command("mount", "-o", "loop,offset=1048576,ro", img, mnt)
-	if out, err := mount.CombinedOutput(); err != nil {
-		t.Fatalf("mounting the guest image to borrow busybox: %v: %s", err, out)
+	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte(probeSource), 0o644); err != nil {
+		t.Fatalf("writing probe source: %v", err)
 	}
-	t.Cleanup(func() { _ = exec.Command("umount", mnt).Run() })
-
-	src, err := os.ReadFile(filepath.Join(mnt, "bin", "busybox"))
-	if err != nil {
-		t.Fatalf("reading busybox from the guest image: %v", err)
+	if err := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module probe\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("writing probe go.mod: %v", err)
 	}
-	dst := filepath.Join(rootfs, "bin", "busybox")
-	if err := os.WriteFile(dst, src, 0o755); err != nil {
-		t.Fatalf("writing busybox: %v", err)
-	}
-	// The agent execs the process directly, so give it the usual names too.
-	for _, name := range []string{"sh", "ls", "cat", "sleep", "grep", "echo"} {
-		if err := os.Symlink("busybox", filepath.Join(rootfs, "bin", name)); err != nil && !os.IsExist(err) {
-			t.Fatalf("linking %s: %v", name, err)
-		}
+	build := exec.Command("go", "build", "-o", filepath.Join(rootfs, "probe"), ".")
+	build.Dir = src
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64", "GOFLAGS=")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building the static probe: %v: %s", err, out)
 	}
 	return rootfs
 }
@@ -176,7 +209,7 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 		t.Fatalf("mkdir shared: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sharedDir) })
-	stageBusyboxRootfs(t, env, sharedDir, cid)
+	stageProbeRootfs(t, sharedDir, cid)
 
 	serialLog := filepath.Join(kata.VMDir(id), "serial.log")
 	vfsd, err := kata.StartVirtiofsd(ctx, kata.VirtiofsdOptions{
@@ -234,13 +267,7 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 
 	// Print what the container can see of the GPU, then idle so the process is
 	// still alive if this is extended across a suspend/resume cycle.
-	// No pipes and no applets beyond the symlinks staged above: busybox resolves
-	// each name through PATH, and one missing applet in a pipeline silently costs
-	// the whole line. Listing all of /dev also shows what CDI did NOT inject.
-	probe := []string{"/bin/busybox", "sh", "-c",
-		"echo '--- dev ---'; ls -l /dev; " +
-			"echo '--- proc devices ---'; cat /proc/devices; " +
-			"echo '--- PROBE DONE ---'; sleep 600"}
+	probe := []string{"/probe"}
 
 	if err := agent.CreateCarrier(ctx, cid, containerSpec(t, probe)); err != nil {
 		b, _ := os.ReadFile(serialLog)
@@ -274,11 +301,20 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 			"  the container was created and started, so look for an exec failure below\n"+
 			"=== serial ===\n%s", tailBytes(b, 6000))
 	}
-	if strings.Contains(out, "nvidia") {
-		t.Log("PASS inject: the container can see nvidia device nodes")
-	} else {
-		t.Errorf("the container ran but /dev has no nvidia nodes -- the annotation was " +
+	if !strings.Contains(out, "nvidia") {
+		t.Fatal("the container ran but /dev has no nvidia nodes -- the annotation was " +
 			"accepted and had no effect")
+	}
+	t.Log("PASS inject: the container can see nvidia device nodes")
+
+	// A node that exists but will not open is the state a re-attach has to undo,
+	// and it is the difference between CDI having injected something and the
+	// container being able to USE the device.
+	if strings.Contains(out, "open /dev/nvidiactl: OK") {
+		t.Log("PASS open: the container can open the device, so the driver is bound to it")
+	} else {
+		t.Error("the device nodes are present but will not open; CDI injected them and " +
+			"the guest driver is not backing them")
 	}
 }
 
