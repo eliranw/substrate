@@ -56,22 +56,12 @@ a `podCertificate` projected volume. That API is alpha, and **a disabled alpha
 field is pruned at admission rather than rejected** — the projection vanishes
 from the pod spec, no signing request is ever filed, and every component that
 reads a credential bundle exits on a file that was never written. Enabling it on
-the kubelet alone does nothing; the API server does the pruning.
+the kubelet alone does not help; the API server does the pruning.
+`docs/dev/gpu-node-bootstrap.md` sets it at `kubeadm init`.
 
-```bash
-# Must list PodCertificateRequest=true.
-kubectl -n kube-system get pod -l component=kube-apiserver \
-  -o jsonpath='{.items[0].spec.containers[0].command}' | tr ',' '\n' | grep feature-gates
-```
-
-On kubeadm, add it to `--feature-gates` in
-`/etc/kubernetes/manifests/kube-apiserver.yaml` (back the file up first — a bad
-flag leaves you with no API server) and the static pod restarts itself.
-`hack/create-kind-cluster.sh:80` does the equivalent for kind. This is a
-cluster-level setting and survives reinstalling substrate.
-
-The decisive check is whether the field survives a round trip, not whether the
-flag is spelled right:
+The only check worth running is whether the field survives a round trip. Do not
+grep the API server's flags — the value is a comma-separated list, and splitting
+on commas to read it will show you the first gate and hide the rest:
 
 ```bash
 kubectl apply --dry-run=server -o json -f - <<'EOF' | grep -c podCertificate  # want > 0
@@ -91,6 +81,10 @@ spec:
           credentialBundlePath: credential-bundle.pem
 EOF
 ```
+
+An empty `kubectl get podcertificaterequests -A` is **not** a symptom: the
+built-in `podcertificaterequestcleaner` controller deletes them once issued, so
+the steady state is no objects at all.
 
 ### Installing substrate
 
@@ -339,7 +333,7 @@ bug in the component being deployed.
 
 | Symptom | Actual cause |
 |---|---|
-| ateom exits: `reading credential bundle: no such file or directory` | API server missing `PodCertificateRequest=true`; the projection was pruned |
+| ateom exits: `reading credential bundle: no such file or directory` | The deployed atecontroller predates `cc858876` and never puts the podCertificate projection in the worker pod spec. Looks identical to the feature gate being off — check the gate with the round-trip probe above, then look at the Deployment the controller actually produced |
 | Controller Running, but the WorkerPool Deployment never changes | Its NetworkPolicy informer is `403 forbidden`, so the manager never finishes cache sync. No error, no crash — it just never reconciles. The old pod stays Running and serving |
 | api-server CrashLoop, `/readyz` refused | Same shape: an informer for `csidriverconfigs.ate.dev`, a CRD the cluster never had. `ensure_crds` short-circuits on the three CRDs that do exist |
 | Client: `cannot parse invalid wire-format data` | #737 wrapped the flat `ateom_pod_*` fields into a `WorkerAssignment` message; field 5 arrives as a string where a message is expected |
