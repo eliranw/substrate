@@ -312,10 +312,26 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	//     source afterwards and nothing merges against it, so it is dropped below and
 	//     the next snapshot stands on its own.
 	memMode := restoreMemMode(ctx, client.Info())
+
+	// A passthrough device forces Eager whatever the VMM would have chosen.
+	// Re-attaching it runs VFIO_IOMMU_MAP_DMA over the guest's memory, and VFIO has
+	// to PIN those pages to map them; pages still demand-paged through userfaultfd
+	// are not resident and cannot be pinned, so the map fails with EFAULT and
+	// vm.add-device 500s. (QEMU has the same incompatibility between postcopy
+	// migration and VFIO.) Observed on a T4: "failed to add guest memory map into
+	// iommu table: Bad address (os error 14)".
+	passthrough, err := resolveWorkerDevices()
+	if err != nil {
+		return fmt.Errorf("while resolving worker passthrough devices: %w", err)
+	}
+	if len(passthrough) > 0 {
+		memMode = ch.MemRestoreEager
+	}
+
 	slog.InfoContext(ctx, "restoring guest memory",
 		slog.String("mode", memMode), slog.String("vmm_version", client.Info().Version))
 	if err := client.RestoreWithNetFDs(ctx, restoreDir, restoredNets, memMode); err != nil {
-		return fmt.Errorf("while restoring VM with net FDs: %w", err)
+		return fmt.Errorf("while restoring VM with net FDs (memory mode %s): %w", memMode, err)
 	}
 	if err := client.Resume(ctx); err != nil {
 		return fmt.Errorf("while resuming restored guest: %w", err)

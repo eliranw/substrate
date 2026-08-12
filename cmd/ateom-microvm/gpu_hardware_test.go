@@ -316,9 +316,13 @@ func TestGPUCycleOnHardware(t *testing.T) {
 		t.Fatalf("WaitReady after relaunch: %v", err)
 	}
 	// No net FDs: this VM has no virtio-net (production adds one separately from
-	// the tap). OnDemand matches production; snapDir outlives the VM because the
-	// VMM is killed by a cleanup registered after the one that removes the dir.
-	if err := client2.RestoreWithNetFDs(ctx, snapDir, nil, "OnDemand"); err != nil {
+	// the tap).
+	//
+	// Copy, not OnDemand: re-attaching a VFIO device maps the guest's memory into
+	// the IOMMU, which requires pinning it, and userfaultfd-backed pages cannot be
+	// pinned. OnDemand restores fine and then fails at vm.add-device with EFAULT.
+	// restoreFullScope picks the same way, on the same grounds.
+	if err := client2.RestoreWithNetFDs(ctx, snapDir, nil, "Copy"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	if err := client2.Resume(ctx); err != nil {
