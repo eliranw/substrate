@@ -1,0 +1,312 @@
+//go:build linux && gpuhw
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Drives the real GPU suspend/resume cycle against real hardware: a real
+// cloud-hypervisor, a real VFIO-bound GPU, and the real NVIDIA guest. Nothing
+// here is stubbed, and every function it calls is the one production uses.
+//
+// It deliberately stops below the container layer. Running it needs no
+// Kubernetes, no atelet, no ateapi and no OCI bundles -- only the staged guest
+// assets and a GPU bound to vfio-pci -- which is what makes it the cheapest way
+// to find out whether the VM-level design actually holds. What it therefore does
+// NOT cover is the container half: CDI injection and whether a container's
+// /dev/nvidia* survive the cycle. Those need the full actor path (see
+// docs/dev/microvm-gpu-e2e.md).
+//
+// Build-tagged so it never runs in CI or on a developer laptop:
+//
+//	sudo -E env "PATH=$PATH" \
+//	  ATE_GPU_ASSETS=$PWD/bin/microvm-gpu-assets \
+//	  ATE_CH_BIN=$PWD/bin/microvm-assets/cloud-hypervisor \
+//	  ATE_VIRTIOFSD_BIN=$PWD/bin/microvm-assets/virtiofsd \
+//	  go test -tags gpuhw -run TestGPUCycleOnHardware -v -timeout 20m ./cmd/ateom-microvm/
+//
+// Root is required: cloud-hypervisor needs the /dev/vfio group node, and the
+// eject check reads /proc/<vmm pid>/fd.
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
+)
+
+// hwEnv collects the host paths the run needs, failing with one message that
+// names everything missing rather than one per lookup.
+type hwEnv struct {
+	assets, chBin, virtiofsd string
+}
+
+func hardwareEnv(t *testing.T) hwEnv {
+	t.Helper()
+	e := hwEnv{
+		assets:    os.Getenv("ATE_GPU_ASSETS"),
+		chBin:     os.Getenv("ATE_CH_BIN"),
+		virtiofsd: os.Getenv("ATE_VIRTIOFSD_BIN"),
+	}
+	var missing []string
+	for k, v := range map[string]string{
+		"ATE_GPU_ASSETS": e.assets, "ATE_CH_BIN": e.chBin, "ATE_VIRTIOFSD_BIN": e.virtiofsd,
+	} {
+		if v == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("set %s (see the comment at the top of this file)", strings.Join(missing, ", "))
+	}
+	for _, f := range []string{
+		filepath.Join(e.assets, "vmlinux-gpu"),
+		filepath.Join(e.assets, "rootfs-gpu.img"),
+		filepath.Join(e.assets, "configuration-clh-gpu.toml"),
+		e.chBin, e.virtiofsd,
+	} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("missing %s -- run hack/microvm-assets/assemble-gpu.sh: %v", f, err)
+		}
+	}
+	if os.Geteuid() != 0 {
+		t.Fatal("must run as root: cloud-hypervisor needs /dev/vfio and the eject check reads /proc/<pid>/fd")
+	}
+	return e
+}
+
+// TestGPUCycleOnHardware boots the NVIDIA guest with a passthrough GPU, detaches
+// it, snapshots, restores, re-attaches, and confirms the GPU works again.
+//
+// The assertions are ordered so a failure names the stage that broke rather than
+// leaving a dead VM and no explanation; the guest serial log is dumped on every
+// failure, because a guest that will not boot says so there and nowhere else.
+func TestGPUCycleOnHardware(t *testing.T) {
+	env := hardwareEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	// The worker's allocation, exactly as production reads it. Set
+	// PCI_RESOURCE_NVIDIA_COM_<MODEL> the way the device plugin would.
+	devices, err := resolveWorkerDevices()
+	if err != nil {
+		t.Fatalf("resolveWorkerDevices: %v", err)
+	}
+	if len(devices) == 0 {
+		t.Fatal("no PCI_RESOURCE_* in the environment: export the BDF the device plugin would, " +
+			"e.g. PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4=0000:da:00.0")
+	}
+	t.Logf("passthrough devices: %v", devices)
+
+	id := "gpuhw-" + fmt.Sprint(os.Getpid())
+	vmDir := kata.VMDir(id)
+	if err := os.MkdirAll(vmDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", vmDir, err)
+	}
+	sharedDir := filepath.Join(t.TempDir(), "shared")
+	if err := os.MkdirAll(sharedDir, 0o755); err != nil {
+		t.Fatalf("mkdir shared: %v", err)
+	}
+	serialLog := filepath.Join(vmDir, "serial.log")
+	dumpSerial := func(stage string) {
+		b, _ := os.ReadFile(serialLog)
+		if len(b) > 6000 {
+			b = b[len(b)-6000:]
+		}
+		t.Logf("=== guest serial log (%s) ===\n%s", stage, b)
+	}
+
+	// --- boot -------------------------------------------------------------
+	vfsd, err := kata.StartVirtiofsd(ctx, kata.VirtiofsdOptions{
+		Binary: env.virtiofsd, SocketPath: kata.VirtiofsdSocketPath(id), SharedDir: sharedDir,
+	})
+	if err != nil {
+		t.Fatalf("StartVirtiofsd: %v", err)
+	}
+	t.Cleanup(func() { _ = vfsd.Process.Kill(); _, _ = vfsd.Process.Wait() })
+
+	apiSocket := kata.CLHSocketPath(id)
+	chCmd, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{Binary: env.chBin, APISocket: apiSocket})
+	if err != nil {
+		t.Fatalf("LaunchVMM: %v", err)
+	}
+	t.Cleanup(func() { _ = chCmd.Process.Kill(); _, _ = chCmd.Process.Wait() })
+	if err := client.WaitReady(ctx, 15*time.Second); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+
+	// The guest's own config decides the root parameters: NVIDIA's guest is
+	// EROFS, and booting it with the stock ext4 parameters fails in the kernel
+	// before anything we could log.
+	cfgBytes, err := os.ReadFile(filepath.Join(env.assets, "configuration-clh-gpu.toml"))
+	if err != nil {
+		t.Fatalf("reading generated kata config: %v", err)
+	}
+	cfg, err := kata.ParseConfig(cfgBytes, 2048, 1)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	t.Logf("guest: rootfs_type=%q vcpus=%d mem=%dMiB", cfg.RootfsType, cfg.VCPUs, cfg.MemoryMiB)
+	if cfg.RootfsType != "erofs" {
+		t.Errorf("expected the NVIDIA guest to be erofs, got %q -- assemble-gpu.sh may be stale", cfg.RootfsType)
+	}
+
+	vmCfg := buildVMConfig(id,
+		filepath.Join(env.assets, "vmlinux-gpu"), filepath.Join(env.assets, "rootfs-gpu.img"),
+		kata.WithDebugConsole(cfg.KernelParams), cfg.RootfsType, serialLog,
+		cfg.MemoryMiB, cfg.VCPUs, false, devices)
+	t.Logf("cmdline: %s", vmCfg.Payload.Cmdline)
+
+	if err := client.CreateVM(ctx, vmCfg); err != nil {
+		t.Fatalf("CreateVM (device cold-plug rejected?): %v", err)
+	}
+	if err := client.BootVM(ctx); err != nil {
+		dumpSerial("boot failed")
+		t.Fatalf("BootVM: %v", err)
+	}
+
+	// --- claim A: does NVRC come up on a non-verity root? -----------------
+	vsock := kata.VsockSocketPath(id)
+	var bdfs []string
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		bdfs, err = kata.GuestGPUBDFs(ctx, vsock)
+		if err == nil && len(bdfs) >= len(devices) {
+			break
+		}
+		if time.Now().After(deadline) {
+			dumpSerial("guest never reported its GPUs")
+			t.Fatalf("guest did not enumerate %d GPU(s) within 90s (last: %v, err %v). "+
+				"If the guest booted but NVRC refused, this is design claim A -- see docs/dev/microvm-gpu-e2e.md step 4",
+				len(devices), bdfs, err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Logf("PASS boot: guest sees GPU(s) %v", bdfs)
+
+	// NVRC writes the CDI spec before forking the agent, so by the time the guest
+	// answers at all this must already exist. It is what the kata-agent resolves
+	// the cdi.k8s.io annotation against, so its absence would break the container
+	// half even though the VM half works.
+	if out := kata.DebugConsoleDump(ctx, vsock, "ls -l /var/run/cdi/ 2>&1"); !strings.Contains(out, "nvidia") {
+		t.Errorf("no CDI spec in the guest -- container injection would fail. Got: %s", oneLineHW(out))
+	} else {
+		t.Logf("PASS cdi: guest CDI spec present")
+	}
+	t.Logf("guest nvidia-smi:\n%s", kata.DebugConsoleDump(ctx, vsock, "nvidia-smi 2>&1 | head -12"))
+
+	// --- detach -----------------------------------------------------------
+	ids, err := client.VFIOPassthroughIDs(ctx)
+	if err != nil {
+		t.Fatalf("VFIOPassthroughIDs: %v", err)
+	}
+	if len(ids) != len(devices) {
+		t.Fatalf("VMM reports %v for %d cold-plugged device(s)", ids, len(devices))
+	}
+	t.Logf("VMM device ids: %v", ids)
+
+	for _, bdf := range bdfs {
+		if err := kata.GuestDetachGPU(ctx, vsock, bdf); err != nil {
+			t.Fatalf("GuestDetachGPU(%s): %v", bdf, err)
+		}
+	}
+	for _, did := range ids {
+		if err := client.RemoveDevice(ctx, did); err != nil {
+			t.Fatalf("RemoveDevice(%s): %v", did, err)
+		}
+	}
+	for _, did := range ids {
+		if err := client.WaitDeviceRemoved(ctx, did, chCmd.Process.Pid, 60*time.Second); err != nil {
+			t.Fatalf("WaitDeviceRemoved(%s): %v", did, err)
+		}
+	}
+	if err := errIfPassthroughSnapshot(ctx, client); err != nil {
+		t.Fatalf("gate still sees a device after a confirmed eject: %v", err)
+	}
+	t.Log("PASS detach: devices ejected and the eject confirmed")
+
+	// --- snapshot / restore ----------------------------------------------
+	snapDir := filepath.Join(t.TempDir(), "snapshot")
+	if err := os.MkdirAll(snapDir, 0o700); err != nil {
+		t.Fatalf("mkdir snapshot: %v", err)
+	}
+	if err := client.Pause(ctx); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if err := client.Snapshot(ctx, snapDir); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	_ = chCmd.Process.Kill()
+	_, _ = chCmd.Process.Wait()
+	t.Log("PASS snapshot: taken with no device attached")
+
+	chCmd2, client2, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{Binary: env.chBin, APISocket: apiSocket})
+	if err != nil {
+		t.Fatalf("relaunch VMM: %v", err)
+	}
+	t.Cleanup(func() { _ = chCmd2.Process.Kill(); _, _ = chCmd2.Process.Wait() })
+	if err := client2.WaitReady(ctx, 15*time.Second); err != nil {
+		t.Fatalf("WaitReady after relaunch: %v", err)
+	}
+	// No net FDs: this VM has no virtio-net (production adds one separately from
+	// the tap). "Copy" rather than the production "OnDemand" so the restored guest
+	// does not keep demand-paging from a directory the test is about to remove.
+	if err := client2.RestoreWithNetFDs(ctx, snapDir, nil, "Copy"); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if err := client2.Resume(ctx); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	t.Log("PASS restore: guest resumed from a device-free snapshot")
+
+	// --- re-attach --------------------------------------------------------
+	for _, d := range devices {
+		if _, err := client2.AddDevice(ctx, d.Path); err != nil {
+			t.Fatalf("AddDevice(%s): %v", d.Path, err)
+		}
+	}
+	rebdfs, err := waitGuestGPUs(ctx, vsock, len(devices), 60*time.Second)
+	if err != nil {
+		t.Fatalf("guest never re-enumerated the GPU after add-device: %v", err)
+	}
+	for _, bdf := range rebdfs {
+		if err := kata.GuestVerifyGPUBound(ctx, vsock, bdf, 60*time.Second); err != nil {
+			t.Fatalf("GuestVerifyGPUBound(%s): %v", bdf, err)
+		}
+	}
+	t.Logf("PASS re-attach: driver bound %v", rebdfs)
+
+	// --- the GPU actually works again -------------------------------------
+	smi := kata.DebugConsoleDump(ctx, vsock, "nvidia-smi 2>&1")
+	if !strings.Contains(smi, "NVIDIA-SMI") || strings.Contains(smi, "no devices") {
+		t.Fatalf("nvidia-smi does not see the GPU after re-attach:\n%s", smi)
+	}
+	t.Logf("PASS cycle complete -- nvidia-smi after resume:\n%s", firstLinesHW(smi, 12))
+}
+
+func oneLineHW(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+func firstLinesHW(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[:n]
+	}
+	return strings.Join(lines, "\n")
+}
