@@ -432,7 +432,20 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 		t.Log("ATE_SKIP_CYCLE set; stopping before the suspend/resume cycle")
 		return
 	}
-	t.Log("=== cycling the device: detach -> snapshot -> restore -> re-attach ===")
+	// ATE_SKIP_SNAPSHOT isolates the two variables in the cycle. The full path is
+	// eject -> snapshot -> restore -> hot-plug, and a failure at the end could be
+	// caused by either half. With it set, the device is ejected and immediately
+	// hot-plugged back into the SAME running VM: no snapshot, no restore, same
+	// guest, same driver, same container.
+	//
+	//   still broken -> hot-plug itself is the fault; restore is innocent
+	//   works        -> hot-plug is fine and the restore is what breaks it
+	skipSnapshot := os.Getenv("ATE_SKIP_SNAPSHOT") != ""
+	if skipSnapshot {
+		t.Log("=== cycling the device: detach -> re-attach (no snapshot/restore) ===")
+	} else {
+		t.Log("=== cycling the device: detach -> snapshot -> restore -> re-attach ===")
+	}
 
 	// The agent's connection dies with the VMM; production re-dials after restore.
 	_ = agent.Close()
@@ -460,6 +473,33 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 		t.Fatalf("gate still sees a device after a confirmed eject: %v", err)
 	}
 	t.Log("PASS detach: device ejected while the container kept running")
+
+	// The isolating path stops here: same VMM, same guest, straight back in.
+	client2, chCmd2 := client, chCmd
+	if skipSnapshot {
+		for _, d := range devices {
+			if _, err := client.AddDevice(ctx, d.Path); err != nil {
+				t.Fatalf("AddDevice(%s): %v", d.Path, err)
+			}
+		}
+		if err := waitDevicesAttached(ctx, client, len(devices), 60*time.Second); err != nil {
+			t.Fatalf("re-attach: %v", err)
+		}
+		t.Log("PASS re-attach: the VMM holds the device again (no snapshot taken)")
+		agent2, err := dialAgentRetry(ctx, vsock, 60*time.Second)
+		if err != nil {
+			t.Fatalf("re-dialing the agent: %v", err)
+		}
+		t.Cleanup(func() { _ = agent2.Close() })
+		after, _ := readProbeOutput(ctx, t, agent2, cid, 60*time.Second)
+		t.Logf("=== container view after eject+re-attach, NO restore (%d bytes) ===\n%s", len(after), after)
+		if strings.Contains(after, "Tesla") || strings.Contains(after, "UUID") {
+			t.Log("PASS: hot-plug alone is fine -- the restore is what breaks the GPU")
+			return
+		}
+		t.Fatal("the GPU is unusable after a plain eject+re-attach, with no snapshot or " +
+			"restore involved: hot-plug itself is the fault, and the restore is innocent")
+	}
 
 	snapDir := filepath.Join(t.TempDir(), "snapshot")
 	if err := os.MkdirAll(snapDir, 0o700); err != nil {
@@ -489,7 +529,7 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = vfsd2.Process.Kill(); _, _ = vfsd2.Process.Wait() })
 
-	chCmd2, client2, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
+	chCmd2, client2, err = ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
 		Binary: env.chBin, APISocket: kata.CLHSocketPath(id),
 		Stdout: testWriter{t, "clh2"}, Stderr: testWriter{t, "clh2"},
 	})
