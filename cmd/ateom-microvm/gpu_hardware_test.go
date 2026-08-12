@@ -53,7 +53,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -283,26 +282,13 @@ func TestGPUCycleOnHardware(t *testing.T) {
 	// used is spent. Production restarts it on the restore path (stageOverlayLowers
 	// in restoreFullScope) for the same reason; reusing it here made vm.restore
 	// fail with a bare HTTP 500.
-	// Whether it was still alive decides what the earlier HTTP 500 meant: a dead
-	// virtiofsd explains it, a healthy one means the 500 had another cause and
-	// restarting is treating the wrong thing.
-	if err := vfsd.Process.Signal(syscall.Signal(0)); err != nil {
-		t.Logf("virtiofsd had already exited before the restore (%v) -- consistent with it "+
-			"serving a single vhost-user connection", err)
-	} else {
-		t.Log("virtiofsd was STILL ALIVE before the restore; if the restore now succeeds, " +
-			"the earlier 500 was not a spent virtiofsd")
-	}
+	// virtiofsd logs "Client disconnected, shutting down" the moment the first VMM
+	// goes away, so the restore needs a fresh one.
 	_ = vfsd.Process.Kill()
 	_, _ = vfsd.Process.Wait()
-	vfsd2, err := kata.StartVirtiofsd(ctx, kata.VirtiofsdOptions{
-		Binary: env.virtiofsd, SocketPath: kata.VirtiofsdSocketPath(id), SharedDir: sharedDir,
-		Log: testWriter{t, "virtiofsd2"},
-	})
+	vfsd2, err := startVirtiofsdWaitingForLock(ctx, t, env, id, sharedDir)
 	if err != nil {
-		t.Fatalf("restarting virtiofsd for restore: %v\n"+
-			"  its own output is logged above under [virtiofsd2]; an immediate exit with no "+
-			"output usually means the shared dir or socket path is gone", err)
+		t.Fatalf("restarting virtiofsd for restore: %v", err)
 	}
 	t.Cleanup(func() { _ = vfsd2.Process.Kill(); _, _ = vfsd2.Process.Wait() })
 
@@ -361,6 +347,41 @@ func TestGPUCycleOnHardware(t *testing.T) {
 			"claim B needs the container path -- see docs/dev/microvm-gpu-e2e.md step 8")
 	}
 	t.Log("PASS cycle complete: boot -> eject -> snapshot -> restore -> re-attach")
+}
+
+// startVirtiofsdWaitingForLock starts virtiofsd, retrying while the previous one
+// still holds its pid-file lock.
+//
+// virtiofsd flocks <socket-path>.pid, and the lock outlives the exiting process
+// briefly, so an immediate restart fails with EAGAIN. Waiting on our own
+// Process.Wait is not enough: it returns once the child is reaped, which can
+// precede the kernel dropping the flock.
+//
+// Production never meets this. A restore follows a teardown, usually minutes
+// later and often on another worker, so nothing is holding the lock. Only a test
+// that snapshots and restores back-to-back in one process sees it -- so the
+// retry belongs here rather than in StartVirtiofsd.
+func startVirtiofsdWaitingForLock(ctx context.Context, t *testing.T, env hwEnv, id, sharedDir string) (*exec.Cmd, error) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for attempt := 1; ; attempt++ {
+		cmd, err := kata.StartVirtiofsd(ctx, kata.VirtiofsdOptions{
+			Binary: env.virtiofsd, SocketPath: kata.VirtiofsdSocketPath(id), SharedDir: sharedDir,
+			Log: testWriter{t, "virtiofsd2"},
+		})
+		if err == nil {
+			if attempt > 1 {
+				t.Logf("virtiofsd started on attempt %d (waited for the old pid-file lock)", attempt)
+			}
+			return cmd, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("after %d attempts over 30s: %w "+
+				"(check the [virtiofsd2] lines: EAGAIN on the .pid file means the previous "+
+				"instance still holds its flock)", attempt, err)
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 // testWriter routes a subprocess's output into the test log, so a bare HTTP 500
