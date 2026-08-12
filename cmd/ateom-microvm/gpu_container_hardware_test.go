@@ -99,9 +99,44 @@ func main() {
 // rootfs assembled by hand is. CGO_ENABLED=0 removes the question entirely, and
 // a CUDA image is still unnecessary: CDI supplies the driver libraries itself,
 // which is the mechanism under test.
-func stageProbeRootfs(t *testing.T, sharedDir, cid string) string {
+func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probeArgs []string) {
 	t.Helper()
-	rootfs := filepath.Join(sharedDir, cid, "rootfs")
+	rootfs = filepath.Join(sharedDir, cid, "rootfs")
+
+	// A real image rootfs is the better probe when one is available: it has a
+	// libc, so it can run the nvidia-smi and driver libraries CDI mounts in, which
+	// is the actual product assertion rather than a proxy for it. Stage one with
+	// whatever the host has and point ATE_PROBE_ROOTFS at the unpacked directory:
+	//
+	//   sudo ctr -n k8s.io images pull docker.io/library/ubuntu:24.04
+	//   sudo ctr -n k8s.io images mount docker.io/library/ubuntu:24.04 /mnt/ubuntu
+	//   export ATE_PROBE_ROOTFS=/mnt/ubuntu
+	//
+	// or with docker:
+	//
+	//   docker create --name u ubuntu:24.04 && mkdir -p /mnt/ubuntu && \
+	//     docker export u | sudo tar -x -C /mnt/ubuntu
+	//   export ATE_PROBE_ROOTFS=/mnt/ubuntu
+	if img := os.Getenv("ATE_PROBE_ROOTFS"); img != "" {
+		if err := os.MkdirAll(rootfs, 0o755); err != nil {
+			t.Fatalf("mkdir rootfs: %v", err)
+		}
+		// Bind rather than copy: virtiofsd serves files to the guest on demand, so
+		// nothing is duplicated on the host. Production stages its lowers the same
+		// way (ReconstructSharedDirFromImage).
+		if out, err := exec.Command("mount", "--bind", img, rootfs).CombinedOutput(); err != nil {
+			t.Fatalf("binding %s into the shared dir: %v: %s", img, err, out)
+		}
+		t.Cleanup(func() { _ = exec.Command("umount", "-l", rootfs).Run() })
+		t.Logf("probe rootfs: %s (image)", img)
+		// nvidia-smi and libcuda come from CDI's mounts, not from the image.
+		return rootfs, []string{"/bin/sh", "-c",
+			"echo '--- dev ---'; ls -l /dev | grep -i nvidia; " +
+				"echo '--- nvidia-smi ---'; nvidia-smi 2>&1 | head -15; " +
+				"echo '--- PROBE DONE ---'; sleep 600"}
+	}
+
+	t.Log("probe rootfs: static binary (set ATE_PROBE_ROOTFS to use a real image)")
 	for _, d := range []string{"dev", "proc", "sys", "etc", "tmp"} {
 		if err := os.MkdirAll(filepath.Join(rootfs, d), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", d, err)
@@ -124,7 +159,7 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) string {
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("building the static probe: %v: %s", err, out)
 	}
-	return rootfs
+	return rootfs, []string{"/probe"}
 }
 
 // containerSpec is the OCI spec for the probe container: the same shaping
@@ -209,7 +244,7 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 		t.Fatalf("mkdir shared: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sharedDir) })
-	stageProbeRootfs(t, sharedDir, cid)
+	_, probe := stageProbeRootfs(t, sharedDir, cid)
 
 	serialLog := filepath.Join(kata.VMDir(id), "serial.log")
 	vfsd, err := kata.StartVirtiofsd(ctx, kata.VirtiofsdOptions{
@@ -267,7 +302,6 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 
 	// Print what the container can see of the GPU, then idle so the process is
 	// still alive if this is extended across a suspend/resume cycle.
-	probe := []string{"/probe"}
 
 	if err := agent.CreateCarrier(ctx, cid, containerSpec(t, probe)); err != nil {
 		b, _ := os.ReadFile(serialLog)
@@ -310,11 +344,15 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	// A node that exists but will not open is the state a re-attach has to undo,
 	// and it is the difference between CDI having injected something and the
 	// container being able to USE the device.
-	if strings.Contains(out, "open /dev/nvidiactl: OK") {
+	switch {
+	case strings.Contains(out, "NVIDIA-SMI"):
+		t.Log("PASS use: nvidia-smi ran inside the container and saw the GPU")
+	case strings.Contains(out, "open /dev/nvidiactl: OK"):
 		t.Log("PASS open: the container can open the device, so the driver is bound to it")
-	} else {
-		t.Error("the device nodes are present but will not open; CDI injected them and " +
-			"the guest driver is not backing them")
+	default:
+		t.Error("the device nodes are present but unusable: nothing opened them and " +
+			"nvidia-smi did not report a GPU. CDI injected the nodes and the guest " +
+			"driver is not backing them")
 	}
 }
 
