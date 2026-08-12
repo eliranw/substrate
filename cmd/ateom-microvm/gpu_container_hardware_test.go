@@ -134,12 +134,23 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 		}
 		t.Logf("probe rootfs: %s (image)", img)
 		// nvidia-smi and libcuda come from CDI's mounts, not from the image.
-		// Loops rather than reporting once: the same container is asked again after
-		// the suspend/resume cycle, and a process that has already exited cannot
-		// answer. nvidia-smi -L is one line per GPU, so a MARK with no line after it
-		// is the visible failure.
+		// Reports once, goes QUIET, then loops.
+		//
+		// The quiet window exists because the eject failed with the probe polling
+		// nvidia-smi every 3s: the container had opened the GPU and the ACPI eject
+		// never completed. Whether that is a LIVE user or any PRIOR use is the
+		// question, and a window where nothing touches the device separates them.
+		// The detach runs inside it; if the eject succeeds there, a live handle is
+		// the blocker and suspend needs the workload idle, not merely GPU-free.
+		//
+		// It loops afterwards so the same container can still answer claim B once
+		// the device is back.
+		quiet := envOr("ATE_PROBE_QUIET_SECS", "90")
 		return rootfs, []string{"/bin/sh", "-c",
-			"while true; do echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
+			"echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
+				"nvidia-smi -L 2>&1 | head -3; echo '--- PROBE DONE ---'; " +
+				"sleep " + quiet + "; " +
+				"while true; do echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
 				"nvidia-smi -L 2>&1 | head -3; echo '--- PROBE DONE ---'; sleep 3; done"}
 	}
 
@@ -398,7 +409,12 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	}
 	for _, did := range ids {
 		if err := client.WaitDeviceRemoved(ctx, did, chCmd.Process.Pid, 60*time.Second); err != nil {
-			t.Fatalf("WaitDeviceRemoved(%s): %v", did, err)
+			t.Fatalf("WaitDeviceRemoved(%s): %v\n"+
+				"  The VM-only test ejects fine, so what changed is that a container has USED\n"+
+				"  the GPU. If this fails even in the probe's quiet window, then any prior use\n"+
+				"  blocks the eject, not just a live handle -- which means the guest must release\n"+
+				"  the device before a snapshot, and that cannot be done over the debug console\n"+
+				"  on this guest (no shell). Re-opens design 4.2b.", did, err)
 		}
 	}
 	if err := errIfPassthroughSnapshot(ctx, client); err != nil {
