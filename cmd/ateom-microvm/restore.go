@@ -360,7 +360,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// Confirm from inside the actor that the device is usable, now that the
 	// guest is running again and can be asked.
 	if len(passthrough) > 0 {
-		if err := verifyGuestGPU(ctx, actorUID, workloadIDs); err != nil {
+		if err := verifyGuestGPU(ctx, client, actorUID, workloadIDs); err != nil {
 			slog.WarnContext(ctx, "The actor's GPU is not usable after re-attach",
 				slog.String("id", actorUID), slog.Any("err", err))
 		}

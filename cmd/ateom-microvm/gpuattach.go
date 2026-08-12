@@ -43,7 +43,7 @@ const (
 var (
 	waitDeviceGone     = (*ch.Client).WaitDeviceRemoved
 	releasePersistence = clearGPUPersistence
-	verifyGuestGPU     = ensureGuestDriverBound
+	verifyGuestGPU     = ensureActorGPUUsable
 )
 
 // clearGPUPersistence asks the guest to stop holding the GPU, so the eject can
@@ -98,22 +98,18 @@ func clearGPUPersistence(ctx context.Context, actorUID string, containerIDs []st
 	return lastErr
 }
 
-// ensureGuestDriverBound confirms the actor can use its re-attached device, and
-// re-runs the guest driver's probe if it cannot.
+// actorGPUUsable asks the actor whether its GPU works, polling for up to tries
+// seconds because the driver needs a moment to bring the device up after a
+// probe.
 //
-// A guest that is running when a device is hot-added probes it 14ms after
-// assigning its BARs, ahead of the VMM's mapping for those new addresses. The
-// NVIDIA open module reports the resulting read as the GPU lacking a GSP, which
-// looks like an unsupported card rather than an early read, and it does not
-// retry. Attaching while the guest is paused avoids the race, so the common
-// path here is the first line: nvidia-smi already works and nothing else runs.
-//
-// The rebind is the fallback for when it does not. It writes to sysfs, which
-// actors mount read-only, so it only helps a container privileged enough to
-// write it -- hence best-effort, and reported rather than fatal.
-func ensureGuestDriverBound(ctx context.Context, actorUID string, containerIDs []string) error {
+// nvidia-smi is the oracle rather than the presence of /dev/nvidia*: those nodes
+// ride through a snapshot whether or not a driver is behind them, so they are
+// present exactly as often when the GPU is dead. It runs in a container because
+// the guest rootfs has no shell, and CDI mounts nvidia-smi into every GPU
+// container.
+func actorGPUUsable(ctx context.Context, actorUID string, containerIDs []string, tries int) error {
 	if len(containerIDs) == 0 {
-		return fmt.Errorf("no containers to check the driver from")
+		return fmt.Errorf("no containers to check the GPU from")
 	}
 	agent, err := dialAgentRetry(ctx, kata.VsockSocketPath(actorUID), 15*time.Second)
 	if err != nil {
@@ -121,41 +117,95 @@ func ensureGuestDriverBound(ctx context.Context, actorUID string, containerIDs [
 	}
 	defer agent.Close()
 
-	// The guest BDF is not the host's, so the container finds it the only way it
-	// can: by vendor id in sysfs. The driver takes a few seconds to bring the GPU
-	// up after a bind, so the result is polled rather than read once.
-	const script = `nvidia-smi -L >/dev/null 2>&1 && exit 0
-for d in /sys/bus/pci/devices/*/; do
-[ "$(cat "$d/vendor" 2>/dev/null)" = 0x10de ] || continue
-b=$(basename "$d")
-echo "$b" > /sys/bus/pci/drivers/nvidia/unbind 2>/dev/null
-echo "$b" > /sys/bus/pci/drivers/nvidia/bind 2>/dev/null || exit 10
-done
-i=0
-while [ $i -lt 20 ]; do
+	script := fmt.Sprintf(`i=0
+while [ $i -lt %d ]; do
 nvidia-smi -L >/dev/null 2>&1 && exit 0
 i=$((i+1)); sleep 1
 done
-exit 1`
+exit 1`, tries)
 
 	var lastErr error
 	for _, cid := range containerIDs {
 		// A distinct exec id: the container's own id belongs to its init process.
-		code, err := agent.ExecProcess(ctx, cid, cid+"_gpucheck", []string{"/bin/sh", "-c", script})
+		code, err := agent.ExecProcess(ctx, cid, fmt.Sprintf("%s_gpucheck%d", cid, tries), []string{"/bin/sh", "-c", script})
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		switch code {
-		case 0:
-			return nil
-		case 10:
-			lastErr = fmt.Errorf("%s cannot write /sys/bus/pci/drivers/nvidia/bind (sysfs is read-only in an actor)", cid)
-		default:
-			lastErr = fmt.Errorf("the GPU is still unusable in %s after a rebind (exit %d)", cid, code)
+		if code != 0 {
+			lastErr = fmt.Errorf("nvidia-smi found no GPU in %s", cid)
+			continue
 		}
+		return nil
 	}
 	return lastErr
+}
+
+// retriggerHotplug ejects every passthrough device and adds it straight back, so
+// the guest runs its driver probe a second time.
+//
+// The guest's first probe, the one its own hot-plug path runs, fails: it reads
+// the device 14ms after assigning its BARs and the NVIDIA open module reports
+// what comes back as the GPU lacking a GSP, then gives up for good. The device
+// is fine -- config space and the kernel's resource record agree at the new
+// addresses, it answers reads, and a probe seconds later binds the same GPU with
+// the same UUID. So the fix is to make the guest probe again, later.
+//
+// The eject here does not go through detachPassthrough: that path exists to make
+// a snapshot safe and refuses to proceed without confirming the VMM dropped its
+// /dev/vfio fd. Nothing is being snapshotted, the driver never bound so nothing
+// holds the device, and the device tree is enough to know the guest saw it go.
+func retriggerHotplug(ctx context.Context, client *ch.Client) error {
+	devices, err := resolveWorkerDevices()
+	if err != nil {
+		return fmt.Errorf("while resolving worker passthrough devices: %w", err)
+	}
+	ids, err := client.VFIOPassthroughIDs(ctx)
+	if err != nil {
+		return fmt.Errorf("while listing passthrough devices: %w", err)
+	}
+	for _, id := range ids {
+		if err := client.RemoveDevice(ctx, id); err != nil {
+			return fmt.Errorf("while ejecting %s: %w", id, err)
+		}
+	}
+	// Not waitDevicesAttached: that one returns as soon as at least want devices
+	// are present, so asking it for zero is satisfied immediately.
+	end := time.Now().Add(ejectTimeout)
+	for {
+		left, err := client.VFIOPassthroughIDs(ctx)
+		if err == nil && len(left) == 0 {
+			break
+		}
+		if time.Now().After(end) {
+			return fmt.Errorf("the guest did not release %d passthrough device(s) within %s", len(left), ejectTimeout)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	for _, d := range devices {
+		if _, err := client.AddDevice(ctx, d.Path); err != nil {
+			return fmt.Errorf("while re-attaching %s: %w", d.Path, err)
+		}
+	}
+	return waitDevicesAttached(ctx, client, len(devices), attachSettleTimeout)
+}
+
+// ensureActorGPUUsable makes the actor's re-attached GPU usable, or reports why
+// it could not.
+//
+// Checking first keeps the cost off actors that do not need it, and keeps the
+// remedy honest: a re-trigger that runs unconditionally would look like it was
+// doing something even on a resume that never needed it.
+func ensureActorGPUUsable(ctx context.Context, client *ch.Client, actorUID string, containerIDs []string) error {
+	if err := actorGPUUsable(ctx, actorUID, containerIDs, 3); err == nil {
+		return nil
+	}
+	slog.InfoContext(ctx, "The re-attached GPU is not bound yet; re-triggering hot-plug so the guest probes again",
+		slog.String("id", actorUID))
+	if err := retriggerHotplug(ctx, client); err != nil {
+		return fmt.Errorf("while re-triggering hot-plug: %w", err)
+	}
+	return actorGPUUsable(ctx, actorUID, containerIDs, 25)
 }
 
 // vmmPID returns the pid of the cloud-hypervisor process ateom launched for an
