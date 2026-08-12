@@ -93,29 +93,15 @@ func extractField(body, key string) string {
 	return ""
 }
 
-// stubGuestSeams replaces the guest-side and eject steps with recorders.
-func stubGuestSeams(t *testing.T, log *[]string, bdfs []string) {
+// stubEject records the eject confirmations instead of inspecting a live VMM.
+func stubEject(t *testing.T, log *[]string) {
 	t.Helper()
-	oG, oD, oV, oW := guestGPUBDFs, guestDetachGPU, guestVerifyBound, waitDeviceGone
-	guestGPUBDFs = func(ctx context.Context, vsock string) ([]string, error) {
-		*log = append(*log, "scan")
-		return bdfs, nil
-	}
-	guestDetachGPU = func(ctx context.Context, vsock, bdf string) error {
-		*log = append(*log, "unbind:"+bdf)
-		return nil
-	}
-	guestVerifyBound = func(ctx context.Context, vsock, bdf string, d time.Duration) error {
-		*log = append(*log, "verify:"+bdf)
-		return nil
-	}
+	orig := waitDeviceGone
 	waitDeviceGone = func(c *ch.Client, ctx context.Context, id string, pid int, d time.Duration) error {
 		*log = append(*log, "wait:"+id)
 		return nil
 	}
-	t.Cleanup(func() {
-		guestGPUBDFs, guestDetachGPU, guestVerifyBound, waitDeviceGone = oG, oD, oV, oW
-	})
+	t.Cleanup(func() { waitDeviceGone = orig })
 }
 
 // liveActor returns a runningActor whose chCmd is a real, running process, so
@@ -130,20 +116,19 @@ func liveActor(t *testing.T) *runningActor {
 	return &runningActor{chCmd: cmd}
 }
 
-// The ordering is the correctness argument: the guest must release the device
-// before the VMM ejects it, because nothing quiesces a bus-mastering device and
-// ejecting one the driver still owns leaves it free to DMA into guest RAM while
-// the memory image is written.
-func TestDetachUnbindsInGuestBeforeEjecting(t *testing.T) {
+// The eject is the unbind: clh raises an ACPI eject and the guest kernel calls
+// the bound driver's .remove(). Nothing is asked of the guest, which could not
+// answer anyway -- NVIDIA's rootfs has no shell.
+func TestDetachEjectsWithoutAskingTheGuest(t *testing.T) {
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio2":{},"_net0":{}}}`)
-	stubGuestSeams(t, &log, []string{"0000:00:02.0"})
+	stubEject(t, &log)
 
 	s := &AteomService{}
 	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1"); err != nil {
 		t.Fatalf("detachPassthrough: %v", err)
 	}
-	want := []string{"scan", "unbind:0000:00:02.0", "remove:_vfio2", "wait:_vfio2"}
+	want := []string{"remove:_vfio2", "wait:_vfio2"}
 	if fmt.Sprint(log) != fmt.Sprint(want) {
 		t.Errorf("call order = %v, want %v", log, want)
 	}
@@ -155,7 +140,7 @@ func TestDetachUnbindsInGuestBeforeEjecting(t *testing.T) {
 func TestDetachRequestsAllEjectsBeforeWaiting(t *testing.T) {
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio2":{},"_vfio3":{}}}`)
-	stubGuestSeams(t, &log, []string{"0000:00:02.0", "0000:00:03.0"})
+	stubEject(t, &log)
 
 	s := &AteomService{}
 	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1"); err != nil {
@@ -180,14 +165,14 @@ func TestDetachRequestsAllEjectsBeforeWaiting(t *testing.T) {
 func TestDetachIsANoOpWithoutPassthrough(t *testing.T) {
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{"_net0":{},"__rng":{}}}`)
-	stubGuestSeams(t, &log, []string{"0000:00:02.0"})
+	stubEject(t, &log)
 
 	s := &AteomService{}
 	if err := s.detachPassthrough(context.Background(), c, nil, "actor-1"); err != nil {
 		t.Fatalf("detachPassthrough on a device-free VM: %v", err)
 	}
 	if len(log) != 0 {
-		t.Errorf("expected no guest or VMM calls, got %v", log)
+		t.Errorf("expected no VMM calls, got %v", log)
 	}
 }
 
@@ -197,7 +182,7 @@ func TestDetachIsANoOpWithoutPassthrough(t *testing.T) {
 func TestDetachRefusesWhenTheEjectCannotBeConfirmed(t *testing.T) {
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio2":{}}}`)
-	stubGuestSeams(t, &log, []string{"0000:00:02.0"})
+	stubEject(t, &log)
 
 	s := &AteomService{}
 	err := s.detachPassthrough(context.Background(), c, nil, "actor-1") // nil ra -> pid 0
@@ -211,42 +196,51 @@ func TestDetachRefusesWhenTheEjectCannotBeConfirmed(t *testing.T) {
 	}
 }
 
-// A guest that will not release the device must stop the detach before the
-// eject, not after: ejecting a device the driver still owns is the exact state
-// the guest step exists to prevent.
-func TestDetachStopsWhenTheGuestWillNotRelease(t *testing.T) {
-	var log []string
-	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio2":{}}}`)
-	stubGuestSeams(t, &log, []string{"0000:00:02.0"})
-	guestDetachGPU = func(ctx context.Context, vsock, bdf string) error {
-		log = append(log, "unbind-failed")
-		return fmt.Errorf("still bound")
-	}
-
-	s := &AteomService{}
-	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1"); err == nil {
-		t.Fatal("expected the detach to fail when the guest will not release")
-	}
-	for _, e := range log {
-		if strings.HasPrefix(e, "remove:") {
-			t.Errorf("must not eject a device the guest still owns: %v", log)
-		}
-	}
-}
-
-func TestAttachAddsThenVerifiesEachDeviceBound(t *testing.T) {
+func TestAttachAddsEachAllocatedDevice(t *testing.T) {
 	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
 	var log []string
-	c := startRecordingCH(t, &log, `{"device_tree":{}}`)
-	stubGuestSeams(t, &log, []string{"0000:00:02.0"})
+	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio9":{}}}`)
 
 	s := &AteomService{}
 	if err := s.attachPassthrough(context.Background(), c, "actor-1"); err != nil {
 		t.Fatalf("attachPassthrough: %v", err)
 	}
-	want := []string{"add:/sys/bus/pci/devices/0000:da:00.0/", "scan", "verify:0000:00:02.0"}
+	want := []string{"add:/sys/bus/pci/devices/0000:da:00.0/"}
 	if fmt.Sprint(log) != fmt.Sprint(want) {
 		t.Errorf("call order = %v, want %v", log, want)
+	}
+}
+
+// Attach must not report success on a device the VMM never took: the actor
+// would come back believing it has a GPU it cannot use.
+//
+// Exercised through waitDevicesAttached rather than attachPassthrough so the
+// deadline can be short -- going through attachPassthrough would burn the real
+// 30s settle timeout to assert a timeout.
+func TestWaitDevicesAttachedFailsWhenTheDeviceDoesNotComeBack(t *testing.T) {
+	var log []string
+	c := startRecordingCH(t, &log, `{"device_tree":{"_net0":{}}}`) // no _vfio entry
+
+	err := waitDevicesAttached(context.Background(), c, 1, 300*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected an error when the device never appears in the device tree")
+	}
+	if !strings.Contains(err.Error(), "0 of 1") {
+		t.Errorf("error should report the shortfall, got %q", err)
+	}
+}
+
+// An unreadable device tree must not read as "it came back".
+func TestWaitDevicesAttachedFailsOnAnUnreadableTree(t *testing.T) {
+	var log []string
+	c := startRecordingCH(t, &log, `{"config":{}}`) // no device_tree
+
+	err := waitDevicesAttached(context.Background(), c, 1, 300*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected an error when the device tree cannot be read")
+	}
+	if !strings.Contains(err.Error(), "could not confirm") {
+		t.Errorf("error should name the unreadable tree, got %q", err)
 	}
 }
 
@@ -254,7 +248,6 @@ func TestAttachAddsThenVerifiesEachDeviceBound(t *testing.T) {
 func TestAttachIsANoOpWithoutAnAllocation(t *testing.T) {
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{}}`)
-	stubGuestSeams(t, &log, []string{"0000:00:02.0"})
 
 	s := &AteomService{}
 	if err := s.attachPassthrough(context.Background(), c, "actor-1"); err != nil {
@@ -262,46 +255,5 @@ func TestAttachIsANoOpWithoutAnAllocation(t *testing.T) {
 	}
 	if len(log) != 0 {
 		t.Errorf("expected no calls, got %v", log)
-	}
-}
-
-// Hot-plug is asynchronous, so a short first read is expected rather than a
-// failure -- binding only the devices that appeared first would silently leave
-// the rest unusable.
-func TestWaitGuestGPUsPollsUntilAllAppear(t *testing.T) {
-	orig := guestGPUBDFs
-	t.Cleanup(func() { guestGPUBDFs = orig })
-	calls := 0
-	guestGPUBDFs = func(ctx context.Context, vsock string) ([]string, error) {
-		calls++
-		switch calls {
-		case 1:
-			return nil, nil // guest has not processed the hot-plug yet
-		case 2:
-			return []string{"0000:00:02.0"}, nil // only one of two so far
-		}
-		return []string{"0000:00:02.0", "0000:00:03.0"}, nil
-	}
-	got, err := waitGuestGPUs(context.Background(), "/tmp/vsock", 2, 3*time.Second)
-	if err != nil {
-		t.Fatalf("waitGuestGPUs: %v", err)
-	}
-	if len(got) != 2 {
-		t.Errorf("got %v, want both devices", got)
-	}
-}
-
-func TestWaitGuestGPUsReportsAShortfallOnTimeout(t *testing.T) {
-	orig := guestGPUBDFs
-	t.Cleanup(func() { guestGPUBDFs = orig })
-	guestGPUBDFs = func(ctx context.Context, vsock string) ([]string, error) {
-		return []string{"0000:00:02.0"}, nil
-	}
-	_, err := waitGuestGPUs(context.Background(), "/tmp/vsock", 2, 300*time.Millisecond)
-	if err == nil {
-		t.Fatal("expected a timeout when only one of two devices appears")
-	}
-	if !strings.Contains(err.Error(), "1 of 2") {
-		t.Errorf("error should report the shortfall, got %q", err)
 	}
 }

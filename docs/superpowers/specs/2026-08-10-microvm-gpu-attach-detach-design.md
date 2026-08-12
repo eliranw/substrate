@@ -198,6 +198,35 @@ occurs with a VFIO device attached.
 2. **Quiesce before eject.** The actor must be idle and `nvidia-persistenced` stopped.
    This keeps us in the regime validated in §3.
 
+### 4.2b Correction from hardware: no guest-side step, and no eager-restore option
+
+Proven on a T4 (`cmd/ateom-microvm/gpu_hardware_test.go`, `-tags gpuhw`). Three
+things the design got wrong:
+
+- **The guest-side detach was impossible.** NVIDIA's guest rootfs contains
+  `/bin/busybox` and no `/bin/sh` or `/bin/bash`, with `/init` pointing straight
+  at NVRC. kata-agent's debug console spawns bash then sh, so it accepts the
+  connection and dies — no command can run in that guest at all. No agent RPC
+  fills the gap either: `ExecProcess` is container-scoped, `CopyFile` only writes
+  host→guest.
+- **It was also unnecessary.** The eject IS the unbind: `vm.remove-device`
+  raises an ACPI eject and the guest kernel runs
+  `pci_stop_and_remove_bus_device`, which calls the bound driver's `.remove()`.
+  The full cycle completes with ateom asking the guest nothing, and
+  `nvidia-persistenced` did not block it. C3 and C4 are therefore deleted, not
+  deferred.
+- **A restored actor must load its memory EAGERLY.** Re-attaching a VFIO device
+  maps guest memory into the IOMMU, which requires pinning it; under `OnDemand`
+  restore the pages are demand-paged through userfaultfd, cannot be pinned, and
+  `vm.add-device` fails with `VfioDmaMap(IommuDmaMap(Error(14)))` — EFAULT. QEMU
+  has the same incompatibility between postcopy and VFIO. `restoreFullScope` now
+  picks `Copy` when the worker holds a passthrough device, which costs the ~75ms
+  restore and the sparse memfd that `OnDemand` was buying.
+
+What this does NOT settle is §4.3 below: whether a CONTAINER can use the device
+after the cycle. That is only observable from inside a container, and the guest
+cannot be asked.
+
 ### 4.3 Injection — one-time, at container creation
 
 Booting with the GPU (D7) collapses the *timing* half of this problem: the container is
@@ -503,8 +532,8 @@ assumption into a guarded fast path at negligible cost.
 |---|---|---|---|
 | C1 | `ch.AddDevice` / `ch.RemoveDevice` | `internal/ch/` | `vm.add-device` (returns `{id,bdf}` — capture it), `vm.remove-device` |
 | C2 | Eject completion oracle | `internal/ch/` | `device-removed` event + group-fd check on the real clh PID, with deadline; fail loudly, never silently |
-| C3 | Guest detach | `internal/kata/` | verify no holders (no `nvidia-persistenced` by D9; no live CUDA client); unbind; confirm via **absence** of `/sys/bus/pci/devices/<BDF>/driver` |
-| C4 | Guest attach/bring-up | `internal/kata/` | after `add-device`: **verify the driver re-bound** by polling for `/sys/bus/pci/devices/<BDF>/driver`, and explicitly `echo <BDF> > /sys/bus/pci/drivers/nvidia/bind` if it has not within a deadline. PCI rescan if the device did not enumerate. First boot only: the `nvidia-ctk` bring-up commands |
+| ~~C3~~ | ~~Guest detach~~ — DELETED (§4.2b): impossible on this guest and unnecessary | `internal/kata/` | verify no holders (no `nvidia-persistenced` by D9; no live CUDA client); unbind; confirm via **absence** of `/sys/bus/pci/devices/<BDF>/driver` |
+| ~~C4~~ | ~~Guest attach/bring-up~~ — DELETED (§4.2b): the PCI core rebinds; verified at the VMM | `internal/kata/` | after `add-device`: **verify the driver re-bound** by polling for `/sys/bus/pci/devices/<BDF>/driver`, and explicitly `echo <BDF> > /sys/bus/pci/drivers/nvidia/bind` if it has not within a deadline. PCI rescan if the device did not enumerate. First boot only: the `nvidia-ctk` bring-up commands |
 | C5 | container device injection at **create** | `internal/kata/`, `spec.go` | **Required** (§4.3 correction): no CDI injector exists in ateom-microvm and the device cgroup denies NVIDIA majors. Must supply libraries + `/dev/nvidia*` + a widened cgroup. §12 step 5 decides only whether injection must ALSO be repeated after re-attach (`mknod` into `/proc/<pid>/root/dev/` + `UpdateContainer`) |
 | C6 | Attach/detach orchestration | `run.go`, `restore.go`, `checkpoint.go` | sequence the above at the right lifecycle points |
 

@@ -23,34 +23,21 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
-	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 )
 
 const (
 	// ejectTimeout bounds the wait for the guest to complete an ACPI eject.
 	// vm.remove-device only REQUESTS the eject; the guest runs it.
 	ejectTimeout = 30 * time.Second
-	// bindTimeout bounds the wait for the guest driver to claim a re-attached
-	// device, including the explicit bind GuestVerifyGPUBound falls back to.
-	bindTimeout = 30 * time.Second
-	// enumerateTimeout bounds the wait for a freshly attached device to appear on
-	// the guest PCI bus at all. Hot-plug is asynchronous: vm.add-device returns as
-	// soon as the VMM has wired the device up, before the guest has processed the
-	// hot-plug event, so the first look can legitimately find nothing.
-	enumerateTimeout = 30 * time.Second
+	// attachSettleTimeout bounds the wait for a re-attached device to reappear in
+	// the VMM's device tree. Hot-plug is asynchronous: vm.add-device returns once
+	// the VMM has wired the device up, before the guest has processed the event.
+	attachSettleTimeout = 30 * time.Second
 )
 
-// Seams for the guest and eject steps, so the ORDER this file imposes can be
-// tested without a live guest or a VMM-shaped /proc. The sequencing is the part
-// that carries the correctness argument -- the steps themselves are covered in
-// internal/kata and internal/ch -- and it is invisible to any test that cannot
-// observe the calls interleave.
-var (
-	guestGPUBDFs     = kata.GuestGPUBDFs
-	guestDetachGPU   = kata.GuestDetachGPU
-	guestVerifyBound = kata.GuestVerifyGPUBound
-	waitDeviceGone   = (*ch.Client).WaitDeviceRemoved
-)
+// waitDeviceGone is a seam so the detach ORDER can be tested without a
+// VMM-shaped /proc. The step itself is covered in internal/ch.
+var waitDeviceGone = (*ch.Client).WaitDeviceRemoved
 
 // vmmPID returns the pid of the cloud-hypervisor process ateom launched for an
 // actor, or 0 when it is not known (ra lost across an ateom restart).
@@ -67,18 +54,17 @@ func vmmPID(ra *runningActor) int {
 
 // detachPassthrough releases every passthrough device before a snapshot.
 //
-// Order is the whole point. The guest must let go first: cloud-hypervisor's
-// VfioPciDevice has an empty Pausable impl, so nothing downstream ever quiesces
-// a bus-mastering device, and ejecting one that the guest driver still owns
-// leaves it free to DMA into guest RAM while the memory image is written.
+// The eject IS the unbind. clh's vm.remove-device raises an ACPI eject, and the
+// guest kernel's hotplug path runs pci_stop_and_remove_bus_device, which calls
+// the bound driver's .remove(). An earlier design had ateom stop
+// nvidia-persistenced and unbind the driver over the guest debug console first;
+// that was both impossible and unnecessary. Impossible because NVIDIA's guest
+// rootfs has no shell at all -- only /bin/busybox, with /init pointing straight
+// at NVRC -- so kata-agent's console cannot spawn one and no command can run in
+// the guest. Unnecessary because the eject completes anyway, verified on a T4.
 //
-//  1. guest — stop nvidia-persistenced and unbind the driver, so the device has
-//     no owner and stops mastering.
-//  2. VMM — request the eject for every device, THEN wait for all of them. The
-//     requests are issued up front on purpose: waiting for each in turn would
-//     serialise ejects that the guest can process concurrently.
-//  3. confirm — WaitDeviceRemoved, which trusts observed state rather than the
-//     204 that vm.remove-device returns (that means "requested", not "gone").
+// Ejects are requested for every device before any is awaited, so the guest can
+// process them concurrently rather than one round-trip at a time.
 //
 // Returns without doing anything when the VM holds no passthrough device, so it
 // is safe to call unconditionally.
@@ -99,17 +85,6 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 	}
 
 	tDetach := time.Now()
-	vsockPath := kata.VsockSocketPath(actorUID)
-	bdfs, err := guestGPUBDFs(ctx, vsockPath)
-	if err != nil {
-		return fmt.Errorf("while listing guest GPUs: %w", err)
-	}
-	for _, bdf := range bdfs {
-		if err := guestDetachGPU(ctx, vsockPath, bdf); err != nil {
-			return fmt.Errorf("while releasing guest GPU %s: %w", bdf, err)
-		}
-	}
-
 	for _, id := range ids {
 		if err := client.RemoveDevice(ctx, id); err != nil {
 			return fmt.Errorf("while requesting eject of %s: %w", id, err)
@@ -123,22 +98,21 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 
 	slog.InfoContext(ctx, "Detached passthrough devices for snapshot",
 		slog.String("id", actorUID), slog.Int("devices", len(ids)),
-		slog.Any("guest_bdfs", bdfs), slog.Duration("took", time.Since(tDetach)))
+		slog.Duration("took", time.Since(tDetach)))
 	return nil
 }
 
 // attachPassthrough gives the actor its passthrough device(s) back after a
-// restore, and does not return until the guest driver has actually claimed them.
+// restore.
 //
 // The devices come from the worker's own allocation rather than from anything in
 // the snapshot: the snapshot was deliberately taken with none attached, and the
 // actor may well be resuming on a different worker with different host BDFs.
 //
-// Verifying the bind is not ceremony. A container's /dev/nvidia* nodes survive
-// the cycle in guest RAM, so they exist again the moment the memory image is
-// restored — but they are just (major, minor) pairs, and they only start working
-// once the driver rebinds. Returning early would hand the actor device nodes
-// that fail on open.
+// The device reappearing in the VMM's device tree is as far as ateom can verify
+// from the host. Whether the guest driver rebound, and whether the container's
+// /dev/nvidia* work again, is only observable from inside the container -- the
+// guest itself cannot be asked, having no shell.
 func (s *AteomService) attachPassthrough(ctx context.Context, client *ch.Client, actorUID string) error {
 	devices, err := resolveWorkerDevices()
 	if err != nil {
@@ -154,50 +128,33 @@ func (s *AteomService) attachPassthrough(ctx context.Context, client *ch.Client,
 			return fmt.Errorf("while attaching %s: %w", d.Path, err)
 		}
 	}
-
-	// Guest BDFs are assigned by the VMM and are not the host's, so they have to
-	// be read back after the attach rather than carried over.
-	vsockPath := kata.VsockSocketPath(actorUID)
-	bdfs, err := waitGuestGPUs(ctx, vsockPath, len(devices), enumerateTimeout)
-	if err != nil {
+	if err := waitDevicesAttached(ctx, client, len(devices), attachSettleTimeout); err != nil {
 		return err
-	}
-	for _, bdf := range bdfs {
-		if err := guestVerifyBound(ctx, vsockPath, bdf, bindTimeout); err != nil {
-			return fmt.Errorf("while waiting for guest GPU %s to bind: %w", bdf, err)
-		}
 	}
 
 	slog.InfoContext(ctx, "Re-attached passthrough devices after restore",
 		slog.String("id", actorUID), slog.Int("devices", len(devices)),
-		slog.Any("guest_bdfs", bdfs), slog.Duration("took", time.Since(tAttach)))
+		slog.Duration("took", time.Since(tAttach)))
 	return nil
 }
 
-// waitGuestGPUs polls until the guest has enumerated want devices.
-//
-// Hot-plug is asynchronous — vm.add-device returns once the VMM has wired the
-// device up, which is before the guest has handled the event — so an empty or
-// short first read is expected rather than a failure. Waiting for the full count
-// avoids binding only the devices that happened to appear first.
-func waitGuestGPUs(ctx context.Context, vsockPath string, want int, deadline time.Duration) ([]string, error) {
+// waitDevicesAttached polls until the VMM's device tree holds want devices.
+func waitDevicesAttached(ctx context.Context, client *ch.Client, want int, deadline time.Duration) error {
 	end := time.Now().Add(deadline)
 	for {
-		bdfs, err := guestGPUBDFs(ctx, vsockPath)
-		// A scan error means we could not ask the guest at all; keep trying until
-		// the deadline, since the agent may still be coming back after the restore.
-		if err == nil && len(bdfs) >= want {
-			return bdfs, nil
+		ids, err := client.VFIOPassthroughIDs(ctx)
+		if err == nil && len(ids) >= want {
+			return nil
 		}
 		if time.Now().After(end) {
 			if err != nil {
-				return nil, fmt.Errorf("guest never reported its GPUs within %s: %w", deadline, err)
+				return fmt.Errorf("could not confirm the re-attached devices within %s: %w", deadline, err)
 			}
-			return nil, fmt.Errorf("guest enumerated %d of %d passthrough device(s) within %s", len(bdfs), want, deadline)
+			return fmt.Errorf("only %d of %d passthrough device(s) came back within %s", len(ids), want, deadline)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
