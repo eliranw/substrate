@@ -504,10 +504,16 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 
 	// Quiesce exactly as production does. nvidia-persistenced keeps the device
 	// open for as long as it runs, and the driver's removal path spins on
-	// usage_count, so an eject requested without this never completes. Skipping
-	// it here would make the test fail on a path production does not take.
-	if err := clearGPUPersistence(ctx, id, []string{cid}); err != nil {
-		t.Fatalf("clearGPUPersistence: %v", err)
+	// usage_count, so an eject requested without this never completes.
+	//
+	// Best-effort, like detachPassthrough: it needs nvidia-smi on the container's
+	// PATH, which only a rootfs with a dynamic loader has (CDI mounts the binary
+	// in, it does not static-link it). The hand-assembled probe rootfs has
+	// neither, so this fails there with exit 127 and the eject below is what
+	// reports the consequence.
+	persistErr := clearGPUPersistence(ctx, id, []string{cid})
+	if persistErr != nil {
+		t.Logf("could not clear GPU persistence: %v", persistErr)
 	}
 
 	// The agent's connection dies with the VMM; production re-dials after restore.
@@ -524,11 +530,18 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	}
 	for _, did := range ids {
 		if err := client.WaitDeviceRemoved(ctx, did, chCmd.Process.Pid, 60*time.Second); err != nil {
-			t.Fatalf("WaitDeviceRemoved(%s): %v\n"+
-				"  Persistence was cleared above, so the usual holder is already gone. What\n"+
-				"  remains is a live handle on the device: a process in the container with\n"+
-				"  /dev/nvidia* still open keeps usage_count non-zero and the driver's removal\n"+
-				"  path spins until it drops. Suspend expects an idle GPU.", did, err)
+			hint := "  Persistence was cleared, so the usual holder is gone. What remains is a\n" +
+				"  live handle: a process in the container with /dev/nvidia* still open keeps\n" +
+				"  usage_count non-zero and the driver's removal path spins until it drops.\n" +
+				"  Suspend expects an idle GPU."
+			if persistErr != nil {
+				hint = "  Persistence was NOT cleared -- see the log line above. nvidia-persistenced\n" +
+					"  holds the device from boot, so this eject cannot complete. Point\n" +
+					"  ATE_PROBE_ROOTFS at a real image rootfs so nvidia-smi can run; the\n" +
+					"  hand-assembled one has no dynamic loader. This is a limitation of the\n" +
+					"  probe, not of the detach path."
+			}
+			t.Fatalf("WaitDeviceRemoved(%s): %v\n%s", did, err, hint)
 		}
 	}
 	if err := errIfPassthroughSnapshot(ctx, client); err != nil {
