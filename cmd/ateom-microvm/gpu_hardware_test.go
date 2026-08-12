@@ -168,7 +168,10 @@ func TestGPUCycleOnHardware(t *testing.T) {
 	t.Cleanup(func() { _ = vfsd.Process.Kill(); _, _ = vfsd.Process.Wait() })
 
 	apiSocket := kata.CLHSocketPath(id)
-	chCmd, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{Binary: env.chBin, APISocket: apiSocket})
+	chCmd, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
+		Binary: env.chBin, APISocket: apiSocket,
+		Stdout: testWriter{t, "clh"}, Stderr: testWriter{t, "clh"},
+	})
 	if err != nil {
 		t.Fatalf("LaunchVMM: %v", err)
 	}
@@ -274,7 +277,24 @@ func TestGPUCycleOnHardware(t *testing.T) {
 	_, _ = chCmd.Process.Wait()
 	t.Log("PASS snapshot: taken with no device attached")
 
-	chCmd2, client2, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{Binary: env.chBin, APISocket: apiSocket})
+	// virtiofsd serves exactly one vhost-user connection, so the one the first VMM
+	// used is spent. Production restarts it on the restore path (stageOverlayLowers
+	// in restoreFullScope) for the same reason; reusing it here made vm.restore
+	// fail with a bare HTTP 500.
+	_ = vfsd.Process.Kill()
+	_, _ = vfsd.Process.Wait()
+	vfsd2, err := kata.StartVirtiofsd(ctx, kata.VirtiofsdOptions{
+		Binary: env.virtiofsd, SocketPath: kata.VirtiofsdSocketPath(id), SharedDir: sharedDir,
+	})
+	if err != nil {
+		t.Fatalf("restarting virtiofsd for restore: %v", err)
+	}
+	t.Cleanup(func() { _ = vfsd2.Process.Kill(); _, _ = vfsd2.Process.Wait() })
+
+	chCmd2, client2, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
+		Binary: env.chBin, APISocket: apiSocket,
+		Stdout: testWriter{t, "clh2"}, Stderr: testWriter{t, "clh2"},
+	})
 	if err != nil {
 		t.Fatalf("relaunch VMM: %v", err)
 	}
@@ -283,9 +303,9 @@ func TestGPUCycleOnHardware(t *testing.T) {
 		t.Fatalf("WaitReady after relaunch: %v", err)
 	}
 	// No net FDs: this VM has no virtio-net (production adds one separately from
-	// the tap). "Copy" rather than the production "OnDemand" so the restored guest
-	// does not keep demand-paging from a directory the test is about to remove.
-	if err := client2.RestoreWithNetFDs(ctx, snapDir, nil, "Copy"); err != nil {
+	// the tap). OnDemand matches production; snapDir outlives the VM because the
+	// VMM is killed by a cleanup registered after the one that removes the dir.
+	if err := client2.RestoreWithNetFDs(ctx, snapDir, nil, "OnDemand"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	if err := client2.Resume(ctx); err != nil {
@@ -326,6 +346,18 @@ func TestGPUCycleOnHardware(t *testing.T) {
 			"claim B needs the container path -- see docs/dev/microvm-gpu-e2e.md step 8")
 	}
 	t.Log("PASS cycle complete: boot -> eject -> snapshot -> restore -> re-attach")
+}
+
+// testWriter routes a subprocess's output into the test log, so a bare HTTP 500
+// from the VMM arrives with the reason it printed alongside it.
+type testWriter struct {
+	t   *testing.T
+	tag string
+}
+
+func (w testWriter) Write(p []byte) (int, error) {
+	w.t.Logf("[%s] %s", w.tag, strings.TrimRight(string(p), "\n"))
+	return len(p), nil
 }
 
 func oneLineHW(s string) string { return strings.Join(strings.Fields(s), " ") }
