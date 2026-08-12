@@ -87,8 +87,8 @@ cp -f "$image" "${OUT}/rootfs-gpu.img"
 # than written here, so they track the release:
 #   rootfs_type   the guest image's filesystem (erofs, vs ext4 for the stock
 #                 guest) -- it decides root=/rootflags=/rootfstype=.
-#   kernel_params pci=realloc pci=nocrs pci=assign-busses, which is BAR
-#                 reallocation and bus reassignment for the passed-through GPU.
+#   kernel_params the PCI options the passed-through GPU needs, minus pci=nocrs
+#                 (see below), which breaks hot-plug under a VMM.
 # Sizing comes from the clh config, since that is hypervisor state, not guest.
 DEFAULTS="kata/opt/kata/share/defaults/kata-containers"
 tomlval() { sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" | head -1; }
