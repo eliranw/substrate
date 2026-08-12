@@ -295,3 +295,36 @@ func (r *StreamReader) Read(p []byte) (int, error) {
 	n := copy(p, data)
 	return n, nil
 }
+
+// ExecProcess runs a command inside an existing container and waits for it to
+// exit, returning its exit code.
+//
+// This is the only way to run anything inside the guest at all: NVIDIA's guest
+// rootfs has no shell (/bin/busybox only, /init -> NVRC), so the kata debug
+// console cannot spawn one, and the agent's other RPCs are container-scoped or
+// host-to-guest. Whatever needs doing in the guest has to borrow a container's
+// userspace.
+//
+// execID must be unique within the container; reusing the container's own id
+// collides with its init process.
+func (a *AgentClient) ExecProcess(ctx context.Context, containerID, execID string, args []string) (int32, error) {
+	req := &agentpb.ExecProcessRequest{
+		ContainerId: containerID,
+		ExecId:      execID,
+		Process: &agentpb.Process{
+			Args: args,
+			Cwd:  "/",
+			User: &agentpb.User{UID: 0, GID: 0},
+			Env:  []string{"PATH=/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+		},
+	}
+	if err := a.client.Call(ctx, "grpc.AgentService", "ExecProcess", req, &emptypb.Empty{}); err != nil {
+		return 0, fmt.Errorf("agent ExecProcess %v: %w", args, err)
+	}
+	resp := &agentpb.WaitProcessResponse{}
+	wreq := &agentpb.WaitProcessRequest{ContainerId: containerID, ExecId: execID}
+	if err := a.client.Call(ctx, "grpc.AgentService", "WaitProcess", wreq, resp); err != nil {
+		return 0, fmt.Errorf("agent WaitProcess %s/%s: %w", containerID, execID, err)
+	}
+	return resp.GetStatus(), nil
+}

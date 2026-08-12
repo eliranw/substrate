@@ -93,9 +93,16 @@ func extractField(body, key string) string {
 	return ""
 }
 
-// stubEject records the eject confirmations instead of inspecting a live VMM.
+// stubEject records the eject confirmations and the persistence release instead
+// of inspecting a live VMM or dialing a guest.
 func stubEject(t *testing.T, log *[]string) {
 	t.Helper()
+	origRelease := releasePersistence
+	releasePersistence = func(ctx context.Context, actorUID string, cids []string) error {
+		*log = append(*log, "persistence-off:"+strings.Join(cids, ","))
+		return nil
+	}
+	t.Cleanup(func() { releasePersistence = origRelease })
 	orig := waitDeviceGone
 	waitDeviceGone = func(c *ch.Client, ctx context.Context, id string, pid int, d time.Duration) error {
 		*log = append(*log, "wait:"+id)
@@ -116,19 +123,20 @@ func liveActor(t *testing.T) *runningActor {
 	return &runningActor{chCmd: cmd}
 }
 
-// The eject is the unbind: clh raises an ACPI eject and the guest kernel calls
-// the bound driver's .remove(). Nothing is asked of the guest, which could not
-// answer anyway -- NVIDIA's rootfs has no shell.
-func TestDetachEjectsWithoutAskingTheGuest(t *testing.T) {
+// The guest must release the device BEFORE the eject is requested.
+// nvidia-persistenced holds it open from boot, and the driver's PCI remove
+// callback then spins waiting for that refcount, so an eject requested first
+// simply blocks until the timeout.
+func TestDetachClearsPersistenceBeforeEjecting(t *testing.T) {
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio2":{},"_net0":{}}}`)
 	stubEject(t, &log)
 
 	s := &AteomService{}
-	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1"); err != nil {
+	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1", []string{"ctr_ovl"}); err != nil {
 		t.Fatalf("detachPassthrough: %v", err)
 	}
-	want := []string{"remove:_vfio2", "wait:_vfio2"}
+	want := []string{"persistence-off:ctr_ovl", "remove:_vfio2", "wait:_vfio2"}
 	if fmt.Sprint(log) != fmt.Sprint(want) {
 		t.Errorf("call order = %v, want %v", log, want)
 	}
@@ -143,7 +151,7 @@ func TestDetachRequestsAllEjectsBeforeWaiting(t *testing.T) {
 	stubEject(t, &log)
 
 	s := &AteomService{}
-	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1"); err != nil {
+	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1", []string{"ctr_ovl"}); err != nil {
 		t.Fatalf("detachPassthrough: %v", err)
 	}
 	lastRemove, firstWait := -1, len(log)
@@ -168,7 +176,7 @@ func TestDetachIsANoOpWithoutPassthrough(t *testing.T) {
 	stubEject(t, &log)
 
 	s := &AteomService{}
-	if err := s.detachPassthrough(context.Background(), c, nil, "actor-1"); err != nil {
+	if err := s.detachPassthrough(context.Background(), c, nil, "actor-1", []string{"ctr_ovl"}); err != nil {
 		t.Fatalf("detachPassthrough on a device-free VM: %v", err)
 	}
 	if len(log) != 0 {
@@ -185,7 +193,7 @@ func TestDetachRefusesWhenTheEjectCannotBeConfirmed(t *testing.T) {
 	stubEject(t, &log)
 
 	s := &AteomService{}
-	err := s.detachPassthrough(context.Background(), c, nil, "actor-1") // nil ra -> pid 0
+	err := s.detachPassthrough(context.Background(), c, nil, "actor-1", []string{"ctr_ovl"}) // nil ra -> pid 0
 	if err == nil {
 		t.Fatal("expected a refusal when the cloud-hypervisor pid is unknown")
 	}
@@ -193,6 +201,26 @@ func TestDetachRefusesWhenTheEjectCannotBeConfirmed(t *testing.T) {
 		if strings.HasPrefix(e, "remove:") {
 			t.Errorf("must not request an eject it cannot confirm: %v", log)
 		}
+	}
+}
+
+// Clearing persistence is best-effort: a workload that removed nvidia-smi from
+// its image cannot be helped, and failing the suspend then would be worse than
+// letting the eject report the real state a moment later.
+func TestDetachProceedsWhenPersistenceCannotBeCleared(t *testing.T) {
+	var log []string
+	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio2":{}}}`)
+	stubEject(t, &log)
+	releasePersistence = func(ctx context.Context, actorUID string, cids []string) error {
+		return fmt.Errorf("nvidia-smi: not found")
+	}
+
+	s := &AteomService{}
+	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1", []string{"ctr_ovl"}); err != nil {
+		t.Fatalf("a failed persistence clear must not abort the detach: %v", err)
+	}
+	if fmt.Sprint(log) != fmt.Sprint([]string{"remove:_vfio2", "wait:_vfio2"}) {
+		t.Errorf("the eject should still have been attempted, got %v", log)
 	}
 }
 

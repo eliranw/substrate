@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 )
 
 const (
@@ -35,9 +36,64 @@ const (
 	attachSettleTimeout = 30 * time.Second
 )
 
-// waitDeviceGone is a seam so the detach ORDER can be tested without a
-// VMM-shaped /proc. The step itself is covered in internal/ch.
-var waitDeviceGone = (*ch.Client).WaitDeviceRemoved
+// Seams so the detach ORDER can be tested without a VMM-shaped /proc or a live
+// guest. The steps themselves are covered in internal/ch and internal/kata.
+var (
+	waitDeviceGone     = (*ch.Client).WaitDeviceRemoved
+	releasePersistence = clearGPUPersistence
+)
+
+// clearGPUPersistence asks the guest to stop holding the GPU, so the eject can
+// complete.
+//
+// NVRC starts nvidia-persistenced unconditionally, and that daemon's default is
+// persistence mode ENABLED, so the guest holds the device's file descriptors
+// open from boot with no workload involved. The driver's PCI remove callback
+// then spins forever waiting for that refcount to drop:
+//
+//	// kernel-open/nvidia/nv-pci.c, "we wait for the usage count to go to zero"
+//	while (atomic64_read(&nvl->usage_count) != 0) { os_delay(500); }
+//
+// so vm.remove-device is accepted and the eject never finishes. NVIDIA
+// documents the contract for their own removal API in the same terms:
+// "persistence mode counts as an attachment to the GPU thus it must be disabled
+// prior to this call".
+//
+// nvidia-smi -pm 0 does not write a kernel flag; it RPCs the daemon over the IPC
+// socket, which closes the device and drops the refcount. It has to run in a
+// CONTAINER because the guest rootfs has no shell -- CDI mounts both nvidia-smi
+// and the daemon's socket into every GPU container, so the container is the only
+// place with the tools and the access.
+//
+// Best-effort by design: a workload that removed nvidia-smi from its image
+// cannot be helped here, and failing the suspend now would be worse than letting
+// the eject report the real state a moment later.
+func clearGPUPersistence(ctx context.Context, actorUID string, containerIDs []string) error {
+	if len(containerIDs) == 0 {
+		return fmt.Errorf("no containers to run nvidia-smi in")
+	}
+	agent, err := dialAgentRetry(ctx, kata.VsockSocketPath(actorUID), 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("dialing the agent: %w", err)
+	}
+	defer agent.Close()
+
+	var lastErr error
+	for _, cid := range containerIDs {
+		// A distinct exec id: the container's own id belongs to its init process.
+		code, err := agent.ExecProcess(ctx, cid, cid+"_pm", []string{"nvidia-smi", "-pm", "0"})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if code != 0 {
+			lastErr = fmt.Errorf("nvidia-smi -pm 0 in %s exited %d", cid, code)
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
 
 // vmmPID returns the pid of the cloud-hypervisor process ateom launched for an
 // actor, or 0 when it is not known (ra lost across an ateom restart).
@@ -68,7 +124,7 @@ func vmmPID(ra *runningActor) int {
 //
 // Returns without doing anything when the VM holds no passthrough device, so it
 // is safe to call unconditionally.
-func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client, ra *runningActor, actorUID string) error {
+func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client, ra *runningActor, actorUID string, containerIDs []string) error {
 	ids, err := client.VFIOPassthroughIDs(ctx)
 	if err != nil {
 		return fmt.Errorf("while listing attached passthrough devices: %w", err)
@@ -85,6 +141,14 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 	}
 
 	tDetach := time.Now()
+	// Release the guest's hold BEFORE asking for the eject: the request is
+	// accepted either way, and the driver then blocks in its remove callback
+	// until the refcount drops, so an eject requested first simply waits.
+	if err := releasePersistence(ctx, actorUID, containerIDs); err != nil {
+		slog.WarnContext(ctx, "Could not clear GPU persistence before detach; the eject may not complete",
+			slog.String("id", actorUID), slog.Any("err", err))
+	}
+
 	for _, id := range ids {
 		if err := client.RemoveDevice(ctx, id); err != nil {
 			return fmt.Errorf("while requesting eject of %s: %w", id, err)
@@ -92,7 +156,9 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 	}
 	for _, id := range ids {
 		if err := waitDeviceGone(client, ctx, id, pid, ejectTimeout); err != nil {
-			return fmt.Errorf("while confirming eject of %s: %w", id, err)
+			return fmt.Errorf("while confirming eject of %s (the guest may still hold the "+
+				"device: nvidia-persistenced keeps it open unless nvidia-smi -pm 0 ran "+
+				"in a container): %w", id, err)
 		}
 	}
 

@@ -209,12 +209,33 @@ things the design got wrong:
   connection and dies — no command can run in that guest at all. No agent RPC
   fills the gap either: `ExecProcess` is container-scoped, `CopyFile` only writes
   host→guest.
-- **It was also unnecessary.** The eject IS the unbind: `vm.remove-device`
-  raises an ACPI eject and the guest kernel runs
-  `pci_stop_and_remove_bus_device`, which calls the bound driver's `.remove()`.
-  The full cycle completes with ateom asking the guest nothing, and
-  `nvidia-persistenced` did not block it. C3 and C4 are therefore deleted, not
-  deferred.
+- **The eject IS the unbind** — `vm.remove-device` raises an ACPI eject and the
+  guest kernel runs `pci_stop_and_remove_bus_device`, which calls the bound
+  driver's `.remove()`. No guest-side unbind step is needed. C3 and C4 are
+  therefore deleted, not deferred.
+- **But the guest must still RELEASE the device first**, and an earlier draft of
+  this section was wrong to say otherwise. It concluded `nvidia-persistenced`
+  was not a blocker from a run with no container, and therefore no GPU user at
+  all. With a container that has used the GPU, the eject never completes:
+
+  NVRC starts `nvidia-persistenced` unconditionally (`nvrc/src/main.rs:55`), and
+  that daemon defaults to persistence mode ENABLED (`options.c:100`), so the
+  guest holds the device's file descriptors open from boot. The driver then
+  spins in its PCI remove callback — `kernel-open/nvidia/nv-pci.c:2324-2350`,
+  *"we wait for the usage count to go to zero"* — so the eject is accepted and
+  never finishes. NVIDIA states the contract for their own removal API in the
+  same terms: *"persistence mode counts as an attachment to the GPU thus it must
+  be disabled prior to this call"* (`nvmlDeviceRemoveGpu_v2`).
+
+  `nvidia-smi -pm 0` does not write a kernel flag; it RPCs the daemon, which
+  closes the device and drops the refcount. It must run in a CONTAINER, because
+  the guest has no shell and CDI mounts both `nvidia-smi` and the daemon's IPC
+  socket into every GPU container. There is no boot-time alternative:
+  `nvrc.uvm.persistence.mode=off` only drops the `--uvm-persistence-mode` flag
+  and leaves the daemon's own default intact (`nvrc/src/daemon.rs`), no
+  `NVreg_*` module parameter controls persistence in 595.58.03, and no released
+  NVRC tag handles unplug — the code that did was removed in `fd395ac`
+  ("switching to cold-plug per default").
 - **A restored actor must load its memory EAGERLY.** Re-attaching a VFIO device
   maps guest memory into the IOMMU, which requires pinning it; under `OnDemand`
   restore the pages are demand-paged through userfaultfd, cannot be pinned, and

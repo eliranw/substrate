@@ -146,7 +146,14 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// Give the device back before freezing the guest. Both scopes pause, and a
 	// paused vCPU does not stop a bus-mastering device, so this runs for Data as
 	// well as Full.
-	if err := s.detachPassthrough(ctx, client, ra, actorUID); err != nil {
+	//
+	// The workload containers come along because that is where nvidia-smi lives:
+	// CDI mounts it in, and the guest has no shell of its own to run it from.
+	var workloadIDs []string
+	for _, c := range req.GetSpec().GetContainers() {
+		workloadIDs = append(workloadIDs, overlayWorkloadID(c.GetName()))
+	}
+	if err := s.detachPassthrough(ctx, client, ra, actorUID, workloadIDs); err != nil {
 		return nil, err
 	}
 	if err := errIfPassthroughSnapshot(ctx, client); err != nil {
