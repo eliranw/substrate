@@ -333,23 +333,37 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	if err := client.RestoreWithNetFDs(ctx, restoreDir, restoredNets, memMode); err != nil {
 		return fmt.Errorf("while restoring VM with net FDs (memory mode %s): %w", memMode, err)
 	}
-	if err := client.Resume(ctx); err != nil {
-		return fmt.Errorf("while resuming restored guest: %w", err)
-	}
 
-	// Give the actor its passthrough device(s) back before waiting on readyz: a
-	// container that needs the GPU cannot report ready without it, so attaching
-	// after the wait would deadlock against our own timeout.
+	// Attach BEFORE resuming. A guest that is already running sees the hot-plug
+	// event immediately and binds its driver 14ms after assigning the device's
+	// BARs, which is ahead of the VMM's mapping for those new addresses: the
+	// driver reads the device, cannot make sense of what comes back, and gives
+	// up for good. Adding it to a paused guest lets the VMM finish before the
+	// guest processes the event at all.
 	//
 	// The workload containers come along for the same reason the detach takes
 	// them: re-probing the guest's driver runs from inside one, the guest having
-	// no shell of its own.
+	// no shell of its own. That is a fallback for when this ordering is not
+	// enough, not the primary mechanism.
 	var workloadIDs []string
 	for _, c := range containers {
 		workloadIDs = append(workloadIDs, overlayWorkloadID(c.GetName()))
 	}
-	if err := s.attachPassthrough(ctx, client, actorUID, workloadIDs); err != nil {
+	if err := s.attachPassthrough(ctx, client, actorUID); err != nil {
 		return err
+	}
+
+	if err := client.Resume(ctx); err != nil {
+		return fmt.Errorf("while resuming restored guest: %w", err)
+	}
+
+	// Confirm from inside the actor that the device is usable, now that the
+	// guest is running again and can be asked.
+	if len(passthrough) > 0 {
+		if err := verifyGuestGPU(ctx, actorUID, workloadIDs); err != nil {
+			slog.WarnContext(ctx, "The actor's GPU is not usable after re-attach",
+				slog.String("id", actorUID), slog.Any("err", err))
+		}
 	}
 
 	// Block until every readyz-enabled container reports 200.

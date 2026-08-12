@@ -240,55 +240,21 @@ func TestDetachProceedsWhenPersistenceCannotBeCleared(t *testing.T) {
 	}
 }
 
-// stubReprobe records the guest driver re-probe instead of dialing a guest.
-func stubReprobe(t *testing.T, log *[]string) {
-	t.Helper()
-	orig := reprobeDriver
-	reprobeDriver = func(ctx context.Context, actorUID string, cids []string) error {
-		*log = append(*log, "reprobe:"+strings.Join(cids, ","))
-		return nil
-	}
-	t.Cleanup(func() { reprobeDriver = orig })
-}
-
 func TestAttachAddsEachAllocatedDevice(t *testing.T) {
 	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio9":{}}}`)
-	stubReprobe(t, &log)
 
 	s := &AteomService{}
-	if err := s.attachPassthrough(context.Background(), c, "actor-1", []string{"cuda"}); err != nil {
+	if err := s.attachPassthrough(context.Background(), c, "actor-1"); err != nil {
 		t.Fatalf("attachPassthrough: %v", err)
 	}
-	// The re-probe is part of attaching, not a nicety layered on top. The guest
-	// binds its driver the moment the hot-added device's BARs are assigned and
-	// that probe fails, so an attach that stops at "the VMM holds the device"
-	// hands the actor a GPU it cannot open.
-	want := []string{"add:/sys/bus/pci/devices/0000:da:00.0/", "reprobe:cuda"}
+	want := []string{"add:/sys/bus/pci/devices/0000:da:00.0/"}
 	if fmt.Sprint(log) != fmt.Sprint(want) {
 		t.Errorf("call order = %v, want %v", log, want)
 	}
 }
 
-// A container with no shell cannot re-probe, and that must not fail the resume:
-// the actor is otherwise healthy and the device is attached. It is logged, and
-// the GPU is unusable until something else binds it.
-func TestAttachSurvivesAReProbeItCannotRun(t *testing.T) {
-	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
-	var log []string
-	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio9":{}}}`)
-	orig := reprobeDriver
-	reprobeDriver = func(ctx context.Context, actorUID string, cids []string) error {
-		return fmt.Errorf("no /bin/sh in the container")
-	}
-	t.Cleanup(func() { reprobeDriver = orig })
-
-	s := &AteomService{}
-	if err := s.attachPassthrough(context.Background(), c, "actor-1", []string{"cuda"}); err != nil {
-		t.Fatalf("a re-probe that cannot run must not fail the resume: %v", err)
-	}
-}
 
 // Attach must not report success on a device the VMM never took: the actor
 // would come back believing it has a GPU it cannot use.
@@ -329,7 +295,7 @@ func TestAttachIsANoOpWithoutAnAllocation(t *testing.T) {
 	c := startRecordingCH(t, &log, `{"device_tree":{}}`)
 
 	s := &AteomService{}
-	if err := s.attachPassthrough(context.Background(), c, "actor-1", []string{"cuda"}); err != nil {
+	if err := s.attachPassthrough(context.Background(), c, "actor-1"); err != nil {
 		t.Fatalf("attachPassthrough with no allocation: %v", err)
 	}
 	if len(log) != 0 {

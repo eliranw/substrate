@@ -43,7 +43,7 @@ const (
 var (
 	waitDeviceGone     = (*ch.Client).WaitDeviceRemoved
 	releasePersistence = clearGPUPersistence
-	reprobeDriver      = reprobeGuestDriver
+	verifyGuestGPU     = ensureGuestDriverBound
 )
 
 // clearGPUPersistence asks the guest to stop holding the GPU, so the eject can
@@ -98,25 +98,22 @@ func clearGPUPersistence(ctx context.Context, actorUID string, containerIDs []st
 	return lastErr
 }
 
-// reprobeGuestDriver makes the guest bind its driver to the re-attached
-// device(s), which its own hot-plug probe has already failed to do.
+// ensureGuestDriverBound confirms the actor can use its re-attached device, and
+// re-runs the guest driver's probe if it cannot.
 //
-// The guest probes the moment the hot-added device's BARs are assigned --
-// measured at 14ms after assignment on a T4 -- and reads the device before the
-// VMM has moved its MMIO mapping to the new addresses. The NVIDIA open module
-// reports that as the GPU lacking a GSP, which reads like an unsupported card
-// rather than an early read. Nothing is wrong with the device: seconds later
-// config space and the kernel's resource record agree at the relocated
-// addresses, the device answers reads, and an explicit unbind/bind brings the
-// same GPU back with the same UUID.
+// A guest that is running when a device is hot-added probes it 14ms after
+// assigning its BARs, ahead of the VMM's mapping for those new addresses. The
+// NVIDIA open module reports the resulting read as the GPU lacking a GSP, which
+// looks like an unsupported card rather than an early read, and it does not
+// retry. Attaching while the guest is paused avoids the race, so the common
+// path here is the first line: nvidia-smi already works and nothing else runs.
 //
-// Best-effort, like clearGPUPersistence: it needs a shell in the container, and
-// an actor whose image has none keeps a GPU its driver never bound. The caller
-// logs rather than failing the resume, because everything else about the actor
-// is healthy.
-func reprobeGuestDriver(ctx context.Context, actorUID string, containerIDs []string) error {
+// The rebind is the fallback for when it does not. It writes to sysfs, which
+// actors mount read-only, so it only helps a container privileged enough to
+// write it -- hence best-effort, and reported rather than fatal.
+func ensureGuestDriverBound(ctx context.Context, actorUID string, containerIDs []string) error {
 	if len(containerIDs) == 0 {
-		return fmt.Errorf("no containers to re-probe the driver from")
+		return fmt.Errorf("no containers to check the driver from")
 	}
 	agent, err := dialAgentRetry(ctx, kata.VsockSocketPath(actorUID), 15*time.Second)
 	if err != nil {
@@ -125,29 +122,38 @@ func reprobeGuestDriver(ctx context.Context, actorUID string, containerIDs []str
 	defer agent.Close()
 
 	// The guest BDF is not the host's, so the container finds it the only way it
-	// can: by vendor id in sysfs. unbind is best-effort -- after a failed probe
-	// there is no driver link to remove -- and bind is what re-runs the probe.
-	const script = `for d in /sys/bus/pci/devices/*/; do
+	// can: by vendor id in sysfs. The driver takes a few seconds to bring the GPU
+	// up after a bind, so the result is polled rather than read once.
+	const script = `nvidia-smi -L >/dev/null 2>&1 && exit 0
+for d in /sys/bus/pci/devices/*/; do
 [ "$(cat "$d/vendor" 2>/dev/null)" = 0x10de ] || continue
 b=$(basename "$d")
 echo "$b" > /sys/bus/pci/drivers/nvidia/unbind 2>/dev/null
-echo "$b" > /sys/bus/pci/drivers/nvidia/bind 2>/dev/null
+echo "$b" > /sys/bus/pci/drivers/nvidia/bind 2>/dev/null || exit 10
 done
-nvidia-smi -L`
+i=0
+while [ $i -lt 20 ]; do
+nvidia-smi -L >/dev/null 2>&1 && exit 0
+i=$((i+1)); sleep 1
+done
+exit 1`
 
 	var lastErr error
 	for _, cid := range containerIDs {
 		// A distinct exec id: the container's own id belongs to its init process.
-		code, err := agent.ExecProcess(ctx, cid, cid+"_rebind", []string{"/bin/sh", "-c", script})
+		code, err := agent.ExecProcess(ctx, cid, cid+"_gpucheck", []string{"/bin/sh", "-c", script})
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		if code != 0 {
-			lastErr = fmt.Errorf("driver re-probe in %s exited %d", cid, code)
-			continue
+		switch code {
+		case 0:
+			return nil
+		case 10:
+			lastErr = fmt.Errorf("%s cannot write /sys/bus/pci/drivers/nvidia/bind (sysfs is read-only in an actor)", cid)
+		default:
+			lastErr = fmt.Errorf("the GPU is still unusable in %s after a rebind (exit %d)", cid, code)
 		}
-		return nil
 	}
 	return lastErr
 }
@@ -252,7 +258,7 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 // from the host. Whether the guest driver rebound, and whether the container's
 // /dev/nvidia* work again, is only observable from inside the container -- the
 // guest itself cannot be asked, having no shell.
-func (s *AteomService) attachPassthrough(ctx context.Context, client *ch.Client, actorUID string, containerIDs []string) error {
+func (s *AteomService) attachPassthrough(ctx context.Context, client *ch.Client, actorUID string) error {
 	devices, err := resolveWorkerDevices()
 	if err != nil {
 		return fmt.Errorf("while resolving worker passthrough devices: %w", err)
@@ -269,13 +275,6 @@ func (s *AteomService) attachPassthrough(ctx context.Context, client *ch.Client,
 	}
 	if err := waitDevicesAttached(ctx, client, len(devices), attachSettleTimeout); err != nil {
 		return err
-	}
-
-	// The VMM holding the device is not the same as the actor being able to use
-	// it: the guest's own probe has already run and failed by this point.
-	if err := reprobeDriver(ctx, actorUID, containerIDs); err != nil {
-		slog.WarnContext(ctx, "Could not re-probe the guest GPU driver after re-attach; the actor may not see its device",
-			slog.String("id", actorUID), slog.Any("err", err))
 	}
 
 	slog.InfoContext(ctx, "Re-attached passthrough devices after restore",
