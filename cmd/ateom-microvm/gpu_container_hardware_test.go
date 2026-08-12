@@ -174,6 +174,16 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 				"echo '--- PROBE DONE ---'; " +
 				"sleep " + quiet + "; " +
 				"while true; do echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
+				// A bound driver that cannot produce a handle suggests its per-GPU
+				// state did not survive the remove/re-add. Unbind and rebind forces a
+				// clean re-probe; if the GPU comes back, that is the missing step.
+				"nvidia-smi -L 2>&1 | grep -q UUID || { echo '--- rebinding ---'; " +
+				"B=$(basename $(ls -d /sys/bus/pci/devices/*/ | while read d; do " +
+				"[ \"$(cat $d/vendor 2>/dev/null)\" = 0x10de ] && echo $d; done | head -1)); " +
+				"echo \"  bdf=$B\"; " +
+				"echo $B > /sys/bus/pci/drivers/nvidia/unbind 2>&1; sleep 2; " +
+				"echo $B > /sys/bus/pci/drivers/nvidia/bind 2>&1; sleep 3; " +
+				"echo '  after rebind:'; nvidia-smi -L 2>&1 | head -3; }; " +
 				"echo '--- pci ---'; for d in /sys/bus/pci/devices/*/; do " +
 				"[ \"$(cat $d/vendor 2>/dev/null)\" = 0x10de ] || continue; echo \"$d\"; " +
 				"head -3 $d/resource; " +
@@ -244,7 +254,10 @@ func containerSpec(t *testing.T, args []string) *specs.Spec {
 			},
 		},
 		Hostname: "gpuprobe",
-		Mounts:   defaultKataMounts(),
+		// defaultKataMounts gives /sys read-only, as production should. The probe
+		// needs to write /sys/bus/pci/drivers/nvidia/{unbind,bind} to test whether a
+		// driver rebind revives a hot-plugged GPU, so this test alone remounts it rw.
+		Mounts: sysWritable(defaultKataMounts()),
 		Linux: &specs.Linux{
 			Resources:   defaultKataResources(),
 			CgroupsPath: "/ateomchv/gpuprobe",
@@ -269,6 +282,25 @@ func containerSpec(t *testing.T, args []string) *specs.Spec {
 	}
 	t.Logf("container annotation: %s=%s", guestCDIAnnotation, withCDI.Annotations[guestCDIAnnotation])
 	return withCDI
+}
+
+// sysWritable drops "ro" from the /sys mount so the probe can drive sysfs.
+func sysWritable(ms []specs.Mount) []specs.Mount {
+	out := make([]specs.Mount, len(ms))
+	copy(out, ms)
+	for i := range out {
+		if out[i].Destination != "/sys" {
+			continue
+		}
+		var opts []string
+		for _, o := range out[i].Options {
+			if o != "ro" {
+				opts = append(opts, o)
+			}
+		}
+		out[i].Options = opts
+	}
+	return out
 }
 
 // TestGPUContainerSeesDeviceOnHardware creates a container with the CDI
