@@ -29,10 +29,16 @@
 // Build-tagged so it never runs in CI or on a developer laptop:
 //
 //	sudo -E env "PATH=$PATH" \
-//	  ATE_GPU_ASSETS=$PWD/bin/microvm-gpu-assets \
-//	  ATE_CH_BIN=$PWD/bin/microvm-assets/cloud-hypervisor \
-//	  ATE_VIRTIOFSD_BIN=$PWD/bin/microvm-assets/virtiofsd \
+//	  PCI_RESOURCE_NVIDIA_COM_<MODEL>=<BDF> \
 //	  go test -tags gpuhw -run TestGPUCycleOnHardware -v -timeout 20m ./cmd/ateom-microvm/
+//
+// The asset paths default to what the assemble scripts produce for THIS host's
+// architecture; ATE_GPU_ASSETS / ATE_CH_BIN / ATE_VIRTIOFSD_BIN override them.
+// Note the two scripts disagree on both default arch and layout -- assemble.sh
+// defaults to arm64 and writes bin/microvm-assets/$ARCH, assemble-gpu.sh
+// defaults to amd64 and writes bin/microvm-gpu-assets -- so on an amd64 host
+// assemble.sh must be run as ARCH=amd64 or it silently stages binaries that
+// cannot execute here.
 //
 // Root is required: cloud-hypervisor needs the /dev/vfio group node, and the
 // eject check reads /proc/<vmm pid>/fd.
@@ -43,7 +49,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -60,36 +68,53 @@ type hwEnv struct {
 
 func hardwareEnv(t *testing.T) hwEnv {
 	t.Helper()
-	e := hwEnv{
-		assets:    os.Getenv("ATE_GPU_ASSETS"),
-		chBin:     os.Getenv("ATE_CH_BIN"),
-		virtiofsd: os.Getenv("ATE_VIRTIOFSD_BIN"),
+	// repoRoot: this test runs from cmd/ateom-microvm.
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("resolving repo root: %v", err)
 	}
-	var missing []string
-	for k, v := range map[string]string{
-		"ATE_GPU_ASSETS": e.assets, "ATE_CH_BIN": e.chBin, "ATE_VIRTIOFSD_BIN": e.virtiofsd,
+	// assemble.sh writes per-architecture; assemble-gpu.sh does not.
+	hostAssets := filepath.Join(root, "bin", "microvm-assets", runtime.GOARCH)
+	e := hwEnv{
+		assets:    envOr("ATE_GPU_ASSETS", filepath.Join(root, "bin", "microvm-gpu-assets")),
+		chBin:     envOr("ATE_CH_BIN", filepath.Join(hostAssets, "cloud-hypervisor")),
+		virtiofsd: envOr("ATE_VIRTIOFSD_BIN", filepath.Join(hostAssets, "virtiofsd")),
+	}
+	for _, f := range []struct{ path, fix string }{
+		{filepath.Join(e.assets, "vmlinux-gpu"), "hack/microvm-assets/assemble-gpu.sh"},
+		{filepath.Join(e.assets, "rootfs-gpu.img"), "hack/microvm-assets/assemble-gpu.sh"},
+		{filepath.Join(e.assets, "configuration-clh-gpu.toml"), "hack/microvm-assets/assemble-gpu.sh"},
+		{e.chBin, "ARCH=" + runtime.GOARCH + " hack/microvm-assets/assemble.sh"},
+		{e.virtiofsd, "ARCH=" + runtime.GOARCH + " hack/microvm-assets/assemble.sh"},
 	} {
-		if v == "" {
-			missing = append(missing, k)
+		if _, err := os.Stat(f.path); err != nil {
+			t.Fatalf("missing %s\n  run: %s", f.path, f.fix)
 		}
 	}
-	if len(missing) > 0 {
-		t.Fatalf("set %s (see the comment at the top of this file)", strings.Join(missing, ", "))
-	}
-	for _, f := range []string{
-		filepath.Join(e.assets, "vmlinux-gpu"),
-		filepath.Join(e.assets, "rootfs-gpu.img"),
-		filepath.Join(e.assets, "configuration-clh-gpu.toml"),
-		e.chBin, e.virtiofsd,
-	} {
-		if _, err := os.Stat(f); err != nil {
-			t.Fatalf("missing %s -- run hack/microvm-assets/assemble-gpu.sh: %v", f, err)
+	// Both scripts stage binaries for whatever ARCH they were told, and neither
+	// checks it against the host. A cross-architecture binary fails deep inside
+	// LaunchVMM as a bare "exec format error" with no hint about why, so run each
+	// one now: the failure is the same either way, but here it can name the cause.
+	for _, bin := range []string{e.chBin, e.virtiofsd} {
+		if out, err := exec.Command(bin, "--version").CombinedOutput(); err != nil {
+			t.Fatalf("%s will not execute on this %s host (%v): %s\n"+
+				"  assemble.sh defaults to ARCH=arm64; re-run it as: ARCH=%s hack/microvm-assets/assemble.sh",
+				bin, runtime.GOARCH, err, strings.TrimSpace(string(out)), runtime.GOARCH)
+		} else {
+			t.Logf("%s: %s", filepath.Base(bin), strings.TrimSpace(string(out)))
 		}
 	}
 	if os.Geteuid() != 0 {
 		t.Fatal("must run as root: cloud-hypervisor needs /dev/vfio and the eject check reads /proc/<pid>/fd")
 	}
 	return e
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // TestGPUCycleOnHardware boots the NVIDIA guest with a passthrough GPU, detaches
