@@ -734,11 +734,17 @@ The eager restore compounds it. Dropping `OnDemand` also drops the sparse memfd,
 so resuming a GPU actor reads the entire memory image at once — an I/O burst
 against the same storage other guests are demand-paging their EROFS roots from.
 
-Neither is a bug, but a node's GPU actors must be sized as if their memory were
-fully committed, because it is. The GPU WorkerPool template therefore sets
-memory and cpu `requests == limits`, which puts the worker in Guaranteed QoS and
-makes the scheduler's model match what the kernel will actually do — encoding
-the constraint rather than describing it.
+Neither is a bug, but a node's GPU actors should be sized as if their memory
+were fully committed, because it is.
+
+Encoding that in a worker's resource requests is the obvious response and is
+**deliberately not done here**. Worker sizing is unresolved and owned elsewhere:
+the pod-vs-guest memory relationship has its own open issues (an undersized
+worker pod host-OOM-kills the VM), and `ActorTemplate.spec.resources` sizing is
+being designed separately. Numbers invented in a demo fixture would cut across
+that work and be wrong the moment it lands. The right place for this constraint
+is whatever emerges there; the point to carry over is that GPU actors cannot be
+overcommitted, because the kernel will not allow it.
 
 ### Reduced: the suspend path holds a service-wide lock across the eject
 
