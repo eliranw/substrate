@@ -18,8 +18,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
@@ -154,12 +156,28 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 			return false, fmt.Errorf("while requesting eject of %s: %w", id, err)
 		}
 	}
-	for _, id := range ids {
-		if err := waitDeviceGone(client, ctx, id, pid, ejectTimeout); err != nil {
-			return false, fmt.Errorf("while confirming eject of %s (the guest may still hold the "+
-				"device: nvidia-persistenced keeps it open unless nvidia-smi -pm 0 ran "+
-				"in a container): %w", id, err)
-		}
+	// Wait concurrently. The ejects were all requested above and the guest
+	// processes them in parallel, so waiting in sequence would make the worst case
+	// N x ejectTimeout for no reason. That matters beyond this actor:
+	// CheckpointWorkload runs under a lock that deliberately serialises every RPC
+	// on this ateom, so any time spent here is time other actors' runs, restores
+	// and suspends are blocked.
+	errs := make([]error, len(ids))
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := waitDeviceGone(client, ctx, id, pid, ejectTimeout); err != nil {
+				errs[i] = fmt.Errorf("while confirming eject of %s (the guest may still hold "+
+					"the device: nvidia-persistenced keeps it open unless nvidia-smi -pm 0 "+
+					"ran in a container): %w", id, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return false, err
 	}
 
 	slog.InfoContext(ctx, "Detached passthrough devices for snapshot",

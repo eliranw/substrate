@@ -95,17 +95,28 @@ func extractField(body, key string) string {
 
 // stubEject records the eject confirmations and the persistence release instead
 // of inspecting a live VMM or dialing a guest.
+//
+// The waits run concurrently, so the recorder is mutex-guarded: without it the
+// race detector reports the stub appending to a shared slice from several
+// goroutines. That also means "wait:" entries have no guaranteed order among
+// themselves -- assertions must compare sets or boundaries, not exact sequences.
 func stubEject(t *testing.T, log *[]string) {
 	t.Helper()
+	var mu sync.Mutex
+	record := func(e string) {
+		mu.Lock()
+		defer mu.Unlock()
+		*log = append(*log, e)
+	}
 	origRelease := releasePersistence
 	releasePersistence = func(ctx context.Context, actorUID string, cids []string) error {
-		*log = append(*log, "persistence-off:"+strings.Join(cids, ","))
+		record("persistence-off:" + strings.Join(cids, ","))
 		return nil
 	}
 	t.Cleanup(func() { releasePersistence = origRelease })
 	orig := waitDeviceGone
 	waitDeviceGone = func(c *ch.Client, ctx context.Context, id string, pid int, d time.Duration) error {
-		*log = append(*log, "wait:"+id)
+		record("wait:" + id)
 		return nil
 	}
 	t.Cleanup(func() { waitDeviceGone = orig })

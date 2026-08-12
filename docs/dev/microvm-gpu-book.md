@@ -734,28 +734,46 @@ The eager restore compounds it. Dropping `OnDemand` also drops the sparse memfd,
 so resuming a GPU actor reads the entire memory image at once — an I/O burst
 against the same storage other guests are demand-paging their EROFS roots from.
 
-Neither is a bug, but a node's GPU actors should be sized as if their memory
-were fully committed, because it is.
+Neither is a bug, but a node's GPU actors must be sized as if their memory were
+fully committed, because it is. The GPU WorkerPool template therefore sets
+memory and cpu `requests == limits`, which puts the worker in Guaranteed QoS and
+makes the scheduler's model match what the kernel will actually do — encoding
+the constraint rather than describing it.
 
-### Open: the suspend path holds a service-wide lock across the eject
+### Reduced: the suspend path holds a service-wide lock across the eject
 
 `CheckpointWorkload` takes `s.lock` for its whole duration, and
-`RunWorkload`/`RestoreWorkload` take the same lock. `s.running` is a map, so one
-ateom can track several actors.
+`RunWorkload`/`RestoreWorkload` take the same lock, so a slow eject blocks
+unrelated operations on that ateom.
 
-The eject is the long pole: `nv-pci.c`'s wait loop is unbounded, so it runs until
-`ejectTimeout` (30s per device) fires. **One GPU actor with a live CUDA context
-can therefore add its entire timeout to unrelated actors' runs, restores and
-suspends on the same worker.**
+**This is deliberate, not an oversight.** The field says so:
 
-Whether this bites in practice depends on how many actors an ateom actually
-serves, which the one-actor-per-worker scheduling makes small today — but
-nothing in ateom enforces it, and §11 notes the layer above `detachPassthrough`
-is unexercised. Narrowing the lock so it guards `s.running` rather than the
-whole RPC is the obvious fix; it was not attempted here because it touches
-shared lifecycle code that this work has no test coverage over.
+```go
+// lock serializes RPCs; like ateom-gvisor, the run/checkpoint/restore
+// lifecycle is not safe to drive concurrently.
+lock sync.Mutex
+```
 
----
+and the surrounding comment notes it is already "held across a cold boot with
+its retry, across a snapshot write, and across a restore" — which is why
+`activeActor` is atomic and `GetWorkloadStats` takes no lock at all. Long holds
+were designed for.
+
+**Per-actor locking would be unsafe.** `deactivateActorNetworking` operates on
+`s.atunnelIngress` and `s.atunnelEgress`, which are service-scoped singletons,
+not per-actor state. Splitting the lock by actor would let two actors race on
+shared networking — trading a latency problem for a correctness one.
+
+So the GPU work does not introduce an architectural problem; it adds one more
+long operation to a lock that already spans cold boots and restores. What it
+*could* have added was a worst case of N × `ejectTimeout` for an N-GPU actor,
+because the ejects were requested together and then awaited in sequence. They
+are now awaited **concurrently**, which is how the guest processes them anyway,
+bounding the contribution to roughly one timeout regardless of device count.
+
+Narrowing the lock itself remains open, and belongs to whoever owns that
+lifecycle: it is shared code with no coverage from this work, and the comment
+suggests the serialisation is load-bearing beyond networking.
 
 ## 14. What we would do differently
 

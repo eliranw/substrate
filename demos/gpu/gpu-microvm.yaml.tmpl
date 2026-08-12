@@ -52,10 +52,24 @@ spec:
   ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-microvm
   template:
     resources:
+      # Memory requests == limits on purpose, which puts the worker pod in
+      # Guaranteed QoS and stops the node overcommitting it.
+      #
+      # VFIO PINS the guest's entire RAM into the IOMMU for as long as the device
+      # is attached -- the same property that makes an OnDemand restore impossible
+      # (design 7.3). Pinned pages are unevictable and unswappable, so a GPU
+      # actor's memory is reserved for real rather than merely accounted for, and
+      # any overcommit the scheduler assumed is unavailable to the actors sharing
+      # the node. Declaring it Guaranteed makes the scheduler's model match what
+      # the kernel will actually do.
       requests:
         nvidia.com/TU104GL_TESLA_T4: "1"
+        memory: 4Gi
+        cpu: "2"
       limits:
         nvidia.com/TU104GL_TESLA_T4: "1"
+        memory: 4Gi
+        cpu: "2"
 
 ---
 
