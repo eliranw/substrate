@@ -282,6 +282,18 @@ func TestGPUCycleOnHardware(t *testing.T) {
 	// used is spent. Production restarts it on the restore path (stageOverlayLowers
 	// in restoreFullScope) for the same reason; reusing it here made vm.restore
 	// fail with a bare HTTP 500.
+	// The snapshot's config.json names this actor's hybrid-vsock socket, and clh
+	// BINDS it on restore. The first VM's socket file is still on disk, so without
+	// removing it the restore dies with AddrInUse before it touches any device.
+	//
+	// Production does not need this: a restore runs under a NEW actor UID with
+	// rewriteSnapshotSocketPaths repointing the snapshot at that actor's paths, so
+	// there is nothing to collide with. Reusing one id back-to-back is what makes
+	// it visible here. (LaunchVMM already clears the API socket itself.)
+	if err := os.Remove(kata.VsockSocketPath(id)); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("removing the stale vsock socket before restore: %v", err)
+	}
+
 	// virtiofsd logs "Client disconnected, shutting down" the moment the first VMM
 	// goes away, so the restore needs a fresh one.
 	_ = vfsd.Process.Kill()
