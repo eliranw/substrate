@@ -124,20 +124,20 @@ func vmmPID(ra *runningActor) int {
 //
 // Returns without doing anything when the VM holds no passthrough device, so it
 // is safe to call unconditionally.
-func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client, ra *runningActor, actorUID string, containerIDs []string) error {
+func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client, ra *runningActor, actorUID string, containerIDs []string) (detached bool, err error) {
 	ids, err := client.VFIOPassthroughIDs(ctx)
 	if err != nil {
-		return fmt.Errorf("while listing attached passthrough devices: %w", err)
+		return false, fmt.Errorf("while listing attached passthrough devices: %w", err)
 	}
 	if len(ids) == 0 {
-		return nil
+		return false, nil
 	}
 
 	pid := vmmPID(ra)
 	if pid == 0 {
 		// Refusing is the safe answer: the alternative is snapshotting on the
 		// strength of an eject we cannot confirm, which is the torn-memory bug.
-		return fmt.Errorf("cannot detach %d passthrough device(s): the cloud-hypervisor pid is unknown, so the eject cannot be confirmed", len(ids))
+		return false, fmt.Errorf("cannot detach %d passthrough device(s): the cloud-hypervisor pid is unknown, so the eject cannot be confirmed", len(ids))
 	}
 
 	tDetach := time.Now()
@@ -151,12 +151,12 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 
 	for _, id := range ids {
 		if err := client.RemoveDevice(ctx, id); err != nil {
-			return fmt.Errorf("while requesting eject of %s: %w", id, err)
+			return false, fmt.Errorf("while requesting eject of %s: %w", id, err)
 		}
 	}
 	for _, id := range ids {
 		if err := waitDeviceGone(client, ctx, id, pid, ejectTimeout); err != nil {
-			return fmt.Errorf("while confirming eject of %s (the guest may still hold the "+
+			return false, fmt.Errorf("while confirming eject of %s (the guest may still hold the "+
 				"device: nvidia-persistenced keeps it open unless nvidia-smi -pm 0 ran "+
 				"in a container): %w", id, err)
 		}
@@ -165,7 +165,7 @@ func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client,
 	slog.InfoContext(ctx, "Detached passthrough devices for snapshot",
 		slog.String("id", actorUID), slog.Int("devices", len(ids)),
 		slog.Duration("took", time.Since(tDetach)))
-	return nil
+	return true, nil
 }
 
 // attachPassthrough gives the actor its passthrough device(s) back after a

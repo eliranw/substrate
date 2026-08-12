@@ -49,6 +49,10 @@ const pciResourceEnvPrefix = "PCI_RESOURCE_"
 // directly, which is exactly what cloud-hypervisor's --device wants.
 //
 // Returns (nil, nil) when nothing was allocated (an ordinary worker).
+// pciSysfsRoot is where PCI devices are described. A var so tests can point it
+// at a fixture tree; production never changes it.
+var pciSysfsRoot = "/sys/bus/pci/devices"
+
 func resolveWorkerDevices() ([]ch.DeviceConfig, error) {
 	seen := map[string]bool{}
 	var addrs []string
@@ -71,7 +75,7 @@ func resolveWorkerDevices() ([]ch.DeviceConfig, error) {
 	sort.Strings(addrs)
 	devs := make([]ch.DeviceConfig, 0, len(addrs))
 	for _, a := range addrs {
-		devs = append(devs, ch.DeviceConfig{Path: filepath.Join("/sys/bus/pci/devices", a) + "/"})
+		devs = append(devs, ch.DeviceConfig{Path: filepath.Join(pciSysfsRoot, a) + "/"})
 	}
 	return devs, nil
 }

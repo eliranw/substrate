@@ -690,6 +690,73 @@ Two things to be careful of, both learned expensively here:
 
 ---
 
+## 13b. Known issues and operational consequences
+
+Four found in review after the hardware work. Two were code bugs and are fixed;
+two are properties of the approach that operators need to know.
+
+### Fixed: the CDI annotation was applied to any passthrough device
+
+`resolveWorkerDevices` matches the bare `PCI_RESOURCE_` prefix, which is the
+convention **every** Kubernetes PCI plugin follows — SR-IOV NICs, RDMA adapters,
+FPGAs. That is right for the VFIO plumbing, which genuinely does not care what
+the device is. It was wrong for the CDI annotation: an actor holding only an
+SR-IOV NIC would have been annotated `nvidia.com/gpu=all`, and an unresolvable
+CDI device **fails `CreateContainer`** rather than being ignored. Not a slower
+path — the actor would not start.
+
+`withGuestCDIDevices` now checks the device's sysfs `vendor` and `class`, and
+annotates only for NVIDIA display-class devices. This also excludes the card's
+HDMI-audio function, which arrives in the same IOMMU group.
+
+### Fixed: every checkpoint paid for the snapshot gate
+
+`detachPassthrough` read the device tree, returned early when empty, and then
+`errIfPassthroughSnapshot` read it **again** — so every suspend on every worker
+paid two `vm.info` round trips. Worse, the gate's deliberate "an unreadable
+device tree is an error" turned a slow or malformed `vm.info` into a *failed
+snapshot* for an actor that never had a device.
+
+`detachPassthrough` now reports whether it detached anything, and the gate runs
+only then. It remains an assertion about a detach that just happened, which is
+the only thing it was ever asserting.
+
+### Consequence: a GPU actor hard-reserves its whole memory allocation
+
+VFIO **pins** the guest's RAM into the IOMMU for the lifetime of the attachment
+— that is the same property that makes §7.3's `OnDemand` restore impossible.
+Pinned pages are unevictable and unswappable, so a GPU actor's full memory
+allocation is reserved on the node for real, not merely accounted for. Non-GPU
+actors sharing that node lose reclaim headroom and any overcommit the scheduler
+assumed.
+
+The eager restore compounds it. Dropping `OnDemand` also drops the sparse memfd,
+so resuming a GPU actor reads the entire memory image at once — an I/O burst
+against the same storage other guests are demand-paging their EROFS roots from.
+
+Neither is a bug, but a node's GPU actors should be sized as if their memory
+were fully committed, because it is.
+
+### Open: the suspend path holds a service-wide lock across the eject
+
+`CheckpointWorkload` takes `s.lock` for its whole duration, and
+`RunWorkload`/`RestoreWorkload` take the same lock. `s.running` is a map, so one
+ateom can track several actors.
+
+The eject is the long pole: `nv-pci.c`'s wait loop is unbounded, so it runs until
+`ejectTimeout` (30s per device) fires. **One GPU actor with a live CUDA context
+can therefore add its entire timeout to unrelated actors' runs, restores and
+suspends on the same worker.**
+
+Whether this bites in practice depends on how many actors an ateom actually
+serves, which the one-actor-per-worker scheduling makes small today — but
+nothing in ateom enforces it, and §11 notes the layer above `detachPassthrough`
+is unexercised. Narrowing the lock so it guards `s.running` rather than the
+whole RPC is the obvious fix; it was not attempted here because it touches
+shared lifecycle code that this work has no test coverage over.
+
+---
+
 ## 14. What we would do differently
 
 **Restore under a second actor id.** Three separate failures — a spent

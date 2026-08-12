@@ -17,13 +17,35 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
+// fakePCIDevice writes a sysfs device directory and points the resolver at it,
+// so the vendor/class check has something real to read.
+func fakePCIDevice(t *testing.T, bdf, vendor, class string) {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, bdf)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, val := range map[string]string{"vendor": vendor, "class": class} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(val+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig := pciSysfsRoot
+	pciSysfsRoot = root
+	t.Cleanup(func() { pciSysfsRoot = orig })
+}
+
 func TestGuestCDIAnnotationSetOnPassthroughWorker(t *testing.T) {
 	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
+	fakePCIDevice(t, "0000:da:00.0", "0x10de", "0x030200")
 	got, err := withGuestCDIDevices(&specs.Spec{})
 	if err != nil {
 		t.Fatalf("withGuestCDIDevices: %v", err)
@@ -57,6 +79,7 @@ func TestGuestCDIAnnotationAbsentWithoutPassthrough(t *testing.T) {
 // carrying one through would break the container.
 func TestGuestCDIAnnotationDropsInheritedHostAnnotations(t *testing.T) {
 	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
+	fakePCIDevice(t, "0000:da:00.0", "0x10de", "0x030200")
 	got, err := withGuestCDIDevices(&specs.Spec{Annotations: map[string]string{
 		"cdi.k8s.io/gpu": "nvidia.com/pgpu=0",
 		"unrelated":      "kept",
@@ -103,11 +126,70 @@ func TestGuestCDIAnnotationStrippedEvenWithoutPassthrough(t *testing.T) {
 // device, so mutating in place would inject into it too.
 func TestGuestCDIAnnotationDoesNotMutateCaller(t *testing.T) {
 	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
+	fakePCIDevice(t, "0000:da:00.0", "0x10de", "0x030200")
 	spec := &specs.Spec{Annotations: map[string]string{"unrelated": "kept"}}
 	if _, err := withGuestCDIDevices(spec); err != nil {
 		t.Fatalf("withGuestCDIDevices: %v", err)
 	}
 	if _, ok := spec.Annotations[guestCDIAnnotation]; ok {
 		t.Error("caller's spec was mutated; the carrier would inherit the annotation")
+	}
+}
+
+// The device resolver matches the bare PCI_RESOURCE_ prefix, which every
+// Kubernetes PCI plugin sets -- SR-IOV NICs, RDMA adapters, FPGAs. Annotating
+// one of those with nvidia.com/gpu=all names a CDI device the guest cannot
+// resolve, and an unresolvable CDI device FAILS CreateContainer rather than
+// being ignored, so a non-GPU passthrough actor would not start at all.
+func TestGuestCDIAnnotationSkipsNonGPUPassthrough(t *testing.T) {
+	dir := t.TempDir()
+	// An SR-IOV NIC: right prefix, wrong device.
+	if err := os.WriteFile(filepath.Join(dir, "vendor"), []byte("0x8086\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "class"), []byte("0x020000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if isNVIDIAGPU(dir) {
+		t.Error("an Intel network device must not be treated as an NVIDIA GPU")
+	}
+
+	gpu := t.TempDir()
+	if err := os.WriteFile(filepath.Join(gpu, "vendor"), []byte("0x10de\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gpu, "class"), []byte("0x030200\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !isNVIDIAGPU(gpu) {
+		t.Error("a 3D-controller NVIDIA device is a GPU")
+	}
+
+	// The audio function arrives in the same IOMMU group and is not a GPU.
+	audio := t.TempDir()
+	if err := os.WriteFile(filepath.Join(audio, "vendor"), []byte("0x10de\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(audio, "class"), []byte("0x040300\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if isNVIDIAGPU(audio) {
+		t.Error("the card's HDMI-audio function must not be treated as a GPU")
+	}
+}
+
+// The whole path, not just the predicate: a worker allocated an SR-IOV NIC
+// through the same PCI_RESOURCE_ convention gets no CDI annotation, so its
+// container still starts.
+func TestGuestCDIAnnotationAbsentForAnSRIOVWorker(t *testing.T) {
+	t.Setenv("PCI_RESOURCE_INTEL_COM_SRIOV_NETDEVICE", "0000:3b:02.1")
+	fakePCIDevice(t, "0000:3b:02.1", "0x8086", "0x020000")
+	got, err := withGuestCDIDevices(&specs.Spec{})
+	if err != nil {
+		t.Fatalf("withGuestCDIDevices: %v", err)
+	}
+	if v, ok := got.Annotations[guestCDIAnnotation]; ok {
+		t.Errorf("an SR-IOV NIC was annotated %s=%q; the guest cannot resolve that "+
+			"CDI device and CreateContainer would fail", guestCDIAnnotation, v)
 	}
 }

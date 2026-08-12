@@ -153,11 +153,20 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	for _, c := range req.GetSpec().GetContainers() {
 		workloadIDs = append(workloadIDs, overlayWorkloadID(c.GetName()))
 	}
-	if err := s.detachPassthrough(ctx, client, ra, actorUID, workloadIDs); err != nil {
+	detached, err := s.detachPassthrough(ctx, client, ra, actorUID, workloadIDs)
+	if err != nil {
 		return nil, err
 	}
-	if err := errIfPassthroughSnapshot(ctx, client); err != nil {
-		return nil, err
+	// Only re-read the device tree when there was something to eject. The gate is
+	// an assertion about a detach that just happened; running it for every actor
+	// would add a second vm.info round trip to every suspend on every worker, and
+	// -- because an unreadable device tree is deliberately an error rather than an
+	// assumed-empty one -- would turn a slow or malformed vm.info into a failed
+	// snapshot for an actor that never had a device.
+	if detached {
+		if err := errIfPassthroughSnapshot(ctx, client); err != nil {
+			return nil, err
+		}
 	}
 
 	tPause := time.Now()

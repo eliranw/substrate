@@ -18,6 +18,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -62,6 +64,33 @@ const (
 	cdiAnnotationPrefix = "cdi.k8s.io/"
 )
 
+// isNVIDIAGPU reports whether a passthrough device is an NVIDIA display-class
+// device, read from the host sysfs directory ateom already hands to
+// cloud-hypervisor.
+//
+// The device resolver deliberately matches the bare PCI_RESOURCE_ prefix, which
+// is the convention EVERY Kubernetes PCI device plugin follows -- SR-IOV NICs,
+// RDMA adapters and FPGAs all set it. That is right for the VFIO plumbing, which
+// genuinely does not care what the device is, and wrong here: annotating a
+// non-GPU actor with nvidia.com/gpu=all names a CDI device the guest cannot
+// resolve, and an unresolvable CDI device FAILS CreateContainer rather than
+// being ignored. An actor holding only an SR-IOV NIC would not merely take a
+// slower path; it would not start.
+//
+// Class 0x03* is the display controllers (0x0300 VGA, 0x0302 3D -- a T4 reports
+// 3D), which also excludes the HDMI-audio function that arrives in the same
+// IOMMU group.
+func isNVIDIAGPU(sysfsPath string) bool {
+	read := func(name string) string {
+		b, err := os.ReadFile(filepath.Join(sysfsPath, name))
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(b))
+	}
+	return read("vendor") == "0x10de" && strings.HasPrefix(read("class"), "0x03")
+}
+
 // withGuestCDIDevices returns spec with the annotation that makes the guest
 // agent inject this worker's passthrough GPU(s) into the container, or spec
 // unchanged when the worker was granted none.
@@ -82,6 +111,12 @@ func withGuestCDIDevices(spec *specs.Spec) (*specs.Spec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("while resolving worker passthrough devices: %w", err)
 	}
+	gpus := 0
+	for _, d := range devs {
+		if isNVIDIAGPU(d.Path) {
+			gpus++
+		}
+	}
 	inherited := false
 	for k := range spec.Annotations {
 		if strings.HasPrefix(k, cdiAnnotationPrefix) {
@@ -89,7 +124,7 @@ func withGuestCDIDevices(spec *specs.Spec) (*specs.Spec, error) {
 			break
 		}
 	}
-	if len(devs) == 0 && !inherited {
+	if gpus == 0 && !inherited {
 		return spec, nil
 	}
 
@@ -100,7 +135,7 @@ func withGuestCDIDevices(spec *specs.Spec) (*specs.Spec, error) {
 			out.Annotations[k] = v
 		}
 	}
-	if len(devs) > 0 {
+	if gpus > 0 {
 		out.Annotations[guestCDIAnnotation] = guestCDIDevices
 	}
 	return &out, nil

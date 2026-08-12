@@ -133,7 +133,7 @@ func TestDetachClearsPersistenceBeforeEjecting(t *testing.T) {
 	stubEject(t, &log)
 
 	s := &AteomService{}
-	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1", []string{"ctr_ovl"}); err != nil {
+	if _, err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1", []string{"ctr_ovl"}); err != nil {
 		t.Fatalf("detachPassthrough: %v", err)
 	}
 	want := []string{"persistence-off:ctr_ovl", "remove:_vfio2", "wait:_vfio2"}
@@ -151,7 +151,7 @@ func TestDetachRequestsAllEjectsBeforeWaiting(t *testing.T) {
 	stubEject(t, &log)
 
 	s := &AteomService{}
-	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1", []string{"ctr_ovl"}); err != nil {
+	if _, err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1", []string{"ctr_ovl"}); err != nil {
 		t.Fatalf("detachPassthrough: %v", err)
 	}
 	lastRemove, firstWait := -1, len(log)
@@ -176,8 +176,13 @@ func TestDetachIsANoOpWithoutPassthrough(t *testing.T) {
 	stubEject(t, &log)
 
 	s := &AteomService{}
-	if err := s.detachPassthrough(context.Background(), c, nil, "actor-1", []string{"ctr_ovl"}); err != nil {
+	detached, err := s.detachPassthrough(context.Background(), c, nil, "actor-1", []string{"ctr_ovl"})
+	if err != nil {
 		t.Fatalf("detachPassthrough on a device-free VM: %v", err)
+	}
+	if detached {
+		t.Error("a device-free VM must report detached=false, or every ordinary actor " +
+			"pays a second vm.info and inherits its failure mode")
 	}
 	if len(log) != 0 {
 		t.Errorf("expected no VMM calls, got %v", log)
@@ -193,7 +198,7 @@ func TestDetachRefusesWhenTheEjectCannotBeConfirmed(t *testing.T) {
 	stubEject(t, &log)
 
 	s := &AteomService{}
-	err := s.detachPassthrough(context.Background(), c, nil, "actor-1", []string{"ctr_ovl"}) // nil ra -> pid 0
+	_, err := s.detachPassthrough(context.Background(), c, nil, "actor-1", []string{"ctr_ovl"}) // nil ra -> pid 0
 	if err == nil {
 		t.Fatal("expected a refusal when the cloud-hypervisor pid is unknown")
 	}
@@ -216,7 +221,7 @@ func TestDetachProceedsWhenPersistenceCannotBeCleared(t *testing.T) {
 	}
 
 	s := &AteomService{}
-	if err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1", []string{"ctr_ovl"}); err != nil {
+	if _, err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1", []string{"ctr_ovl"}); err != nil {
 		t.Fatalf("a failed persistence clear must not abort the detach: %v", err)
 	}
 	if fmt.Sprint(log) != fmt.Sprint([]string{"remove:_vfio2", "wait:_vfio2"}) {
