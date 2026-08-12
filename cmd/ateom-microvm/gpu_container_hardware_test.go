@@ -376,24 +376,35 @@ func readProbeOutput(ctx context.Context, t *testing.T, agent *kata.AgentClient,
 	t.Helper()
 	var out, errOut strings.Builder
 	end := time.Now().Add(deadline)
-	reads := 0
+	reads, empties := 0, 0
+
+	// Each read gets its own timeout. ReadStdout BLOCKS while the container is
+	// alive and has written nothing -- the earlier version returned promptly only
+	// because the probe had already exited -- so an unbounded call wedges the loop
+	// until the outer context expires, many minutes later.
+	read := func(f func(context.Context, string, string, uint32) ([]byte, error)) []byte {
+		rctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		b, err := f(rctx, cid, cid, 8192)
+		if err != nil {
+			return nil
+		}
+		return b
+	}
+
 	for time.Now().Before(end) {
 		reads++
-		chunk, err := agent.ReadStdout(ctx, cid, cid, 8192)
-		if err != nil {
-			t.Logf("ReadStdout stopped after %d reads: %v", reads, err)
-			break
-		}
-		out.Write(chunk)
-		if e, err := agent.ReadStderr(ctx, cid, cid, 8192); err == nil {
-			errOut.Write(e)
+		b := read(agent.ReadStdout)
+		out.Write(b)
+		errOut.Write(read(agent.ReadStderr))
+		if len(b) == 0 {
+			empties++
 		}
 		if strings.Contains(out.String(), "PROBE DONE") {
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
 	}
-	t.Logf("drained the container streams in %d reads", reads)
+	t.Logf("drained the container streams in %d reads (%d returned nothing)", reads, empties)
 	return out.String(), errOut.String()
 }
 
