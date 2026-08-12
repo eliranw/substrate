@@ -152,7 +152,13 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 		// Turning it off here tests exactly that: if the eject then succeeds,
 		// persistence was the holder and production must clear it before detaching.
 		return rootfs, []string{"/bin/sh", "-c",
-			"echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
+			// Everything the probe prints goes to a file in its own rootfs, which
+			// is the virtiofs-shared directory the host also sees. The agent's
+			// stdout stream is opened when the container starts and does not
+			// survive an eject or a restore, so it cannot report on the cycle it
+			// exists to observe -- every "unresolved" result came from reading it.
+			"exec >> /probe.log 2>&1; " +
+				"echo '--- MARK ---'; ls /dev | grep -i nvidia | tr '\\n' ' '; echo; " +
 				"echo '--- pci ---'; for d in /sys/bus/pci/devices/*/; do " +
 				"[ \"$(cat $d/vendor 2>/dev/null)\" = 0x10de ] || continue; echo \"$d\"; " +
 				"head -3 $d/resource; " +
@@ -439,11 +445,13 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	}
 	t.Log("PASS create: the agent accepted the CDI annotation and created the container")
 
-	out, stderr := readProbeOutput(ctx, t, agent, cid, 60*time.Second)
-	t.Logf("=== container stdout (%d bytes) ===\n%s", len(out), out)
-	if stderr != "" {
-		t.Logf("=== container stderr ===\n%s", stderr)
+	out := probeLog(t, sharedDir, cid, "--- PROBE DONE ---", 60*time.Second)
+	if strings.TrimSpace(out) == "" {
+		// The compiled probe (no ATE_PROBE_ROOTFS) writes to stdout, not the file.
+		out, _ = readProbeOutput(ctx, t, agent, cid, 60*time.Second)
 	}
+	beforeLen := len(out)
+	t.Logf("=== container output (%d bytes) ===\n%s", len(out), out)
 
 	// No output at all is a DIFFERENT failure from output without device nodes,
 	// and must not be reported as the latter: it means the probe never ran or its
@@ -566,7 +574,14 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 			t.Fatalf("re-dialing the agent: %v", err)
 		}
 		t.Cleanup(func() { _ = agent2.Close() })
-		after, _ := readProbeOutput(ctx, t, agent2, cid, 60*time.Second)
+		all := probeLog(t, sharedDir, cid, "", 60*time.Second)
+		after := all
+		if len(all) > beforeLen {
+			after = all[beforeLen:]
+		}
+		if strings.TrimSpace(after) == "" {
+			after, _ = readProbeOutput(ctx, t, agent2, cid, 60*time.Second)
+		}
 		t.Logf("=== container view after eject+re-attach, NO restore (%d bytes) ===\n%s", len(after), after)
 		if strings.Contains(after, "Tesla") || strings.Contains(after, "UUID") {
 			t.Log("PASS: the GPU survives a plain eject and re-attach")
@@ -654,11 +669,15 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = agent2.Close() })
 
-	after, afterErr := readProbeOutput(ctx, t, agent2, cid, 60*time.Second)
-	t.Logf("=== container view AFTER the cycle (%d bytes) ===\n%s", len(after), after)
-	if afterErr != "" {
-		t.Logf("=== stderr after ===\n%s", afterErr)
+	all := probeLog(t, sharedDir, cid, "", 90*time.Second)
+	after := all
+	if len(all) > beforeLen {
+		after = all[beforeLen:]
 	}
+	if strings.TrimSpace(after) == "" {
+		after, _ = readProbeOutput(ctx, t, agent2, cid, 60*time.Second)
+	}
+	t.Logf("=== container view AFTER the cycle (%d bytes) ===\n%s", len(after), after)
 	if strings.Contains(after, "Tesla") || strings.Contains(after, "UUID") {
 		t.Log("PASS claim B: the container still uses the GPU after detach and re-attach")
 		return
@@ -735,6 +754,42 @@ func tailBytes(b []byte, n int) string {
 		b = b[len(b)-n:]
 	}
 	return string(b)
+}
+
+// probeLog reads what the probe has written so far, waiting up to deadline for
+// `want` to appear.
+//
+// The probe writes into its own rootfs, which lives under the virtiofs-shared
+// directory, so this is a plain file read on the host. That matters because the
+// alternative -- draining the container's stdout over ttrpc -- stops working the
+// moment the device is ejected or the guest is restored, which is exactly when
+// the interesting output is produced.
+//
+// Returns everything written so far; callers slice from a previously recorded
+// length to isolate what a cycle produced.
+func probeLog(t *testing.T, sharedDir, cid, want string, deadline time.Duration) string {
+	t.Helper()
+	path := filepath.Join(sharedDir, cid, "rootfs", "probe.log")
+	end := time.Now().Add(deadline)
+	var last []byte
+	for {
+		b, err := os.ReadFile(path)
+		if err == nil {
+			last = b
+			if want == "" || strings.Contains(string(b), want) {
+				return string(b)
+			}
+		}
+		if time.Now().After(end) {
+			if err != nil {
+				t.Logf("probe log %s unreadable after %s: %v", path, deadline, err)
+			} else {
+				t.Logf("probe log has %d bytes but never contained %q", len(last), want)
+			}
+			return string(last)
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 // gpuUsableViaExec runs nvidia-smi in the container and reports whether it found
