@@ -139,6 +139,9 @@ func liveActor(t *testing.T) *runningActor {
 // callback then spins waiting for that refcount, so an eject requested first
 // simply blocks until the timeout.
 func TestDetachClearsPersistenceBeforeEjecting(t *testing.T) {
+	// The worker holds an allocation: detach consults that before the VMM, so a
+	// test that gives the VM a device must give the worker one too.
+	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio2":{},"_net0":{}}}`)
 	stubEject(t, &log)
@@ -157,6 +160,9 @@ func TestDetachClearsPersistenceBeforeEjecting(t *testing.T) {
 // serialise ejects the guest can run concurrently, turning one slow device into
 // a timeout for all of them.
 func TestDetachRequestsAllEjectsBeforeWaiting(t *testing.T) {
+	// The worker holds an allocation: detach consults that before the VMM, so a
+	// test that gives the VM a device must give the worker one too.
+	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio2":{},"_vfio3":{}}}`)
 	stubEject(t, &log)
@@ -164,6 +170,10 @@ func TestDetachRequestsAllEjectsBeforeWaiting(t *testing.T) {
 	s := &AteomService{}
 	if _, err := s.detachPassthrough(context.Background(), c, liveActor(t), "actor-1", []string{"ctr_ovl"}); err != nil {
 		t.Fatalf("detachPassthrough: %v", err)
+	}
+	if len(log) == 0 {
+		t.Fatal("nothing happened at all; an ordering assertion over an empty log " +
+			"passes for the wrong reason")
 	}
 	lastRemove, firstWait := -1, len(log)
 	for i, e := range log {
@@ -200,10 +210,32 @@ func TestDetachIsANoOpWithoutPassthrough(t *testing.T) {
 	}
 }
 
+// An ordinary actor's suspend must not depend on the VMM answering a question
+// about devices it cannot have. detachPassthrough runs on every checkpoint, so a
+// VMM round-trip there is a failure mode every actor inherits; the worker's own
+// allocation answers it without one.
+func TestDetachDoesNotAskTheVMMWhenTheWorkerHasNoDevice(t *testing.T) {
+	// No PCI_RESOURCE_* in the environment, and a client pointed at a socket that
+	// does not exist: any call to the VMM fails outright.
+	c := ch.NewClient(filepath.Join(t.TempDir(), "absent.sock"))
+
+	s := &AteomService{}
+	detached, err := s.detachPassthrough(context.Background(), c, nil, "actor-1", []string{"ctr_ovl"})
+	if err != nil {
+		t.Fatalf("a device-free actor's suspend must not fail on the VMM: %v", err)
+	}
+	if detached {
+		t.Error("nothing was allocated, but detach reported it released something")
+	}
+}
+
 // Without the VMM pid the eject cannot be confirmed, and an unconfirmed eject is
 // the torn-snapshot bug. It must refuse BEFORE requesting anything, so the
 // device is left in a known state rather than mid-eject.
 func TestDetachRefusesWhenTheEjectCannotBeConfirmed(t *testing.T) {
+	// The worker holds an allocation: detach consults that before the VMM, so a
+	// test that gives the VM a device must give the worker one too.
+	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio2":{}}}`)
 	stubEject(t, &log)
@@ -224,6 +256,9 @@ func TestDetachRefusesWhenTheEjectCannotBeConfirmed(t *testing.T) {
 // its image cannot be helped, and failing the suspend then would be worse than
 // letting the eject report the real state a moment later.
 func TestDetachProceedsWhenPersistenceCannotBeCleared(t *testing.T) {
+	// The worker holds an allocation: detach consults that before the VMM, so a
+	// test that gives the VM a device must give the worker one too.
+	t.Setenv("PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4", "0000:da:00.0")
 	var log []string
 	c := startRecordingCH(t, &log, `{"device_tree":{"_vfio2":{}}}`)
 	stubEject(t, &log)

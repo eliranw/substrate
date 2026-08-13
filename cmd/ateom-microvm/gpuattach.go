@@ -299,6 +299,19 @@ func vmmPID(ra *runningActor) int {
 // Returns without doing anything when the VM holds no passthrough device, so it
 // is safe to call unconditionally.
 func (s *AteomService) detachPassthrough(ctx context.Context, client *ch.Client, ra *runningActor, actorUID string, containerIDs []string) (detached bool, err error) {
+	// Ask the environment before asking the VMM. A worker granted no device cannot
+	// have attached one -- resolveWorkerDevices is the only way a device reaches a
+	// VM, at cold-plug and at re-attach -- and this runs on EVERY checkpoint. The
+	// VMM round-trip below is cheap but it can fail, and a snapshot should not be
+	// lost to it on an actor that has no device to release.
+	devs, err := resolveWorkerDevices()
+	if err != nil {
+		return false, fmt.Errorf("while resolving worker passthrough devices: %w", err)
+	}
+	if len(devs) == 0 {
+		return false, nil
+	}
+
 	ids, err := client.VFIOPassthroughIDs(ctx)
 	if err != nil {
 		return false, fmt.Errorf("while listing attached passthrough devices: %w", err)
