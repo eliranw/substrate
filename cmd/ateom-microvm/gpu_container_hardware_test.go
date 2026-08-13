@@ -359,7 +359,7 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 		t.Fatalf("LaunchVMM: %v", err)
 	}
 	t.Cleanup(func() { _ = chCmd.Process.Kill(); _, _ = chCmd.Process.Wait() })
-	if err := client.WaitReady(ctx, 15*time.Second); err != nil {
+	if _, err := client.WaitReady(ctx, 15*time.Second); err != nil {
 		t.Fatalf("WaitReady: %v", err)
 	}
 
@@ -632,7 +632,7 @@ func TestGPUContainerSeesDeviceOnHardware(t *testing.T) {
 		t.Fatalf("relaunch VMM: %v", err)
 	}
 	t.Cleanup(func() { _ = chCmd2.Process.Kill(); _, _ = chCmd2.Process.Wait() })
-	if err := client2.WaitReady(ctx, 15*time.Second); err != nil {
+	if _, err := client2.WaitReady(ctx, 15*time.Second); err != nil {
 		t.Fatalf("WaitReady after relaunch: %v", err)
 	}
 	// Copy, not OnDemand: VFIO pins guest memory to map it into the IOMMU and
