@@ -117,12 +117,15 @@ func actorGPUUsable(ctx context.Context, actorUID string, containerIDs []string,
 	}
 	defer agent.Close()
 
+	// Quarter-second granularity: the driver comes up when it comes up, and
+	// checking on a one-second grid adds up to a second of pure waiting to every
+	// resume.
 	script := fmt.Sprintf(`i=0
 while [ $i -lt %d ]; do
 nvidia-smi -L >/dev/null 2>&1 && exit 0
-i=$((i+1)); sleep 1
+i=$((i+1)); sleep 0.25
 done
-exit 1`, tries)
+exit 1`, tries*4)
 
 	var lastErr error
 	for _, cid := range containerIDs {
@@ -250,7 +253,12 @@ exit 0`
 // guest assign its BARs and probe all over again, which fails the same way --
 // measured, not assumed.
 func ensureActorGPUUsable(ctx context.Context, client *ch.Client, actorUID string, containerIDs []string) error {
-	if err := actorGPUUsable(ctx, actorUID, containerIDs, 3); err == nil {
+	// One attempt, not several. This asks whether the guest bound the device on
+	// its own, which it does not do today -- the probe it runs at hot-add fails --
+	// so every retry here is time added to every resume for an outcome we have
+	// never observed. It stays because a guest or driver that does bind on its own
+	// should skip the rebind entirely.
+	if err := actorGPUUsable(ctx, actorUID, containerIDs, 1); err == nil {
 		return nil
 	}
 	slog.InfoContext(ctx, "The re-attached GPU is not bound; re-probing the guest driver",
