@@ -38,6 +38,14 @@ not actor status, is the assertion throughout.
 
 ## 0. Host prerequisites
 
+Building the node itself — kernel, IOMMU, containerd, kubeadm, CNI, the
+in-cluster registry, the GPU Operator and the build tooling — is a separate
+runbook: **`docs/dev/gpu-node-bootstrap.md`**. Start there for a fresh VM and
+come back here when its checklist passes.
+
+The rest of this section is the subset worth re-checking before each run, because
+these are the ones that drift.
+
 ```bash
 # IOMMU must be on, or VFIO cannot isolate the device for passthrough.
 ls /sys/kernel/iommu_groups | wc -l          # must be > 0
@@ -45,6 +53,9 @@ ls /sys/kernel/iommu_groups | wc -l          # must be > 0
 # The GPU Operator in vm-passthrough mode binds the GPU to vfio-pci.
 lspci -d 10de: -k | grep -A2 .               # "Kernel driver in use: vfio-pci"
 ls /dev/vfio/                                # the group node, plus "vfio"
+
+# imagecache mounts container rootfs overlays with lowerdir+, which needs 6.5.
+uname -r                                     # >= 6.5
 ```
 
 `Kernel driver in use:` is the state line. `Kernel modules:` is a list of
@@ -109,11 +120,25 @@ code doesn't do that yet." See the appendix for the specific ones.
 export KUBECONFIG=/etc/kubernetes/admin.conf     # kubeadm control plane
 cd <repo>
 
+# Only on a cluster that already has substrate. Skip on a fresh one.
 ATE_INSTALL_KIND=true KO_DOCKER_REPO=localhost:5001 \
   ./hack/install-ate.sh --delete-ate-system
 
 ATE_INSTALL_KIND=true KO_DOCKER_REPO=localhost:5001 \
   ./hack/install-ate.sh --deploy-ate-system
+```
+
+On a fresh node built with `docs/dev/gpu-node-bootstrap.md` there is nothing to
+delete — run only the second command.
+
+**Verify before continuing.** Everything downstream fails confusingly if the
+control plane is not actually healthy:
+
+```bash
+kubectl -n ate-system get pod          # all Running; valkey-cluster-init Completed
+kubectl get crd | grep ate.dev         # actortemplates, sandboxconfigs, workerpools, csidriverconfigs
+kubectl -n ate-system exec valkey-cluster-0 -- \
+  grep -c BEGIN /etc/valkey-ca/ca.crt  # must be 2 -- see the appendix
 ```
 
 `ATE_INSTALL_KIND=true` is load-bearing on any off-GCP cluster, not just kind:
