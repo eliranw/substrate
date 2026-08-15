@@ -36,6 +36,44 @@ actor that never opens the device reaches Ready, suspends and resumes cleanly on
 a worker whose GPU is completely unusable — so `nvidia-smi` inside the actor,
 not actor status, is the assertion throughout.
 
+## What a GPU costs an actor
+
+Measured on a T4, 2048MiB guest, snapshot 124MiB compressed. Read off one
+production cycle rather than estimated:
+
+| Segment | Time |
+|---|---|
+| Suspend: quiesce, eject, confirm | 1.68s |
+| Eager memory restore | ~1.6s |
+| Attach device | 0.65s |
+| Ask the actor whether the GPU is bound | 2.4s |
+| Rebind driver + driver init | 4.3s |
+| **Re-attach → GPU usable** | **~5.8s** |
+| Restore, total | 9.02s |
+
+An ordinary micro-VM actor on the same node restores in 164ms–676ms, so the
+comparison is worth reading carefully before optimising the wrong thing.
+
+**The eager restore is not the problem.** Forcing Eager costs about a second
+against OnDemand — real, but a fifth of what the driver costs. Taking memory
+population off the critical path, which is the architectural change people reach
+for first, would buy back the smallest piece.
+
+**The 2.4s check is not polling.** It runs `nvidia-smi` once; that time is NVML's
+own initialisation timeout when no device is bound. It cannot be trimmed without
+removing the check, and the check is what lets a guest that binds correctly skip
+the rebind entirely.
+
+So **~6.7s of the ~7.3s of GPU overhead is the driver being probed twice** —
+once by the guest's hot-add path, where it fails, and once by us, where it works.
+A guest whose first probe succeeded would collapse both the 2.4s and the 4.3s
+into the attach. That single upstream defect is worth roughly 90% of the resume
+penalty.
+
+Snapshot size is unaffected: the device is detached before capture, and the
+container image's layers are a virtio-fs mount served from the host rather than
+guest RAM, so a 5GB workload image snapshots the same as a 100MB one.
+
 ## 0. Host prerequisites
 
 Building the node itself — kernel, IOMMU, containerd, kubeadm, CNI, the
