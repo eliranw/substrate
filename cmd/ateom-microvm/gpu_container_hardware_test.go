@@ -132,6 +132,19 @@ func stageProbeRootfs(t *testing.T, sharedDir, cid string) (rootfs string, probe
 		if out, err := exec.Command("cp", "-a", img+"/.", rootfs).CombinedOutput(); err != nil {
 			t.Fatalf("copying %s into the shared dir: %v: %s", img, err, out)
 		}
+		// Check the copy produced a usable rootfs rather than finding out inside
+		// CreateContainer. `ctr images mount` does not survive a reboot, and an
+		// empty source copies silently: the failure then surfaces as a CDI hook,
+		// nvidia-cdi-hook update-ldcache exiting 1 on a directory that is missing
+		// because the whole filesystem is, which prints the entire CDI spec and
+		// reads like a driver problem.
+		if _, err := os.Stat(filepath.Join(rootfs, "lib/x86_64-linux-gnu")); err != nil {
+			t.Fatalf("ATE_PROBE_ROOTFS=%s has no lib/x86_64-linux-gnu, so it is not an "+
+				"image rootfs and the container cannot run nvidia-smi.\n"+
+				"  `ctr images mount` does not survive a reboot -- re-run:\n"+
+				"    sudo ctr -n k8s.io images mount --rw docker.io/library/ubuntu:24.04 %s",
+				img, img)
+		}
 		t.Logf("probe rootfs: %s (image)", img)
 		// nvidia-smi and libcuda come from CDI's mounts, not from the image.
 		// Reports once, goes QUIET, then loops.

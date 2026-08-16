@@ -339,7 +339,15 @@ Optional, for the GPU hardware tests — they want a real image rootfs so
 sudo ctr -n k8s.io images pull docker.io/library/ubuntu:24.04
 sudo mkdir -p /mnt/ubuntu
 sudo ctr -n k8s.io images mount --rw docker.io/library/ubuntu:24.04 /mnt/ubuntu
+ls /mnt/ubuntu/lib/x86_64-linux-gnu | head -3    # must list .so files
 ```
+
+**This mount does not survive a reboot**, and its absence is not reported where
+it happens. `cp -a /mnt/ubuntu/.` then copies nothing, the probe container gets
+an empty rootfs, and `CreateContainer` fails inside a CDI hook —
+`nvidia-cdi-hook update-ldcache --folder /lib/x86_64-linux-gnu` exits 1, printing
+the whole CDI spec and reading exactly like a driver or CDI problem. Re-run the
+`mount` line after every reboot, or add it to `/etc/rc.local`.
 
 ## Checklist before moving on
 
