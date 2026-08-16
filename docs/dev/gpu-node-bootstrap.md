@@ -22,6 +22,23 @@ are usually fine; the ones marked **required** are not free choices.
 
 ---
 
+## Running this as a script
+
+`hack/gpu-node-bootstrap.sh` performs every step below. Read this document for
+why each one is there; the script only does them, and each step is idempotent so
+a failed run can be re-run after fixing the cause.
+
+```bash
+sudo ./hack/gpu-node-bootstrap.sh phase1   # kernel + IOMMU
+sudo reboot
+./hack/gpu-node-bootstrap.sh phase2        # everything else, as your normal user
+./hack/gpu-node-bootstrap.sh checks        # re-runnable verification
+```
+
+Two phases because the kernel and IOMMU changes need a reboot and nothing after
+them works until it happens. phase2 refuses to run as root (it writes `~/.kube`
+and `~/go`) and refuses to start at all if phase1 did not take.
+
 ## 1. Kernel
 
 **Linux 6.5 or newer is required.** atelet hands ateom a list of image layers and
