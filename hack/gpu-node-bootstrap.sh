@@ -51,12 +51,17 @@ refuse_root() {
 phase1() {
   need_root
 
-  # imagecache mounts container rootfs overlays with one lowerdir+ per layer,
-  # which overlayfs only understands from 6.5. On 5.15 every actor fails with a
-  # bare "invalid argument" that names neither overlayfs nor a version.
-  say "kernel: installing the HWE stack (need >= 6.5, 22.04 ships 5.15)"
-  apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-generic-hwe-22.04
+  # A boot menu FIRST, before anything changes how this machine boots. Ubuntu
+  # ships GRUB_TIMEOUT=0 with a hidden menu, so a kernel that fails to come up
+  # leaves no way to choose the previous one -- on a remote box that is a brick
+  # recoverable only from the BMC console. Everything below is reversible; this
+  # is what makes it so.
+  say "boot menu: giving the machine a way back if the new kernel fails"
+  cp -a /etc/default/grub "/etc/default/grub.bak.$(date +%s)"
+  sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' /etc/default/grub
+  sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub
+  grep -q '^GRUB_TIMEOUT=' /etc/default/grub || echo 'GRUB_TIMEOUT=10' >> /etc/default/grub
+  grep -q '^GRUB_TIMEOUT_STYLE=' /etc/default/grub || echo 'GRUB_TIMEOUT_STYLE=menu' >> /etc/default/grub
 
   # VFIO cannot isolate a device without an IOMMU, and passthrough then fails at
   # the first step with no useful error.
@@ -66,10 +71,54 @@ phase1() {
   else
     sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 intel_iommu=on iommu=pt"/' \
       /etc/default/grub
-    update-grub
+    # Assert the substitution matched. A silent no-op here means booting without
+    # an IOMMU and discovering it much later, at the first passthrough attempt.
+    grep -q 'GRUB_CMDLINE_LINUX=".*intel_iommu=on' /etc/default/grub || {
+      echo "!! the GRUB_CMDLINE_LINUX substitution did not match. /etc/default/grub is:" >&2
+      grep GRUB_CMDLINE /etc/default/grub >&2
+      echo "!! add 'intel_iommu=on iommu=pt' by hand, then re-run" >&2
+      exit 1
+    }
   fi
 
-  say "phase1 done. REBOOT, then run: ./gpu-node-bootstrap.sh phase2"
+  # Validate before committing. grub-mkconfig to a scratch file exercises the
+  # same generator update-grub uses, so a config it rejects is caught here
+  # rather than at the next boot.
+  say "validating the generated grub config before writing it"
+  grub-mkconfig -o /tmp/grub.cfg.check >/dev/null 2>&1 || {
+    echo "!! grub-mkconfig failed -- NOT touching the live config" >&2
+    exit 1
+  }
+  update-grub
+
+  # imagecache mounts container rootfs overlays with one lowerdir+ per layer,
+  # which overlayfs only understands from 6.5. On 5.15 every actor fails with a
+  # bare "invalid argument" that names neither overlayfs nor a version.
+  say "kernel: installing the HWE stack (need >= 6.5, 22.04 ships 5.15)"
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-generic-hwe-22.04
+
+  # Confirm a >= 6.5 kernel actually landed and has an initramfs. Rebooting into
+  # a kernel that was never fully installed is the failure this catches.
+  say "verifying the new kernel is installed and bootable"
+  local newest; newest="$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's/.*vmlinuz-//' | sort -V | tail -1)"
+  echo "   newest kernel on /boot: ${newest:-NONE}"
+  case "${newest:-0}" in
+    [0-5].*|6.[0-4].*|NONE|0)
+      echo "!! no kernel >= 6.5 in /boot -- the HWE install did not take." >&2
+      echo "!! DO NOT REBOOT. Fix the install first." >&2
+      exit 1 ;;
+  esac
+  [[ -f "/boot/initrd.img-${newest}" ]] || {
+    echo "!! /boot/initrd.img-${newest} is missing -- that kernel will not boot." >&2
+    echo "!! DO NOT REBOOT. Try: update-initramfs -c -k ${newest}" >&2
+    exit 1
+  }
+
+  say "phase1 done -- kernel ${newest} installed, boot menu enabled (10s)."
+  echo "   If it does not come back, pick the previous kernel from the GRUB menu"
+  echo "   on the BMC console rather than power-cycling."
+  echo "   Then: sudo reboot && ./gpu-node-bootstrap.sh phase2"
 }
 
 phase2() {
