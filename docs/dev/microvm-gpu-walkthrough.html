@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A GPU actor, step by step</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Newsreader:opsz,wght@6..72,300;6..72,400;6..72,500&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --font-display: 'Fraunces', Georgia, serif;
+    --font-body: 'Newsreader', Georgia, serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+
+    --bg: #faf5ee;
+    --surface: #fffdf9;
+    --surface2: #f3ebdf;
+    --border: rgba(74, 52, 30, 0.13);
+    --border-bright: rgba(74, 52, 30, 0.24);
+    --text: #2c2115;
+    --text-dim: #7b6a56;
+
+    --you:   #b45309;  --you-dim:   rgba(180, 83,  9,   0.10);
+    --ctl:   #6d28d9;  --ctl-dim:   rgba(109, 40,  217, 0.10);
+    --node:  #1d4ed8;  --node-dim:  rgba(29,  78,  216, 0.10);
+    --guest: #047857;  --guest-dim: rgba(4,   120, 87,  0.10);
+    --hw:    #c2410c;  --hw-dim:    rgba(194, 65,  12,  0.10);
+    --warn:  #b91c1c;  --warn-dim:  rgba(185, 28,  28,  0.09);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #191410;
+      --surface: #221b15;
+      --surface2: #2b2219;
+      --border: rgba(255, 240, 220, 0.10);
+      --border-bright: rgba(255, 240, 220, 0.20);
+      --text: #f0e6d8;
+      --text-dim: #a4917a;
+
+      --you:   #fbbf24;  --you-dim:   rgba(251, 191, 36,  0.14);
+      --ctl:   #c4b5fd;  --ctl-dim:   rgba(196, 181, 253, 0.14);
+      --node:  #93c5fd;  --node-dim:  rgba(147, 197, 253, 0.14);
+      --guest: #6ee7b7;  --guest-dim: rgba(110, 231, 183, 0.14);
+      --hw:    #fdba74;  --hw-dim:    rgba(253, 186, 116, 0.14);
+      --warn:  #fca5a5;  --warn-dim:  rgba(252, 165, 165, 0.13);
+    }
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background-color: var(--bg);
+    background-image:
+      radial-gradient(ellipse at 15% -5%, var(--you-dim) 0%, transparent 55%),
+      radial-gradient(ellipse at 90% 40%, var(--node-dim) 0%, transparent 50%);
+    background-attachment: fixed;
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.65;
+    padding: 40px;
+    overflow-wrap: break-word;
+  }
+
+  .wrap { max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: 190px 1fr; gap: 0 48px; }
+  .main { min-width: 0; max-width: 880px; }
+  .grid > *, .flex > * { min-width: 0; }
+
+  /* ---------- TOC ---------- */
+  .toc {
+    position: sticky; top: 24px; align-self: start; grid-row: 1 / -1;
+    padding: 14px 0; max-height: calc(100dvh - 48px); overflow-y: auto;
+  }
+  .toc::-webkit-scrollbar { width: 3px; }
+  .toc::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 2px; }
+  .toc-title {
+    font-family: var(--font-mono); font-size: 9px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 2px; color: var(--text-dim);
+    padding-bottom: 10px; margin-bottom: 8px; border-bottom: 1px solid var(--border);
+  }
+  .toc a {
+    display: block; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+    text-decoration: none; padding: 5px 9px; border-radius: 5px;
+    border-left: 2px solid transparent; transition: all 0.15s; line-height: 1.4;
+  }
+  .toc a:hover { color: var(--text); background: var(--surface2); }
+  .toc a.active { color: var(--text); border-left-color: var(--hw); background: var(--surface); }
+
+  /* ---------- Masthead ---------- */
+  h1 {
+    font-family: var(--font-display); font-size: 52px; font-weight: 600;
+    line-height: 1.04; letter-spacing: -1.5px; text-wrap: balance; margin-bottom: 14px;
+  }
+  .standfirst {
+    font-size: 20px; line-height: 1.55; color: var(--text-dim);
+    max-width: 700px; margin-bottom: 30px; font-weight: 300;
+  }
+  .meta {
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 1.6px;
+    padding-bottom: 28px; margin-bottom: 40px; border-bottom: 2px solid var(--border-bright);
+  }
+
+  /* ---------- Cast ---------- */
+  .cast {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    padding: 26px 30px; margin-bottom: 52px;
+    box-shadow: 0 4px 22px rgba(74, 52, 30, 0.07), 0 1px 3px rgba(74, 52, 30, 0.04);
+  }
+  .cast h2 {
+    font-family: var(--font-mono); font-size: 10px; font-weight: 700; letter-spacing: 2px;
+    text-transform: uppercase; color: var(--text-dim); margin-bottom: 18px;
+  }
+  .cast-row { display: grid; grid-template-columns: 200px 1fr; gap: 10px 20px; align-items: baseline; }
+  .cast-row > * { min-width: 0; }
+  .cast-name { font-family: var(--font-mono); font-size: 13px; font-weight: 500; }
+  .cast-desc { font-size: 15px; color: var(--text-dim); line-height: 1.5; }
+
+  /* ---------- Phase heading ---------- */
+  .phase {
+    margin: 64px 0 30px; padding-top: 22px; border-top: 2px solid var(--border-bright);
+    scroll-margin-top: 20px;
+  }
+  .phase-kicker {
+    font-family: var(--font-mono); font-size: 10px; font-weight: 700; letter-spacing: 2.2px;
+    text-transform: uppercase; color: var(--hw); margin-bottom: 8px;
+  }
+  .phase h2 {
+    font-family: var(--font-display); font-size: 33px; font-weight: 600;
+    letter-spacing: -0.6px; line-height: 1.15;
+  }
+  .phase p { font-size: 17px; color: var(--text-dim); margin-top: 8px; max-width: 660px; font-weight: 300; }
+
+  /* ---------- Step ---------- */
+  .step {
+    display: grid; grid-template-columns: 62px 1fr; gap: 0 22px;
+    padding: 26px 0; border-bottom: 1px solid var(--border);
+    animation: fadeUp 0.45s ease-out both; animation-delay: calc(var(--i, 0) * 0.03s);
+  }
+  .step > * { min-width: 0; }
+  .step:last-child { border-bottom: none; }
+  .num {
+    font-family: var(--font-display); font-size: 40px; font-weight: 600;
+    line-height: 1; color: var(--border-bright); text-align: right;
+    font-variant-numeric: tabular-nums; padding-top: 2px;
+  }
+  .step h3 {
+    font-family: var(--font-display); font-size: 22px; font-weight: 600;
+    letter-spacing: -0.3px; line-height: 1.3; margin-bottom: 4px; text-wrap: balance;
+  }
+  .step p { margin-top: 9px; }
+  .step p + p { margin-top: 12px; }
+
+  .who {
+    display: inline-block; font-family: var(--font-mono); font-size: 10px; font-weight: 700;
+    letter-spacing: 1.3px; text-transform: uppercase; padding: 3px 9px;
+    border-radius: 5px; margin-bottom: 9px;
+  }
+  .who--you   { background: var(--you-dim);   color: var(--you); }
+  .who--ctl   { background: var(--ctl-dim);   color: var(--ctl); }
+  .who--node  { background: var(--node-dim);  color: var(--node); }
+  .who--guest { background: var(--guest-dim); color: var(--guest); }
+  .who--hw    { background: var(--hw-dim);    color: var(--hw); }
+
+  .ev {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.75;
+    background: color-mix(in srgb, var(--bg) 62%, var(--surface2) 38%);
+    border: 1px solid var(--border); border-left: 3px solid var(--border-bright);
+    box-shadow: inset 0 1px 3px rgba(74, 52, 30, 0.05);
+    border-radius: 0 9px 9px 0; padding: 12px 16px; margin-top: 13px;
+    white-space: pre-wrap; overflow-x: auto; color: var(--text);
+  }
+  .ev .c { color: var(--text-dim); }
+  .ev .k { color: var(--hw); font-weight: 500; }
+
+  .why {
+    margin-top: 13px; padding: 11px 0 11px 16px;
+    border-left: 3px solid var(--ctl); font-size: 15.5px;
+    color: var(--text-dim); line-height: 1.6;
+  }
+  .why b { color: var(--text); font-weight: 500; }
+  .why--warn { border-left-color: var(--warn); }
+  .why--warn b { color: var(--warn); }
+
+  .chips { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 7px; }
+  .chip {
+    font-family: var(--font-mono); font-size: 11px; font-weight: 500;
+    padding: 3px 10px; border-radius: 20px;
+    background: var(--hw-dim); color: var(--hw); border: 1px solid transparent;
+    animation: fadeScale 0.35s ease-out both;
+  }
+  .chip--n { background: var(--surface2); color: var(--text-dim); }
+
+  code {
+    font-family: var(--font-mono); font-size: 0.83em;
+    background: var(--surface2); padding: 1.5px 5px; border-radius: 4px;
+    color: var(--text); white-space: nowrap;
+  }
+
+  /* ---------- Closing ---------- */
+  .limits {
+    background: var(--warn-dim); border: 1px solid var(--border);
+    border-left: 3px solid var(--warn); border-radius: 0 14px 14px 0;
+    padding: 24px 28px; margin-top: 30px;
+  }
+  .limits h3 { font-family: var(--font-display); font-size: 21px; font-weight: 600; margin-bottom: 10px; }
+  .limits ul { list-style: none; margin-top: 12px; }
+  .limits li { padding-left: 18px; position: relative; margin-bottom: 9px; font-size: 16px; color: var(--text-dim); line-height: 1.55; }
+  .limits li::before { content: '—'; position: absolute; left: 0; color: var(--warn); }
+  .limits li b { color: var(--text); font-weight: 500; }
+
+  footer {
+    margin-top: 56px; padding-top: 22px; border-top: 2px solid var(--border-bright);
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); line-height: 1.9;
+  }
+
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @keyframes fadeScale { from { opacity: 0; transform: scale(0.93); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-delay: 0ms !important; transition-duration: 0.01ms !important; }
+  }
+
+  @media (max-width: 1000px) {
+    body { padding: 16px; font-size: 16px; }
+    .wrap { grid-template-columns: 1fr; }
+    .toc {
+      position: sticky; top: 0; z-index: 200; grid-row: auto; max-height: none;
+      display: flex; gap: 4px; align-items: center; overflow-x: auto;
+      background: var(--bg); border-bottom: 1px solid var(--border);
+      padding: 10px 16px; margin: 0 -16px;
+    }
+    .toc::-webkit-scrollbar { display: none; }
+    .toc-title { display: none; }
+    .toc a { white-space: nowrap; flex-shrink: 0; border-left: none; border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0; }
+    .toc a.active { border-left: none; border-bottom-color: var(--hw); }
+    .main { padding-top: 18px; }
+    h1 { font-size: 34px; }
+    .standfirst { font-size: 18px; }
+    .phase h2 { font-size: 26px; }
+    .step { grid-template-columns: 38px 1fr; gap: 0 14px; }
+    .num { font-size: 27px; }
+    .cast-row { grid-template-columns: 1fr; gap: 3px 0; }
+    .cast-row .cast-desc { margin-bottom: 10px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="toc" id="toc">
+  <div class="toc-title">Contents</div>
+  <a href="#cast">Cast</a>
+  <a href="#p1">1 · The node</a>
+  <a href="#p2">2 · Actor starts</a>
+  <a href="#p3">3 · Into the container</a>
+  <a href="#p4">4 · Suspend</a>
+  <a href="#p5">5 · Resume</a>
+  <a href="#p6">6 · Limits</a>
+</nav>
+
+<div class="main">
+
+  <h1>A GPU actor, step by step</h1>
+  <p class="standfirst">
+    Twenty-five steps from a bare machine to a container running <code>nvidia-smi</code> on a real Tesla T4 —
+    then suspending it, freeing the card, and giving it back. Every command and every number here was taken
+    off hardware.
+  </p>
+  <div class="meta">micro-VM &nbsp;·&nbsp; cloud-hypervisor v52 &nbsp;·&nbsp; Tesla T4 &nbsp;·&nbsp; measured 2026-08-12</div>
+
+  <div class="cast" id="cast">
+    <h2>The cast, before we start</h2>
+    <div class="cast-row">
+      <div class="cast-name" style="color:var(--hw)">VFIO</div>
+      <div class="cast-desc">A Linux facility that lets a normal userspace program own a physical PCI card. <code>vfio-pci</code> is a stub driver whose whole job is to claim the card so that nothing else can, and then hand it to whoever asks. It is how a VM gets real hardware.</div>
+
+      <div class="cast-name" style="color:var(--hw)">IOMMU</div>
+      <div class="cast-desc">Hardware that acts as a page table for devices. A GPU writes to memory on its own; the IOMMU constrains it so it can only reach one VM's pages. This is what makes handing real hardware to untrusted code safe.</div>
+
+      <div class="cast-name" style="color:var(--node)">cloud-hypervisor</div>
+      <div class="cast-desc">The VM monitor. An ordinary Linux process that happens to be running a guest. Driven over a REST socket.</div>
+
+      <div class="cast-name" style="color:var(--node)">atelet</div>
+      <div class="cast-desc">Our per-node agent, a DaemonSet. Builds bundles, stages snapshots, calls into the worker.</div>
+
+      <div class="cast-name" style="color:var(--node)">ateom</div>
+      <div class="cast-desc">The privileged container inside each worker Pod. It launches cloud-hypervisor itself — there is no kata-runtime and no containerd shim anywhere in this path.</div>
+
+      <div class="cast-name" style="color:var(--guest)">NVRC</div>
+      <div class="cast-desc">NVIDIA's init. PID 1 inside the guest. Brings up the driver, then hands off.</div>
+
+      <div class="cast-name" style="color:var(--guest)">kata-agent</div>
+      <div class="cast-desc">Stock, unmodified. The thing inside the guest that actually creates your container.</div>
+
+      <div class="cast-name" style="color:var(--guest)">CDI</div>
+      <div class="cast-desc">Container Device Interface — a spec file saying "to give a container this GPU, create these device nodes and mount these libraries". Someone writes it; someone else applies it.</div>
+    </div>
+  </div>
+
+  <!-- ================= PHASE 1 ================= -->
+  <div class="phase" id="p1">
+    <div class="phase-kicker">Phase one</div>
+    <h2>Before any actor exists</h2>
+    <p>Three things happen at node setup. After them, the machine has a GPU that the host itself cannot use — which is exactly what we want.</p>
+  </div>
+
+  <div class="step" style="--i:0">
+    <div class="num">01</div>
+    <div>
+      <span class="who who--node">node boot</span>
+      <h3>The machine boots with the IOMMU switched on</h3>
+      <p>Without an IOMMU the kernel will not let a userspace process take ownership of a PCI device, because it would have no way to stop that device writing anywhere in memory. Passthrough is simply unavailable.</p>
+      <div class="ev"><span class="c"># /etc/default/grub</span>
+GRUB_CMDLINE_LINUX_DEFAULT="... <span class="k">intel_iommu=on iommu=pt</span>"</div>
+      <div class="why"><b>Also:</b> the host kernel must be 6.5 or newer. We mount the container rootfs overlay using <code>lowerdir+</code>, which does not exist before then. Ubuntu 22.04 needs its HWE kernel (6.8) for this.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:1">
+    <div class="num">02</div>
+    <div>
+      <span class="who who--hw">nvidia-vfio-manager</span>
+      <h3>The GPU operator takes the card away from the host</h3>
+      <p>Running in <code>vm-passthrough</code> mode, the operator binds each GPU to <code>vfio-pci</code>. It deliberately does <em>not</em> deploy the usual driver DaemonSet.</p>
+      <div class="ev">$ lspci -nnk -s 0000:da:00.0
+  NVIDIA Corporation TU104GL [Tesla T4]
+  <span class="k">Kernel driver in use: vfio-pci</span></div>
+      <div class="why"><b>The host now has no NVIDIA driver at all.</b> No <code>nvidia.ko</code>, no <code>nvidia-smi</code>. If you ssh to the node and try to look at the GPU, you will find nothing. That is not a misconfiguration — it is the design.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:2">
+    <div class="num">03</div>
+    <div>
+      <span class="who who--hw">sandbox-device-plugin</span>
+      <h3>The card is advertised to Kubernetes under a model-specific name</h3>
+      <p>Not <code>nvidia.com/gpu</code>. In passthrough mode the resource carries the actual model, because you are being given one specific physical card rather than a slice of a shared one.</p>
+      <div class="ev">$ kubectl get node -o jsonpath='{.status.allocatable}'
+  <span class="k">nvidia.com/TU104GL_TESLA_T4</span>: "1"</div>
+      <div class="why"><b>Worth remembering:</b> <code>nvidia.com/gpu</code> is the time-slicing name and never appears in this mode. Asking for it gets you a pod that will not schedule.</div>
+    </div>
+  </div>
+
+  <!-- ================= PHASE 2 ================= -->
+  <div class="phase" id="p2">
+    <div class="phase-kicker">Phase two</div>
+    <h2>Starting the actor</h2>
+    <p>From your request to a booted VM with the card already inside it.</p>
+  </div>
+
+  <div class="step" style="--i:0">
+    <div class="num">04</div>
+    <div>
+      <span class="who who--you">you</span>
+      <h3>You ask for an actor with a GPU</h3>
+      <p>The request names the model-specific resource from step 3.</p>
+      <div class="ev"><span class="c"># WorkerPool</span>
+template:
+  resources:
+    <span class="k">nvidia.com/TU104GL_TESLA_T4: 1</span></div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:1">
+    <div class="num">05</div>
+    <div>
+      <span class="who who--ctl">atecontroller</span>
+      <h3>That becomes a worker Pod</h3>
+      <p>One Pod per actor. Inside it, a single privileged container named <code>ateom</code>. It is scheduled onto a node carrying the label <code>ate.dev/sandboxClass=microvm</code> — nothing else sets that label, so it is the only thing steering placement.</p>
+    </div>
+  </div>
+
+  <div class="step" style="--i:2">
+    <div class="num">06</div>
+    <div>
+      <span class="who who--node">kubelet</span>
+      <h3>Kubernetes tells the pod which physical card it got</h3>
+      <p>The device plugin sets an environment variable naming the PCI address. This is the moment an abstract resource request becomes a specific piece of silicon.</p>
+      <div class="ev"><span class="k">PCI_RESOURCE_NVIDIA_COM_TU104GL_TESLA_T4</span>=0000:da:00.0</div>
+      <div class="why"><b>Why we read the environment rather than scanning the system:</b> <code>ateom</code> is privileged, so if it enumerated <code>/dev/vfio</code> it would see every GPU on the node and happily assign all of them to this one actor. The environment variable is the only authoritative statement of what this pod was actually allocated.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:3">
+    <div class="num">07</div>
+    <div>
+      <span class="who who--node">atelet</span>
+      <h3>The node agent builds the bundle and calls the worker</h3>
+      <p><code>atelet</code> assembles the OCI bundle and the runtime assets, then makes a gRPC call into the pod.</p>
+      <div class="ev">atelet ──RunWorkload──▶ ateom</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:4">
+    <div class="num">08</div>
+    <div>
+      <span class="who who--node">ateom</span>
+      <h3>The VM is created with the GPU already attached</h3>
+      <p>The BDF from step 6 is turned into a device path and passed in at VM creation time, before the guest has run a single instruction.</p>
+      <div class="ev"><span class="c"># resolveWorkerDevices() →</span>
+{ "path": "<span class="k">/sys/bus/pci/devices/0000:da:00.0/</span>" }
+
+POST /api/v1/vm.create   <span class="c"># devices included here</span>
+POST /api/v1/vm.boot</div>
+      <div class="why"><b>This is cold-plug, not hot-plug — and it is load-bearing.</b> Remember it; step 21 is entirely about the fact that a card added <em>later</em> behaves differently from one that was present at boot.</div>
+    </div>
+  </div>
+
+  <!-- ================= PHASE 3 ================= -->
+  <div class="phase" id="p3">
+    <div class="phase-kicker">Phase three</div>
+    <h2>Getting the GPU into your container</h2>
+    <p>The guest boots, discovers the card, and works out how to expose it. Almost all of this happens inside the VM — the host contributes one line of text.</p>
+  </div>
+
+  <div class="step" style="--i:0">
+    <div class="num">09</div>
+    <div>
+      <span class="who who--guest">NVRC · guest PID 1</span>
+      <h3>The guest loads the NVIDIA driver</h3>
+      <p>NVRC is NVIDIA's own init, and it is the first thing that runs. It loads driver 595 — baked into the guest rootfs — and starts <code>nvidia-persistenced</code>.</p>
+      <div class="why"><b>So here is where the driver actually lives:</b> in the <em>guest</em> kernel. The host has <code>vfio-pci</code> and nothing else. The real driver is talking to the real silicon; it just happens to be doing so from inside a VM.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:1">
+    <div class="num">10</div>
+    <div>
+      <span class="who who--guest">NVRC</span>
+      <h3>NVRC writes the CDI spec, then becomes kata-agent</h3>
+      <p>Before it hands over, NVRC generates the file describing how to give a container this GPU, and blocks until that is done.</p>
+      <div class="ev">$ <span class="k">nvidia-ctk cdi generate</span> --output=/var/run/cdi/nvidia.yaml
+$ exec kata-agent</div>
+      <div class="why"><b>Because the spec is generated inside the guest, its device numbers are already guest-native.</b> There is no host-to-guest translation step anywhere in the codebase, and there does not need to be. It also runs exactly once, at boot — which is the second reason cold-plug matters.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:2">
+    <div class="num">11</div>
+    <div>
+      <span class="who who--node">ateom</span>
+      <h3>The host adds one annotation — and touches nothing else</h3>
+      <p>This is the entire host-side contribution to getting a GPU into your container.</p>
+      <div class="ev"><span class="k">cdi.k8s.io/ate-passthrough</span> = nvidia.com/gpu=all</div>
+      <div class="why"><b>It strips inherited <code>cdi.k8s.io/</code> annotations first.</b> Those name host-side CDI devices, which do not exist inside the guest — and an unresolvable CDI device does not get skipped, it fails <code>CreateContainer</code> outright. It also checks the device really is a display-class NVIDIA GPU, so the HDMI-audio function sharing the IOMMU group does not get annotated, and neither does an unrelated passthrough NIC.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:3">
+    <div class="num">12</div>
+    <div>
+      <span class="who who--guest">kata-agent</span>
+      <h3>The agent does the actual injection</h3>
+      <p>On <code>CreateContainer</code> it reads the annotation, resolves it against NVRC's spec, and creates the device nodes, mounts the driver libraries, and writes the device-cgroup entries.</p>
+      <div class="ev"><span class="c"># observed inside the actor</span>
+195:0    /dev/nvidia0
+195:255  /dev/nvidiactl
+239:0    /dev/nvidia-uvm</div>
+      <div class="why"><b>Nothing in our code writes these.</b> They are the agent's work, using numbers that only make sense inside this guest.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:4">
+    <div class="num">13</div>
+    <div>
+      <span class="who who--you">your container</span>
+      <h3>The GPU is there</h3>
+      <p>Your image is unmodified. From inside, this is indistinguishable from a bare-metal machine with a T4 in it.</p>
+      <div class="ev">$ nvidia-smi
+  <span class="k">Tesla T4</span>   ·   driver 595</div>
+    </div>
+  </div>
+
+  <!-- ================= PHASE 4 ================= -->
+  <div class="phase" id="p4">
+    <div class="phase-kicker">Phase four</div>
+    <h2>Suspending — giving the card back</h2>
+    <p>A snapshot can record guest memory and CPU registers. It cannot record what is inside a GPU. So before we take one, the card has to leave.</p>
+  </div>
+
+  <div class="step" style="--i:0">
+    <div class="num">14</div>
+    <div>
+      <span class="who who--ctl">ateapi</span>
+      <h3>A suspend is requested</h3>
+      <p>From you or from a controller. The chain is always the same, and no controller ever talks to the VM monitor directly.</p>
+      <div class="ev">kubectl-ate │ atecontroller ─▶ ateapi ─▶ atelet ─▶ ateom ─▶ cloud-hypervisor</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:1">
+    <div class="num">15</div>
+    <div>
+      <span class="who who--node">ateom</span>
+      <h3>First: does this worker even have a device?</h3>
+      <p>The check happens before anything is asked of the VM monitor, so an actor without a GPU pays nothing at all for this machinery existing.</p>
+    </div>
+  </div>
+
+  <div class="step" style="--i:2">
+    <div class="num">16</div>
+    <div>
+      <span class="who who--guest">inside your container</span>
+      <h3>Turn persistence mode off</h3>
+      <p>This has to happen before anything else, and it has to happen inside the guest.</p>
+      <div class="ev">$ nvidia-smi -pm 0</div>
+      <div class="why"><b>With persistence on, the driver holds a reference to the card indefinitely.</b> The kernel's PCI remove callback sits in a loop waiting for that reference count to reach zero, and it never does. The eject would hang forever.</div>
+      <div class="why"><b>Why "inside your container" and not "inside the guest":</b> the guest has no shell — busybox only, no <code>/bin/sh</code>. Every question we ask the guest has to be executed inside a container via the agent. That one constraint shapes a surprising amount of this design.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:3">
+    <div class="num">17</div>
+    <div>
+      <span class="who who--node">ateom</span>
+      <h3>Ask the VM monitor to eject the card</h3>
+      <div class="ev">POST /api/v1/vm.remove-device   { "id": "<span class="k">_vfio4</span>" }</div>
+      <div class="why"><b>The id is auto-assigned from a counter that is global across all devices</b>, so the first passthrough device is not reliably <code>_vfio0</code>. We have watched it go <code>_vfio3</code> → <code>_vfio4</code> across a single cycle. It has to be read back, never assumed.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:4">
+    <div class="num">18</div>
+    <div>
+      <span class="who who--node">ateom</span>
+      <h3>Wait for the eject to genuinely finish</h3>
+      <p>Two independent signals both have to clear: the device id leaving the VM's device tree, and the monitor's <code>/dev/vfio/&lt;group&gt;</code> file descriptor disappearing from its open files.</p>
+      <div class="chips"><span class="chip">measured 1.68 s</span></div>
+      <div class="why"><b>Why two signals:</b> cloud-hypervisor clears its own config the instant an eject is <em>requested</em> — which is precisely the window this check exists to observe. Trusting the config alone would report success while the card was still attached.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:5">
+    <div class="num">19</div>
+    <div>
+      <span class="who who--node">ateom</span>
+      <h3>Refuse to snapshot if the card is somehow still attached</h3>
+      <p>A last gate before the point of no return.</p>
+      <div class="why why--warn"><b>This one is nasty.</b> The VM monitor's passthrough device has an empty pause implementation. So <code>vm.pause</code> stops the virtual CPUs, but a bus-mastering GPU carries on writing into the very memory being serialised. You get a torn snapshot — and the monitor reports success. The only defence is refusing to start.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:6">
+    <div class="num">20</div>
+    <div>
+      <span class="who who--node">cloud-hypervisor</span>
+      <h3>Pause, then snapshot</h3>
+      <p>Guest RAM and vCPU registers go to disk. No GPU state — none of it was ever readable.</p>
+      <div class="ev">POST /api/v1/vm.pause
+POST /api/v1/vm.snapshot</div>
+      <div class="why"><b>The card is now free.</b> Another actor can be given it while this one sits on disk. That is the entire point of the exercise.</div>
+    </div>
+  </div>
+
+  <!-- ================= PHASE 5 ================= -->
+  <div class="phase" id="p5">
+    <div class="phase-kicker">Phase five</div>
+    <h2>Resuming — taking it back</h2>
+    <p>Not simply the reverse. Two things have to be done differently, and both were discovered on hardware rather than predicted.</p>
+  </div>
+
+  <div class="step" style="--i:0">
+    <div class="num">21</div>
+    <div>
+      <span class="who who--node">ateom</span>
+      <h3>Restore the memory eagerly, not on demand</h3>
+      <p>Ordinary actors page their memory back lazily as it is touched. Any actor with a passthrough device is forced to copy all of it up front.</p>
+      <div class="chips"><span class="chip">eager ≈ 1.6 s</span><span class="chip chip--n">ordinary actor: 164–676 ms</span></div>
+      <div class="why"><b>VFIO has to pin guest memory to map it into the IOMMU</b>, and pages backed by lazy fault handling cannot be pinned. Get this wrong and the attach in the next step fails with <code>VfioDmaMap(IommuDmaMap(Error(14)))</code>.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:1">
+    <div class="num">22</div>
+    <div>
+      <span class="who who--node">ateom</span>
+      <h3>Attach the card <em>before</em> resuming the guest</h3>
+      <div class="ev">POST /api/v1/vm.add-device
+  { "path": "/sys/bus/pci/devices/<span class="k">0000:da:00.0</span>/" }</div>
+      <div class="chips"><span class="chip">measured 0.65 s</span></div>
+      <div class="why"><b>Order matters:</b> a running guest will process the hot-plug event before the monitor has finished mapping the new memory windows, and the device comes up wrong.</div>
+      <div class="why"><b>The address comes from the worker's current allocation, never from the snapshot.</b> An actor can resume on a different machine, where the same model of card sits at a different PCI address.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:2">
+    <div class="num">23</div>
+    <div>
+      <span class="who who--node">cloud-hypervisor</span>
+      <h3>Resume the guest</h3>
+      <div class="ev">POST /api/v1/vm.resume</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:3">
+    <div class="num">24</div>
+    <div>
+      <span class="who who--guest">inside your container</span>
+      <h3>Check the GPU — and re-probe the driver if it did not come back</h3>
+      <p>One <code>nvidia-smi -L</code>. If it fails, the driver is unbound and rebound by writing the guest's PCI address into sysfs, then polled until it answers.</p>
+      <div class="ev">$ echo &lt;bdf&gt; &gt; /sys/bus/pci/drivers/nvidia/unbind
+$ echo &lt;bdf&gt; &gt; <span class="k">/sys/bus/pci/drivers/nvidia/bind</span></div>
+      <div class="why"><b>This step is the one the design did not anticipate.</b> The guest's own hot-plug probe fails: it assigns the memory windows and probes the card 14 milliseconds later, at which point the driver reports the GPU has no firmware processor and gives up — permanently. Writing to <code>bind</code> re-probes a card whose windows have since settled, and it binds the same GPU with the same UUID.</div>
+      <div class="why"><b>It is also why the actor gets <code>/sys/bus/pci/drivers/nvidia</code> bind-mounted writable</b> over an otherwise read-only <code>/sys</code>. The capability granted is rebinding its own driver inside its own VM, which does not cross the isolation boundary.</div>
+    </div>
+  </div>
+
+  <div class="step" style="--i:4">
+    <div class="num">25</div>
+    <div>
+      <span class="who who--you">your container</span>
+      <h3>Back where we started</h3>
+      <p>Same card, same UUID, same container image, memory restored.</p>
+      <div class="chips">
+        <span class="chip">GPU usable 5.8 s after attach</span>
+        <span class="chip">total restore 9.02 s</span>
+        <span class="chip chip--n">non-GPU actor: 164–676 ms</span>
+      </div>
+      <div class="why"><b>Where the time actually goes:</b> roughly 6.7 of the 7.3 seconds of GPU overhead is the driver being probed twice — once by the failing hot-plug path, once by our rebind. The eager memory restore, which looks like the expensive part, costs about 1.6 s. If this gets optimised, that is the thing to attack.</div>
+    </div>
+  </div>
+
+  <!-- ================= PHASE 6 ================= -->
+  <div class="phase" id="p6">
+    <div class="phase-kicker">Phase six</div>
+    <h2>What this does not do</h2>
+    <p>Stated plainly, because the failure mode is the interesting part of the design.</p>
+  </div>
+
+  <div class="limits">
+    <h3>A busy GPU cannot be suspended — and it fails closed</h3>
+    <p style="color:var(--text-dim); font-size:16px;">
+      If a CUDA context is still open, the driver will not release the card. The remove callback blocks, the eject
+      wait times out, the detach returns an error, and the snapshot is refused. Nothing is corrupted; the suspend
+      simply does not happen. We cannot suspend a GPU mid-computation, and we would rather say so than produce a
+      snapshot that silently does not work.
+    </p>
+    <ul>
+      <li><b>Idle GPUs only.</b> The card must be quiescent at suspend time. <code>cuda-checkpoint</code> would be the way to lift this, and is not implemented.</li>
+      <li><b>Multi-GPU is untested.</b> The code paths handle N&gt;1 and the annotation says <code>all</code>, but no actor with more than one card has ever been exercised on hardware.</li>
+      <li><b>Cold-plug at boot is required.</b> NVRC writes the CDI spec exactly once. A card hot-added to a VM that booted without one would never appear in that spec, so the container would get no injection.</li>
+    </ul>
+  </div>
+
+  <footer>
+    Source · docs/dev/microvm-gpu-e2e.md · docs/dev/gpu-node-bootstrap.md<br>
+    Diagrams · docs/dev/vfio-gpu-passthrough.excalidraw · docs/dev/microvm-gpu-architecture.excalidraw<br>
+    All timings measured on a Tesla T4 with cloud-hypervisor v52, 2026-08-12.
+  </footer>
+
+</div><!-- /main -->
+</div><!-- /wrap -->
+
+<script>
+(function() {
+  const toc = document.getElementById('toc');
+  const links = toc.querySelectorAll('a');
+  const sections = [];
+  links.forEach(link => {
+    const el = document.getElementById(link.getAttribute('href').slice(1));
+    if (el) sections.push({ el, link });
+  });
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        links.forEach(l => l.classList.remove('active'));
+        const match = sections.find(s => s.el === entry.target);
+        if (match) {
+          match.link.classList.add('active');
+          if (window.innerWidth <= 1000) {
+            match.link.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+          }
+        }
+      }
+    });
+  }, { rootMargin: '-8% 0px -80% 0px' });
+  sections.forEach(s => observer.observe(s.el));
+  links.forEach(link => {
+    link.addEventListener('click', e => {
+      e.preventDefault();
+      const el = document.getElementById(link.getAttribute('href').slice(1));
+      if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                history.replaceState(null, '', '#' + link.getAttribute('href').slice(1)); }
+    });
+  });
+})();
+</script>
+
+</body>
+</html>
