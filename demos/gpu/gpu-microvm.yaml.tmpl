@@ -25,8 +25,10 @@
 #   - the GPU assets staged and the microvm-gpu SandboxConfig applied
 #
 # NB: in vm-passthrough mode the advertised resource is MODEL-SPECIFIC
-# (nvidia.com/<PCI_MODEL>), NOT nvidia.com/gpu. On the T4 host it is
-# nvidia.com/TU104GL_TESLA_T4 -- confirm with `kubectl describe node` and adjust.
+# (nvidia.com/<PCI_MODEL>), NOT nvidia.com/gpu. It changes with the card: an
+# A100 host advertises nvidia.com/GA100_A100_PCIE_40GB, a T4 host
+# nvidia.com/TU104GL_TESLA_T4. Read the live name off the node:
+#   kubectl get node -o jsonpath='{.status.allocatable}' | tr ',' '\n' | grep nvidia
 
 apiVersion: v1
 kind: Namespace
@@ -53,9 +55,9 @@ spec:
   template:
     resources:
       requests:
-        nvidia.com/TU104GL_TESLA_T4: "1"
+        nvidia.com/GA100_A100_PCIE_40GB: "1"
       limits:
-        nvidia.com/TU104GL_TESLA_T4: "1"
+        nvidia.com/GA100_A100_PCIE_40GB: "1"
 
 ---
 
