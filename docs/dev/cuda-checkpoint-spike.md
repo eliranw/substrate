@@ -8,6 +8,10 @@ Measured on `ipp1-1984`, A100-PCIE-40GB, guest driver 595.58.03,
 cloud-hypervisor v52, 2026-08-19. Throwaway fixture on
 `eliranw/poc-cuda-checkpoint`; nothing here is product code.
 
+Reproduction detail — environment, pod shapes, full manifests, raw logs — is in
+[`cuda-checkpoint-benchmark.md`](cuda-checkpoint-benchmark.md). This document
+argues the result; that one records how it was obtained.
+
 ---
 
 ## The question
