@@ -6,9 +6,10 @@ holding a live context suspends and resumes normally, its device memory survives
 intact, and its kernels still compute **correct** results afterwards — verified
 against exact arithmetic and an independent CPU reference.
 
-It works for vLLM too, but only once you enumerate the right processes. **The
-enumeration method is load-bearing**, and getting it wrong looks exactly like the
-technique not working.
+It works for **vLLM** too — suspended mid-serve, resumed, and answering
+byte-identically afterwards — but only once you enumerate the right processes.
+**The enumeration method is load-bearing**, and getting it wrong looks exactly
+like the technique not working.
 
 Measured on `ipp1-1984`, A100-PCIE-40GB, guest driver 595.58.03,
 cloud-hypervisor v52, 2026-08-19 and 2026-08-20. Throwaway fixture on
@@ -158,12 +159,21 @@ That difference is the whole result. Toggling only the compute app leaves the
 launcher holding a reference and the eject times out at 30 s. Toggling both:
 
 ```
-state before pid 129: running      pid 201: running
-TOGGLE pid 129 rc=0                TOGGLE pid 201 rc=0      toggle total 4781ms
-state after  pid 129: checkpointed pid 201: checkpointed
+state before pid 127: running      pid 199: running
+TOGGLE pid 127 rc=0                TOGGLE pid 199 rc=0      toggle total 4816ms
+state after  pid 127: checkpointed pid 199: checkpointed
 Detached passthrough devices for snapshot   took 3.71s
-suspend exit 0, 155s wall  ->  STATUS_SUSPENDED       resume 99s
+suspend exit 0, 155s wall  ->  STATUS_SUSPENDED       resume 100s
+device back after 6s of polling
+UNTOGGLE pid 127 rc=0              UNTOGGLE pid 199 rc=0    untoggle total 4914ms
+VERDICT: IDENTICAL -- greedy output matches across the cycle
+VERDICT: long-prompt output also identical
 ```
+
+Greedy decode, so identical output is a real check rather than a coincidence:
+the same prompt through the same weights must produce the same tokens, and a
+corrupted KV cache or a half-restored context would show up immediately. Both a
+short prompt and a 40-sentence one match. Reproduced across three runs.
 
 Note pid 129: `nvidia-smi` never listed it, yet `cuda-checkpoint --get-state`
 reported it `running` and toggled it cleanly. It was holding driver state the
@@ -176,12 +186,19 @@ refusing with *"can't save with live nvproxy clients"* rather than the driver's
 `usage_count` loop — but both are per-holder counters, so both are satisfied only
 when **every** holder is drained.
 
-### What this does not show
+### Untoggle after the rebind, not after a timer
 
-Whether vLLM still answers **correctly** afterwards. The suspend and resume both
-succeed; greedy-decode output equality across the cycle is still running at time
-of writing, and the kernel-correctness result above covers PyTorch, not a served
-model's KV cache.
+The toggle-back has to wait for the driver rebind, not merely for the actor to be
+running again. Firing it too early fails hard:
+
+```
+UNTOGGLE pid 129 rc=1 : Error initializing CUDA:      untoggle total 80ms
+```
+
+Polling `nvidia-smi -L` until the device answers fixes it, and needed **6
+seconds**. The fixture had been sleeping 2400.
+
+### What this does not show
 
 Single GPU, so there were no collectives to tear down. It says nothing about
 tensor parallelism, where `vllm-project/vllm#37921` (RFC #34303) is adding

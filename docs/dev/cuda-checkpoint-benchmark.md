@@ -188,6 +188,19 @@ cuMemcpyHtoD_v2(dptr, pattern, 4096);      // byte i = i*31+7
 Timing knobs: `HOLD_DELAY_SECONDS=90`, `CHECKPOINT_AFTER=120`,
 `RESTORE_AFTER=420`.
 
+**On the timers.** `RESTORE_AFTER` is a guest-seconds sleep spanning the cycle,
+and every fixture here originally used one. It is the wrong instrument twice
+over: 2400 wasted 40 minutes on a result decided in seconds, and 60 fired the
+untoggle *before* the driver rebind —
+
+```
+UNTOGGLE pid 129 rc=1 : Error initializing CUDA:      untoggle total 80ms
+```
+
+The vLLM fixture now sleeps a modest amount to get the guest past the frozen
+window, then polls `nvidia-smi -L` until the device answers. That poll needed
+**6 seconds**.
+
 ### 4b. PyTorch — `demos/gpu/poc-torch-checkpoint.yaml.tmpl`
 
 Sandbox `microvm-gpu-poc` (8192 MiB guest), image
@@ -429,7 +442,18 @@ run 2 — pids from /proc/*/maps
   state after  pid 129: checkpointed   pid 201: checkpointed
   Detached passthrough devices for snapshot   took 3.71s
   suspend exit 0, 155s wall -> STATUS_SUSPENDED       resume 99s
+
+run 3 — same, with the untoggle gated on the device instead of a timer
+  TOGGLE   pid 127 rc=0             TOGGLE   pid 199 rc=0     total 4816ms
+  suspend exit 0, 155s wall -> STATUS_SUSPENDED       resume 100s
+  device back after 6s of polling
+  UNTOGGLE pid 127 rc=0             UNTOGGLE pid 199 rc=0     total 4914ms
+  VERDICT: IDENTICAL -- greedy output matches across the cycle
+  VERDICT: long-prompt output also identical
 ```
+
+Greedy decode, so byte-identical output is a check and not a coincidence. Both a
+short prompt and a 40-sentence one match across the cycle.
 
 `nvidia-smi` never listed pid 129, yet `cuda-checkpoint --get-state --pid 129`
 returned `running` and the toggle succeeded. The launcher held driver state that

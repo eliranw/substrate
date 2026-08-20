@@ -42,7 +42,7 @@ spec:
 apiVersion: ate.dev/v1alpha1
 kind: ActorTemplate
 metadata:
-  name: poc-vllm-v5
+  name: poc-vllm-v7
   namespace: ate-poc-vllm
 spec:
   sandboxClass: microvm
@@ -52,10 +52,18 @@ spec:
     env:
     - name: HOLD_DELAY_SECONDS
       value: "150"
+    # Both are guest-seconds. The checkpoint is gated on vLLM answering a
+    # prompt, not on this timer, so it only has to be long enough to leave the
+    # log readable. RESTORE_AFTER has to outlast the suspend -- guest time stops
+    # while suspended, so this sleep spans the cycle and fires once the actor is
+    # running again.
     - name: CHECKPOINT_AFTER
-      value: "120"
+      value: "20"
     - name: RESTORE_AFTER
-      value: "2400"
+      value: "60"
+    # How long to wait for the GPU to come back before untoggling anyway.
+    - name: DEVICE_WAIT
+      value: "300"
     - name: MODEL
       value: "/tmp/model"
     # In-cluster plain HTTP, so the fixture has no external dependency and no
@@ -299,7 +307,17 @@ spec:
         done
         say "CHECKPOINTED -- suspend should now succeed"
 
+        # RESTORE_AFTER only has to outlast the guest's frozen window; the
+        # driver rebind after re-attach happens later still, and untoggling
+        # before it lands fails with "Error initializing CUDA". So the sleep
+        # gets the guest past the cycle and nvidia-smi decides when the device
+        # is actually usable again.
         sleep "${RESTORE_AFTER}"
+        for i in $(seq 1 "$(( DEVICE_WAIT / 2 ))"); do
+          nvidia-smi -L >/dev/null 2>&1 && { say "device back after $(( i * 2 ))s of polling"; break; }
+          sleep 2
+        done
+        nvidia-smi -L >/dev/null 2>&1 || say "device STILL not usable; untoggling anyway to capture the error"
         t2=$(date +%s%N)
         for p in $GPUPIDS; do
           $CKPT --toggle --pid "$p" >/tmp/ut.$p.log 2>&1; rc=$?
