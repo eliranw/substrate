@@ -1,16 +1,17 @@
 # Suspending a GPU actor that is using its GPU
 
-**Answer: it works, for single-process workloads.** A CUDA process checkpointed
-with NVIDIA's `cuda-checkpoint` releases the driver reference the eject blocks
-on, so an actor holding a live context suspends and resumes normally, its device
-memory survives intact, and its kernels still compute **correct** results
-afterwards — verified against exact arithmetic and an independent CPU reference.
+**Answer: it works.** A CUDA process checkpointed with NVIDIA's
+`cuda-checkpoint` releases the driver reference the eject blocks on, so an actor
+holding a live context suspends and resumes normally, its device memory survives
+intact, and its kernels still compute **correct** results afterwards — verified
+against exact arithmetic and an independent CPU reference.
 
-Multi-process servers are a different matter: vLLM cannot be checkpointed
-externally and needs native support, which upstream is building.
+It works for vLLM too, but only once you enumerate the right processes. **The
+enumeration method is load-bearing**, and getting it wrong looks exactly like the
+technique not working.
 
 Measured on `ipp1-1984`, A100-PCIE-40GB, guest driver 595.58.03,
-cloud-hypervisor v52, 2026-08-19. Throwaway fixture on
+cloud-hypervisor v52, 2026-08-19 and 2026-08-20. Throwaway fixture on
 `eliranw/poc-cuda-checkpoint`; nothing here is product code.
 
 Reproduction detail — environment, pod shapes, full manifests, raw logs — is in
@@ -139,23 +140,53 @@ into the context, still executes correctly after the device was ejected and the
 driver rebound. Module state lives in the context `cuda-checkpoint` has to
 reconstruct, so it was the most likely thing to break.
 
-## Where it does not hold: multi-process servers
+## Which processes to checkpoint
 
-vLLM does **not** suspend, even checkpointed. `nvidia-smi` reports one compute
-PID, `cuda-checkpoint --toggle` moves it to `checkpointed` cleanly, and the
-eject still times out at 30s.
+Ask the wrong oracle and the technique appears to fail. Two ways to find "the
+processes using the GPU", and for a process tree they do not agree:
 
-The reason is upstream, not here. `vllm-project/vllm#37921` (RFC #34303) is
-implementing checkpoint/restore *inside* vLLM, including `gpu_worker`
-`suspend()`/`resume()` that destroy and reinitialise NCCL communicators — 
-application-level coordination no external tool can perform. `nvidia-smi
---query-compute-apps` lists processes holding a CUDA *context*, while the
-driver's `usage_count` counts open *file descriptors*; for a single process
-those coincide, for a process tree they do not.
+| | answers | vLLM reported |
+|---|---|---|
+| `nvidia-smi --query-compute-apps` | who the driver counts as a **compute app** | **1** pid — `VLLM::EngineCore` |
+| `grep /dev/nvidia\|libcuda /proc/*/maps` | who has the device or driver **mapped** | **2** pids — the above, plus the `vllm serve` launcher |
 
-So the dividing line is not synthetic versus real. It is **single-process versus
-multi-process-with-collectives**. Serving frameworks need native support, and
-vLLM's is in flight.
+The eject blocks on `usage_count`, which counts **open file descriptors**. So the
+second list is the one that matches the constraint. For a single process the two
+coincide, which is why every earlier fixture here was unaffected.
+
+That difference is the whole result. Toggling only the compute app leaves the
+launcher holding a reference and the eject times out at 30 s. Toggling both:
+
+```
+state before pid 129: running      pid 201: running
+TOGGLE pid 129 rc=0                TOGGLE pid 201 rc=0      toggle total 4781ms
+state after  pid 129: checkpointed pid 201: checkpointed
+Detached passthrough devices for snapshot   took 3.71s
+suspend exit 0, 155s wall  ->  STATUS_SUSPENDED       resume 99s
+```
+
+Note pid 129: `nvidia-smi` never listed it, yet `cuda-checkpoint --get-state`
+reported it `running` and toggled it cleanly. It was holding driver state the
+whole time, invisible to the tool being used to look for exactly that.
+
+The enumeration above is [dims' wrapper from PR
+#96](https://github.com/agent-substrate/substrate/pull/96), which does the same
+scan for the gVisor + nvproxy path. His blocker is different — `runsc checkpoint`
+refusing with *"can't save with live nvproxy clients"* rather than the driver's
+`usage_count` loop — but both are per-holder counters, so both are satisfied only
+when **every** holder is drained.
+
+### What this does not show
+
+Whether vLLM still answers **correctly** afterwards. The suspend and resume both
+succeed; greedy-decode output equality across the cycle is still running at time
+of writing, and the kernel-correctness result above covers PyTorch, not a served
+model's KV cache.
+
+Single GPU, so there were no collectives to tear down. It says nothing about
+tensor parallelism, where `vllm-project/vllm#37921` (RFC #34303) is adding
+`gpu_worker` `suspend()`/`resume()` that destroy and reinitialise NCCL
+communicators. That work may still be required above TP=1.
 
 ## Still untested
 

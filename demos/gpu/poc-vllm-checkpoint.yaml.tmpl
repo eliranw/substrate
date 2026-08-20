@@ -42,7 +42,7 @@ spec:
 apiVersion: ate.dev/v1alpha1
 kind: ActorTemplate
 metadata:
-  name: poc-vllm
+  name: poc-vllm-v5
   namespace: ate-poc-vllm
 spec:
   sandboxClass: microvm
@@ -58,11 +58,10 @@ spec:
       value: "2400"
     - name: MODEL
       value: "/tmp/model"
-    # In-cluster plain HTTP. huggingface.co is reset from inside an actor while
-    # ordinary pod networking reaches it fine, so the model is staged by a pod
-    # that can, and pulled from its ClusterIP. The egress path dials IP:port
-    # from the CONNECT authority, so a ClusterIP is reachable the same way any
-    # other address is.
+    # In-cluster plain HTTP, so the fixture has no external dependency and no
+    # SigV4 or TLS to get wrong. It also exercises a ClusterIP from inside an
+    # actor, which works because the egress path dials IP:port straight from
+    # the CONNECT authority.
     - name: MODEL_HOST
       value: "10.102.148.70:8080"
     # Fraction of the 40 GB card vLLM may use. A checkpoint drains all of it
@@ -242,9 +241,37 @@ spec:
         || { say "vLLM NEVER CAME UP: $(tail -c 400 /tmp/vllm.log | tr '\n' ' ')"; sleep infinity; }
 
       # vLLM runs its engine in a child process, so the PID holding the CUDA
-      # context is not the one we launched. Ask the driver who is using the GPU.
-      GPUPIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | tr -d ' ' | tr '\n' ' ')
-      say "GPU compute PIDs: ${GPUPIDS:-none}  (launched pid $SERVER)"
+      # context is not the one we launched. Two ways to ask who is using the
+      # GPU, and they do not have to agree:
+      #
+      #   nvidia-smi --query-compute-apps  who the driver counts as a compute
+      #                                    app, i.e. who holds a CUDA context
+      #   /proc/<pid>/maps                 who has the device or the driver
+      #                                    libraries mapped at all
+      #
+      # The eject blocks on the driver's usage_count, which counts open file
+      # descriptors -- so the second list is the one that matches the
+      # constraint. For a single process the two coincide; for a process tree
+      # they need not.
+      SMIPIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | tr -d ' ' | tr '\n' ' ')
+      MAPPIDS=""
+      for d in /proc/[0-9]*; do
+        pid=${d#/proc/}
+        [ "$pid" = "$$" ] && continue
+        [ -r "$d/maps" ] || continue
+        grep -qE '(/dev/nvidia|libcuda\.so|libcudart\.so|libnvidia-ml\.so)' "$d/maps" 2>/dev/null \
+          && MAPPIDS="$MAPPIDS $pid"
+      done
+      say "PIDS via nvidia-smi   :${SMIPIDS:+ }${SMIPIDS:-none}"
+      say "PIDS via /proc/*/maps :${MAPPIDS:- none}"
+      for p in $MAPPIDS; do
+        say "  pid $p  $(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 90)"
+      done
+
+      # Toggle the /proc-derived list: it is a superset, and a process that has
+      # libcuda mapped without ever creating a context simply reports an
+      # initialization error, which is logged and skipped rather than fatal.
+      GPUPIDS="$MAPPIDS"
 
       PROMPT="The capital of France is"
       BEFORE=$(python3 /tmp/ask.py "$PROMPT")
@@ -262,8 +289,8 @@ spec:
         done
         t0=$(date +%s%N)
         for p in $GPUPIDS; do
-          $CKPT --toggle --pid "$p" >/tmp/tg.$p.log 2>&1
-          say "TOGGLE pid $p rc=$? : $(head -c 140 /tmp/tg.$p.log | tr '\n' ' ')"
+          $CKPT --toggle --pid "$p" >/tmp/tg.$p.log 2>&1; rc=$?
+          say "TOGGLE pid $p rc=$rc : $(head -c 140 /tmp/tg.$p.log | tr '\n' ' ')"
         done
         t1=$(date +%s%N)
         say "toggle total $(( (t1-t0)/1000000 ))ms"
@@ -275,8 +302,8 @@ spec:
         sleep "${RESTORE_AFTER}"
         t2=$(date +%s%N)
         for p in $GPUPIDS; do
-          $CKPT --toggle --pid "$p" >/tmp/ut.$p.log 2>&1
-          say "UNTOGGLE pid $p rc=$? : $(head -c 140 /tmp/ut.$p.log | tr '\n' ' ')"
+          $CKPT --toggle --pid "$p" >/tmp/ut.$p.log 2>&1; rc=$?
+          say "UNTOGGLE pid $p rc=$rc : $(head -c 140 /tmp/ut.$p.log | tr '\n' ' ')"
         done
         t3=$(date +%s%N)
         say "untoggle total $(( (t3-t2)/1000000 ))ms"

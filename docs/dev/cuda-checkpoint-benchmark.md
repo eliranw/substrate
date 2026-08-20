@@ -248,9 +248,21 @@ Sandbox `microvm-gpu-vllm` (16384 MiB guest), `vllm/vllm-openai:v0.11.0`, servin
 an in-cluster `modelhost` Service over plain HTTP rather than from
 `huggingface.co`, so the fixture has no external dependency.
 
-The wrapper checkpoints whatever `nvidia-smi --query-compute-apps=pid` reports,
-not the PID it launched — vLLM forks, and the launcher is not the process holding
-the context.
+vLLM forks, so the launched PID is not the one holding the context. The fixture
+prints **both** enumerations and toggles the `/proc/*/maps` list:
+
+```sh
+SMIPIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | tr -d ' ' | tr '\n' ' ')
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}; [ "$pid" = "$$" ] && continue; [ -r "$d/maps" ] || continue
+  grep -qE '(/dev/nvidia|libcuda\.so|libcudart\.so|libnvidia-ml\.so)' "$d/maps" 2>/dev/null \
+    && MAPPIDS="$MAPPIDS $pid"
+done
+```
+
+Toggles are reported per PID and never abort the run: a process with `libcuda`
+mapped but no context returns an initialization error, which is logged and
+skipped.
 
 ### Constraints that shaped every fixture
 
@@ -396,21 +408,39 @@ past 112,000 matmuls with `integrity=OK` throughout.
 `maxerr` is bit-identical either side, not merely within tolerance. Still
 passing at round 138.
 
-### 6e. vLLM: checkpointing the compute PID is not sufficient
+### 6e. vLLM — enumeration decides the outcome
+
+Same fixture, same model, same `gpu_memory_utilization`. The only variable is
+**which processes get toggled**.
 
 ```
-GPU compute PIDs: 162  (launched pid 92)
-TOGGLE pid 162 rc=0 in 4147ms    running -> checkpointed
-suspend -> while confirming eject of _vfio4: device _vfio4 not ejected within 30s
+run 1 — pids from nvidia-smi --query-compute-apps
+  GPU compute PIDs: 162  (launched pid 92)
+  TOGGLE pid 162 rc=4147ms                     running -> checkpointed
+  suspend: while confirming eject of _vfio4: device _vfio4 not ejected within 30s
+
+run 2 — pids from /proc/*/maps
+  PIDS via nvidia-smi   : 201
+  PIDS via /proc/*/maps : 129 201
+    pid 129  /usr/bin/python /usr/local/bin/vllm serve /tmp/model --port 8000 ...
+    pid 201  VLLM::EngineCore
+  state before pid 129: running        pid 201: running
+  TOGGLE pid 129 rc=0                  TOGGLE pid 201 rc=0     total 4781ms
+  state after  pid 129: checkpointed   pid 201: checkpointed
+  Detached passthrough devices for snapshot   took 3.71s
+  suspend exit 0, 155s wall -> STATUS_SUSPENDED       resume 99s
 ```
 
-One compute PID reported, toggled cleanly, eject still blocked. See
-`cuda-checkpoint-spike.md` for why: vLLM needs native support
-(`vllm-project/vllm#37921`), because `gpu_worker` suspend/resume must destroy and
-reinitialise NCCL communicators.
+`nvidia-smi` never listed pid 129, yet `cuda-checkpoint --get-state --pid 129`
+returned `running` and the toggle succeeded. The launcher held driver state that
+the tool used to look for driver state did not report.
 
-Checkpoint cost scales with allocated VRAM: 465 ms for the 1024x1024 correctness
-fixture, 4147 ms for vLLM at `gpu_memory_utilization=0.10`.
+Run 1's conclusion — that vLLM needs native support — **was wrong, and is
+retracted.** It was an under-count, not a coordination problem. Single GPU means
+no collectives, so this says nothing about tensor parallelism.
+
+Checkpoint cost still scales with allocated VRAM: 465 ms for the 1024x1024
+correctness fixture, ~4.1-4.8 s for vLLM at `gpu_memory_utilization=0.10`.
 
 ### 6f. Timing summary
 
@@ -525,9 +555,9 @@ during this work. `workerSelector` lets them share one WorkerPool.
 
 - **In-flight work.** The device was quiesced before every checkpoint, which
   sidesteps precisely the restriction NVIDIA documents.
-- **Multi-GPU**, IPC / peer access, CUDA graphs. NCCL was reached only
-  indirectly: vLLM failed to suspend on a single GPU, and upstream attributes
-  that to communicator teardown, but no NCCL job was run deliberately.
+- **Multi-GPU**, IPC / peer access, CUDA graphs, NCCL. vLLM ran at TP=1, so no
+  collectives existed to tear down; `vllm-project/vllm#37921` may still be
+  required above TP=1.
 - **Restoring onto a different physical card.** Actors resume on whichever
   worker is free; behaviour across GPU UUIDs is unknown, and this is a
   single-GPU node so it could not be tested.
