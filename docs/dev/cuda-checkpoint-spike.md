@@ -75,26 +75,57 @@ The driver rebind after re-attach is still required. Ampere behaves like the T4
 there: the guest's own hot-plug probe fails and the address has to be written to
 `/sys/bus/pci/drivers/nvidia/bind`.
 
-## What this does not prove
+## Confirmed with PyTorch
 
-The tested context is the simplest one that exists:
+The first fixture held a bare driver context with one allocation and never
+launched a kernel, which was a fair objection to the result. A second fixture
+ran the real thing: **torch 2.13.0a0 on the A100**, a 512 MiB checksummed
+tensor, and continuous 2048x2048 cuBLAS matmuls on a non-default stream with
+568 MiB live in the caching allocator.
 
-```c
-cuInit(0); cuDeviceGet(&dev, 0); cuCtxCreate_v2(&ctx, 0, dev);
-cuMemAlloc_v2(&dptr, 64 MiB); cuMemcpyHtoD_v2(...); cuMemcpyDtoH_v2(...);
+Checkpointed mid-workload, then suspended and resumed:
+
+```
+toggling back; state: checkpointed
+UNTOGGLE rc=0
+matmuls=420  allocated=568MiB  digest=e4cda77b566f6763  integrity=OK
+matmuls=440  allocated=568MiB  digest=e4cda77b566f6763  integrity=OK
 ```
 
-No kernel launch, no streams, no in-flight work, no Runtime API, no managed or
-pinned memory, no cuBLAS/cuDNN/NCCL, no CUDA graphs, one GPU. The device was
-fully quiescent at checkpoint time, which sidesteps NVIDIA's documented
-restrictions on in-flight operations.
+Same digest as before the cycle, and the matmul counter resumed from where it
+stopped. It has since run past 112,000 matmuls, integrity OK throughout.
 
-The part that should generalise is the `usage_count` release — that is a
-property of the device handle, not of the workload. Whether a *complex* CUDA
-state restores correctly is a question about `cuda-checkpoint` itself.
+So the result holds for the Runtime API, the caching allocator, cuBLAS kernels
+and a non-default stream — not just a bare context.
 
-Also untested: restoring onto a **different physical card**. Actors resume on
-whichever worker is free, and behaviour across GPU UUIDs is unknown.
+Still untested: **in-flight work** (the device was quiesced before every
+checkpoint, which sidesteps NVIDIA's documented restrictions), multi-GPU, IPC
+and peer access, NCCL, CUDA graphs, and restoring onto a **different physical
+card** — actors resume on whichever worker is free, and behaviour across GPU
+UUIDs is unknown.
+
+## What it costs
+
+Guest RAM is the gate, and there is no per-actor override: `default_memory`
+comes only from the staged kata-config. PyTorch needs more than the stock 2048
+MiB before it allocates anything on the device, so this ran on a separate
+`microvm-gpu-poc` SandboxConfig at 8192 MiB.
+
+Snapshot size follows the checkpointed VRAM, because that is where it lands:
+
+| snapshot (`memory-ranges.zstd`) | size |
+|---|---|
+| golden, idle GPU, 8 GB guest | 149 MB |
+| PyTorch, 568 MiB allocated, checkpointed | **1,132 MB** |
+
+The suspend/resume path itself is unchanged — detach 3.32 s, re-attach 12.57 s,
+restore 37.5 s, all within noise of an idle actor. What grows is the snapshot,
+and it is read back **eagerly**, since a passthrough device forbids lazy
+restore.
+
+One number worth chasing: suspend wall time was 325 s, of which ateom's own
+work was 21 s. The remaining ~5 minutes sat in the control plane before ateom
+was asked to do anything. Not investigated.
 
 ## The constraint that decides whether this is usable
 
