@@ -30,6 +30,9 @@ const (
 	// cpuQuotaPeriodMicros is the cgroup v2 cpu.max period (100ms, the kernel
 	// default) against which the CPU quota is expressed.
 	cpuQuotaPeriodMicros = 100000
+	// cpuQuotaMinMicros is the smallest quota the kernel accepts:
+	// tg_set_cfs_bandwidth rejects anything below 1ms with EINVAL.
+	cpuQuotaMinMicros = 1000
 )
 
 // SandboxSize is the sandbox's target size, derived from the actor's declared
@@ -70,6 +73,21 @@ func (s SandboxSize) VCPUs() int {
 	return int(v)
 }
 
+// CPUQuota converts a milli-core limit into the cgroup v2 cpu.max pair: a
+// container limited to N milli-cores may run for N/1000 of every period.
+//
+// A quota under 1ms is raised to that floor, as kubelet's MilliCPUToQuota does.
+// The kernel rejects a smaller one outright, so an unclamped limit below 10m
+// would fail the cgroup write rather than the declared field, with an error
+// naming neither. Every caller that turns a limit into an OCI spec goes through
+// here so the floor cannot be applied on one path and missed on another.
+//
+// milliCPU must be positive; callers treat a non-positive limit as "unset" and
+// leave the quota off the spec entirely.
+func CPUQuota(milliCPU int64) (quota int64, period uint64) {
+	return max(milliCPU*cpuQuotaPeriodMicros/1000, cpuQuotaMinMicros), cpuQuotaPeriodMicros
+}
+
 // ApplyToOCISpec writes the pod's CPU/memory limits into the container OCI spec's
 // linux.resources so the sandbox cgroup is created with the right values. This is
 // the piece shared by both runtimes: runsc applies it to the host cgroup leaf
@@ -90,8 +108,7 @@ func (s SandboxSize) ApplyToOCISpec(spec *specs.Spec) {
 		if spec.Linux.Resources.CPU == nil {
 			spec.Linux.Resources.CPU = &specs.LinuxCPU{}
 		}
-		period := uint64(cpuQuotaPeriodMicros)
-		quota := s.MilliCPU * cpuQuotaPeriodMicros / 1000
+		quota, period := CPUQuota(s.MilliCPU)
 		spec.Linux.Resources.CPU.Period = &period
 		spec.Linux.Resources.CPU.Quota = &quota
 	}

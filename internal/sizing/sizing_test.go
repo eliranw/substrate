@@ -101,3 +101,50 @@ func TestApplyToOCISpecNoopWhenEmpty(t *testing.T) {
 		t.Error("empty SandboxSize mutated spec")
 	}
 }
+
+// The quota must stay proportional to the declared milli-cores, and never fall
+// below the 1ms the kernel accepts: a spec carrying a smaller quota is refused
+// at container create with an error naming the cgroup write, not the limit.
+func TestCPUQuota(t *testing.T) {
+	tests := []struct {
+		name      string
+		milliCPU  int64
+		wantQuota int64
+	}{
+		{name: "one core", milliCPU: 1000, wantQuota: cpuQuotaPeriodMicros},
+		{name: "two cores", milliCPU: 2000, wantQuota: 2 * cpuQuotaPeriodMicros},
+		{name: "a fraction of a core", milliCPU: 200, wantQuota: 20000},
+		{name: "exactly the floor", milliCPU: 10, wantQuota: cpuQuotaMinMicros},
+		{name: "just under the floor is raised", milliCPU: 9, wantQuota: cpuQuotaMinMicros},
+		{name: "smallest declarable limit is raised", milliCPU: 1, wantQuota: cpuQuotaMinMicros},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			quota, period := CPUQuota(tc.milliCPU)
+			if period != cpuQuotaPeriodMicros {
+				t.Errorf("period = %d, want %d", period, cpuQuotaPeriodMicros)
+			}
+			if quota != tc.wantQuota {
+				t.Errorf("quota = %d, want %d", quota, tc.wantQuota)
+			}
+			if quota < cpuQuotaMinMicros {
+				t.Errorf("quota = %d, below the kernel minimum of %d", quota, cpuQuotaMinMicros)
+			}
+		})
+	}
+}
+
+// ApplyToOCISpec derives the quota through CPUQuota, so a limit small enough to
+// land under the kernel minimum reaches the spec at the floor.
+func TestApplyToOCISpecClampsSmallCPULimit(t *testing.T) {
+	spec := &specs.Spec{}
+	(SandboxSize{MilliCPU: 1}).ApplyToOCISpec(spec)
+
+	cpu := spec.Linux.Resources.CPU
+	if cpu == nil || cpu.Quota == nil {
+		t.Fatal("cpu quota not set")
+	}
+	if *cpu.Quota != cpuQuotaMinMicros {
+		t.Errorf("quota = %d, want the kernel minimum of %d", *cpu.Quota, cpuQuotaMinMicros)
+	}
+}
