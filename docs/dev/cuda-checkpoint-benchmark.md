@@ -241,11 +241,22 @@ before any CUDA context existed, toggled zero PIDs, and still printed
 round, the wrapper waits for it, and refuses to claim a checkpoint when the PID
 list is empty.
 
-### Two constraints that shaped both fixtures
+### 4d. vLLM — `demos/gpu/poc-vllm-checkpoint.yaml.tmpl`
+
+Sandbox `microvm-gpu-vllm` (16384 MiB guest), `vllm/vllm-openai:v0.11.0`, serving
+`Qwen2.5-0.5B-Instruct` at `gpu_memory_utilization=0.10`. Weights are pulled from
+an in-cluster `modelhost` Service over plain HTTP rather than from
+`huggingface.co`, so the fixture has no external dependency.
+
+The wrapper checkpoints whatever `nvidia-smi --query-compute-apps=pid` reports,
+not the PID it launched — vLLM forks, and the launcher is not the process holding
+the context.
+
+### Constraints that shaped every fixture
 
 **The golden-snapshot window.** A pool's warm-up actor is snapshotted shortly
 after start. Snapshotting it while it holds a context would fail to detach,
-leaving the pool with no golden snapshot to create actors from. Both fixtures
+leaving the pool with no golden snapshot to create actors from. Every fixture
 idle for `HOLD_DELAY_SECONDS` first, so the warm-up snapshot happens against an
 idle GPU.
 
@@ -278,7 +289,7 @@ container. Bridging that needs an ateom change shaped like
 
 ## 5. Procedure
 
-Identical for both fixtures. The control is that **only the checkpoint differs**
+Identical for every fixture. The control is that **only the checkpoint differs**
 between the two suspends.
 
 ```bash
@@ -514,7 +525,9 @@ during this work. `workerSelector` lets them share one WorkerPool.
 
 - **In-flight work.** The device was quiesced before every checkpoint, which
   sidesteps precisely the restriction NVIDIA documents.
-- **Multi-GPU**, IPC / peer access, NCCL, CUDA graphs.
+- **Multi-GPU**, IPC / peer access, CUDA graphs. NCCL was reached only
+  indirectly: vLLM failed to suspend on a single GPU, and upstream attributes
+  that to communicator teardown, but no NCCL job was run deliberately.
 - **Restoring onto a different physical card.** Actors resume on whichever
   worker is free; behaviour across GPU UUIDs is unknown, and this is a
   single-GPU node so it could not be tested.
