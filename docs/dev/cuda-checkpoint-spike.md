@@ -127,20 +127,6 @@ One number worth chasing: suspend wall time was 325 s, of which ateom's own
 work was 21 s. The remaining ~5 minutes sat in the control plane before ateom
 was asked to do anything. Not investigated.
 
-## The constraint that decides whether this is usable
-
-**Guest RAM must be at least as large as the VRAM in use.** A checkpoint drains
-device memory into guest memory, and guest memory is what the snapshot captures.
-
-We moved 64 MiB against a 2048 MiB guest. A workload holding 20 GB on the card
-needs a guest sized for it and produces a snapshot roughly 20 GB larger — read
-back **eagerly**, because a passthrough device forbids lazy restore (VFIO must
-pin guest memory to map it into the IOMMU, and userfaultfd-backed pages cannot
-be pinned).
-
-That interaction, not the checkpoint, is what determines whether this is
-practical. It is the next thing worth measuring.
-
 ## Two defects found along the way
 
 ### A failed suspend strands the actor and leaks its GPU
@@ -172,8 +158,14 @@ fixture revision needs a new template name. Worth knowing before iterating.
 
 ```bash
 git checkout eliranw/poc-cuda-checkpoint
-# demos/gpu/poc-cuda-checkpoint.yaml.tmpl — throwaway fixture
+# demos/gpu/poc-cuda-checkpoint.yaml.tmpl  — bare driver context, 2 GB guest
+# demos/gpu/poc-torch-checkpoint.yaml.tmpl — PyTorch, needs microvm-gpu-poc (8 GB)
 ```
+
+Both are throwaway. The PyTorch one needs the `microvm-gpu-poc` SandboxConfig,
+which is the stock GPU config with a `configuration-clh-gpu-8g.toml`
+(`default_memory = 8192`, `default_vcpus = 4`) staged under
+`kata-gpu-assets/`.
 
 `cuda-checkpoint` is embedded in the template as base64 (5,976 bytes, sha256
 `707fa7f5…`). It is fetched rather than staged because SandboxConfig assets
