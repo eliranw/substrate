@@ -1,8 +1,13 @@
 # Suspending a GPU actor that is using its GPU
 
-**Answer: it works.** A CUDA process checkpointed with NVIDIA's `cuda-checkpoint`
-releases the driver reference the eject blocks on, so an actor holding a live
-context suspends and resumes normally, and its device memory survives intact.
+**Answer: it works, for single-process workloads.** A CUDA process checkpointed
+with NVIDIA's `cuda-checkpoint` releases the driver reference the eject blocks
+on, so an actor holding a live context suspends and resumes normally, its device
+memory survives intact, and its kernels still compute **correct** results
+afterwards — verified against exact arithmetic and an independent CPU reference.
+
+Multi-process servers are a different matter: vLLM cannot be checkpointed
+externally and needs native support, which upstream is building.
 
 Measured on `ipp1-1984`, A100-PCIE-40GB, guest driver 595.58.03,
 cloud-hypervisor v52, 2026-08-19. Throwaway fixture on
@@ -99,14 +104,66 @@ matmuls=440  allocated=568MiB  digest=e4cda77b566f6763  integrity=OK
 Same digest as before the cycle, and the matmul counter resumed from where it
 stopped. It has since run past 112,000 matmuls, integrity OK throughout.
 
-So the result holds for the Runtime API, the caching allocator, cuBLAS kernels
-and a non-default stream — not just a bare context.
+So the kernels launch and complete without faulting. But that fixture verified a
+digest over a *static* tensor the kernels never touched, so it proved liveness,
+not correctness — a GPU returning plausible-but-wrong numbers would still have
+reported `integrity=OK`.
 
-Still untested: **in-flight work** (the device was quiesced before every
-checkpoint, which sidesteps NVIDIA's documented restrictions), multi-GPU, IPC
-and peer access, NCCL, CUDA graphs, and restoring onto a **different physical
-card** — actors resume on whichever worker is free, and behaviour across GPU
-UUIDs is unknown.
+## Correctness, measured
+
+A third fixture closes that gap with three checks that fail for different
+reasons, each with its output buffer zeroed first so "the kernel silently did
+not run" fails the same way "the kernel returned garbage" does:
+
+| check | rules out |
+|---|---|
+| `ones @ ones == 1024`, exact equality | cuBLAS returning wrong values. 1024 is exactly representable, so no tolerance is needed and TF32 cannot muddy it |
+| `a @ b` against a **float64 CPU reference** | wrong results on irregular data, measured against something the device under test cannot corrupt |
+| a hand-written `3x+7` kernel built with `nvcc` | the non-library path, and whether a compiled module survives |
+
+Across a full cycle — checkpoint, suspend, GPU ejected, restore, re-attach,
+driver rebind, un-checkpoint:
+
+```
+round=13  exact=ok(mismatched=0) ref=ok(maxerr=3.343e-03) custom=ok(mismatched=0)   <- last before
+          [ actor checkpointed / restored, device ejected and re-attached ]
+round=14  exact=ok(mismatched=0) ref=ok(maxerr=3.343e-03) custom=ok(mismatched=0)   <- first after
+```
+
+`maxerr` is **bit-identical** either side, not merely within tolerance. Still
+passing at round 138. Cycle cost: toggle 465 ms out, suspend 87.4 s, resume
+67.4 s, toggle 2010 ms back.
+
+The custom kernel is the load-bearing one: an `nvcc`-compiled module, loaded
+into the context, still executes correctly after the device was ejected and the
+driver rebound. Module state lives in the context `cuda-checkpoint` has to
+reconstruct, so it was the most likely thing to break.
+
+## Where it does not hold: multi-process servers
+
+vLLM does **not** suspend, even checkpointed. `nvidia-smi` reports one compute
+PID, `cuda-checkpoint --toggle` moves it to `checkpointed` cleanly, and the
+eject still times out at 30s.
+
+The reason is upstream, not here. `vllm-project/vllm#37921` (RFC #34303) is
+implementing checkpoint/restore *inside* vLLM, including `gpu_worker`
+`suspend()`/`resume()` that destroy and reinitialise NCCL communicators — 
+application-level coordination no external tool can perform. `nvidia-smi
+--query-compute-apps` lists processes holding a CUDA *context*, while the
+driver's `usage_count` counts open *file descriptors*; for a single process
+those coincide, for a process tree they do not.
+
+So the dividing line is not synthetic versus real. It is **single-process versus
+multi-process-with-collectives**. Serving frameworks need native support, and
+vLLM's is in flight.
+
+## Still untested
+
+**In-flight work** — the device was quiesced before every checkpoint, which
+sidesteps precisely the restriction NVIDIA documents. Also multi-GPU, IPC and
+peer access, NCCL, CUDA graphs, and restoring onto a **different physical card**
+(actors resume on whichever worker is free; behaviour across GPU UUIDs is
+unknown, and this is a single-GPU node).
 
 ## What it costs
 

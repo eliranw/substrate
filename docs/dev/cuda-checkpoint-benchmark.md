@@ -4,7 +4,8 @@ Reproduction detail for `docs/dev/cuda-checkpoint-spike.md`. That document
 argues the result; this one records exactly what was run, on what, and what came
 back, so the numbers can be re-derived or disputed.
 
-**Run date:** 2026-08-19 · **Branch:** `eliranw/poc-cuda-checkpoint`
+**Run dates:** 2026-08-19 (context, PyTorch) and 2026-08-20 (kernel correctness,
+vLLM) · **Branch:** `eliranw/poc-cuda-checkpoint`
 **Everything below is throwaway PoC material**, not product code.
 
 ---
@@ -66,7 +67,7 @@ VMM: cloud-hypervisor **v52.0.0**. Object store: rustfs (in-cluster S3).
 
 ## 2. Sandbox configuration
 
-Two configs. They differ in **one asset** — the guest's memory budget.
+Three configs, differing in **one asset** — the guest's memory budget.
 
 ```
 microvm-gpu                                          microvm-gpu-poc
@@ -96,6 +97,9 @@ default_vcpus = 4
 the guest image they describe still matches. Note the **absence of
 `pci=nocrs`** — `assemble-gpu.sh` strips it, because it makes the guest ignore
 the VMM's real MMIO windows and breaks hot-plug.
+
+A third, `microvm-gpu-vllm`, uses `configuration-clh-gpu-16g.toml` (sha256
+`21f6a566…`, `default_memory = 16384`, `default_vcpus = 6`) for the vLLM run.
 
 Staged to `s3://ate-snapshots/kata-gpu-assets/`.
 
@@ -210,6 +214,32 @@ while True:
 Exercises the Runtime API, the caching allocator, cuBLAS kernels and a
 non-default stream. `TENSOR_MIB=512`, `CHECKPOINT_AFTER=150`,
 `RESTORE_AFTER=420`.
+
+### 4c. Kernel correctness — `demos/gpu/poc-kernel-correctness.yaml.tmpl`
+
+Sandbox `microvm-gpu-poc` (8192 MiB guest), same PyTorch image. Three checks,
+every output buffer zeroed before its check so a kernel that silently does not
+run fails the same way one that returns garbage does:
+
+```python
+exact_out.zero_(); torch.matmul(ones, ones, out=exact_out)
+assert int((exact_out != 1024.0).sum()) == 0          # exact, no tolerance
+
+ref = (a.cpu().double() @ b.cpu().double()).float()    # CPU reference, computed once
+err = (a @ b).cpu().sub(ref).abs().max()               # tolerance for irregular data
+
+custom_out.zero_(); mod.affine_launch(x, custom_out)   # nvcc-built 3*x+7
+assert int((custom_out != 3*x + 7).sum()) == 0
+```
+
+The custom kernel is compiled in-container with `torch.utils.cpp_extension.load_inline`.
+
+**The checkpoint is gated on readiness, not a timer.** A first attempt used a
+fixed `CHECKPOINT_AFTER=180s`; `nvcc` took 3.5 minutes, so the checkpoint fired
+before any CUDA context existed, toggled zero PIDs, and still printed
+`CHECKPOINTED`. The workload now writes `/tmp/ready` after its first passing
+round, the wrapper waits for it, and refuses to claim a checkpoint when the PID
+list is empty.
 
 ### Two constraints that shaped both fixtures
 
@@ -340,7 +370,38 @@ matmuls=440  allocated=568MiB digest=e4cda77b566f6763 integrity=OK
 Digest unchanged; the counter resumed from where it stopped. It has since run
 past 112,000 matmuls with `integrity=OK` throughout.
 
-### 6d. Timing summary
+### 6d. Kernel correctness across the cycle
+
+```
+14:38:23  GPU compute PIDs: 87  (launched 87)
+14:38:29  TOGGLE pid 87 rc=0 in 465ms      state: checkpointed
+          round=13  exact=ok(mismatched=0) ref=ok(maxerr=3.343e-03) custom=ok(mismatched=0)
+          [ Actor checkpointing / checkpointed / restoring / restored ]
+          suspend exit=0 wall=87.4s        resume wall=67.4s
+15:18:31  UNTOGGLE pid 87 rc=0 in 2010ms
+15:18:34  round=14  exact=ok(mismatched=0) ref=ok(maxerr=3.343e-03) custom=ok(mismatched=0)
+```
+
+`maxerr` is bit-identical either side, not merely within tolerance. Still
+passing at round 138.
+
+### 6e. vLLM: checkpointing the compute PID is not sufficient
+
+```
+GPU compute PIDs: 162  (launched pid 92)
+TOGGLE pid 162 rc=0 in 4147ms    running -> checkpointed
+suspend -> while confirming eject of _vfio4: device _vfio4 not ejected within 30s
+```
+
+One compute PID reported, toggled cleanly, eject still blocked. See
+`cuda-checkpoint-spike.md` for why: vLLM needs native support
+(`vllm-project/vllm#37921`), because `gpu_worker` suspend/resume must destroy and
+reinitialise NCCL communicators.
+
+Checkpoint cost scales with allocated VRAM: 465 ms for the 1024x1024 correctness
+fixture, 4147 ms for vLLM at `gpu_memory_utilization=0.10`.
+
+### 6f. Timing summary
 
 All figures from ateom's structured log except *wall*, which is the
 `kubectl-ate` command duration.
@@ -361,7 +422,7 @@ All figures from ateom's structured log except *wall*, which is the
 **The suspend/resume path is insensitive to the checkpoint.** Detach and
 re-attach are within noise across all three columns.
 
-### 6e. Snapshot size
+### 6g. Snapshot size
 
 `aws s3 ls --recursive s3://ate-snapshots/ate-poc-torch/`:
 
@@ -382,7 +443,7 @@ into the IOMMU; userfaultfd-backed pages cannot be pinned).
 workload holding 20 GB on the card needs a guest sized for it and a snapshot
 roughly that much larger.
 
-### 6f. Unexplained latency
+### 6h. Unexplained latency
 
 PyTorch suspend wall was **325.3 s**, of which `CheckpointWorkload` was
 **21.4 s**:
@@ -460,3 +521,45 @@ during this work. `workerSelector` lets them share one WorkerPool.
 - **Large VRAM footprints.** 568 MiB was moved. The interesting regime is tens
   of GB, where snapshot size and eager restore dominate.
 - **Repeat runs.** Each figure is a single observation, not a distribution.
+
+---
+
+## 9. Cluster defects encountered
+
+Neither is a GPU issue, but both cost time and one invalidated an earlier
+finding, so they are recorded here.
+
+### atenet-egress serves an expired certificate
+
+Actor egress died mid-run. The symptom inside an actor was
+`ConnectionResetError: [Errno 104]` on every outbound connection, and **the
+egress gateway logged nothing at all** — the TLS handshake fails before any
+request exists, so there is nothing to log.
+
+```
+atunnel: egress gateway TLS handshake: tls: failed to verify certificate:
+  x509: certificate has expired or is not yet valid
+
+atenet-egress serving cert:  notBefore Aug 19 11:54:17 2026
+                             notAfter  Aug 20 11:54:17 2026
+```
+
+Rotation itself works — `api.ate-system.svc` and `atenet-router.ate-system.svc`
+both held certs renewed that morning. The gateway simply never **reloads** its
+rotated cert; it serves whatever it read at startup. `kubectl rollout restart
+deploy/atenet-egress` produced a valid one immediately.
+
+Effect: actor egress silently dies roughly 24 hours after the gateway pod
+starts, and the failure surfaces far from its cause.
+
+**This invalidated a finding.** "huggingface.co is reset from an actor while
+github works" compared measurements taken either side of the expiry. Nothing was
+special about HuggingFace.
+
+### Model fetching, once egress was restored
+
+`huggingface.co` is reachable from ordinary pod networking. The vLLM fixture
+still fetches from an in-cluster `modelhost` Service over plain HTTP — no SigV4,
+no TLS, no external dependency — which is more robust for a fixture and proves
+in passing that an actor can reach a **ClusterIP**, consistent with the egress
+path dialing IP:port from the CONNECT authority.
