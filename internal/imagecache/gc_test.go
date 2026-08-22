@@ -17,6 +17,7 @@ package imagecache
 import (
 	"archive/tar"
 	"context"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -232,6 +233,62 @@ func TestEvictUnusedRootSet(t *testing.T) {
 	}
 }
 
+// A bundle's image volumes root their images exactly like its rootfs does:
+// the volume's layers are bind-mounted for as long as the bundle exists.
+func TestEvictUnusedRootSetImageVolumes(t *testing.T) {
+	_, host := newTestRegistry(t)
+	refRootfs := host + "/test/rootfs:latest"
+	refVolume := host + "/test/volume:latest"
+	for _, r := range []string{refRootfs, refVolume} {
+		pushImage(t, r, v1.Config{}, layerFromEntries(t, []tarEntry{
+			{name: "f-" + r[len(r)-8:], typeflag: tar.TypeReg, mode: 0o644, body: r},
+		}))
+	}
+
+	actorsDir := t.TempDir()
+	store := newTestStore(t, WithActorsDir(actorsDir))
+	imgRootfs := mustEnsure(t, store, refRootfs)
+	imgVolume := mustEnsure(t, store, refVolume)
+
+	bundle := filepath.Join(actorsDir, "actor-1", "bundles", "main")
+	if err := os.MkdirAll(bundle, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSpec(bundle, &OverlaySpec{
+		ImageDigest: imgRootfs.Digest.String(),
+		Layers:      imgRootfs.LayerDirs,
+		ImageVolumes: []ImageVolumeOverlay{{
+			Name:        "agent",
+			ImageDigest: imgVolume.Digest.String(),
+			Layers:      imgVolume.LayerDirs,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rs, err := store.InUse()
+	if err != nil {
+		t.Fatalf("InUse: %v", err)
+	}
+	if !rs.ImageDigests[imgVolume.Digest.String()] {
+		t.Error("InUse missing image volume digest")
+	}
+	if !rs.LayerHexes[filepath.Base(imgVolume.LayerDirs[0])] {
+		t.Error("InUse missing image volume layer")
+	}
+
+	backdateStore(t, store, 3*time.Hour)
+	if _, err := store.EvictUnused(context.Background(), math.MaxInt64, false); err != nil {
+		t.Fatalf("EvictUnused: %v", err)
+	}
+	if _, err := os.Stat(store.recordPath(imgVolume.Digest)); err != nil {
+		t.Errorf("image volume record evicted while its bundle exists: %v", err)
+	}
+	if _, err := os.Stat(imgVolume.LayerDirs[0]); err != nil {
+		t.Errorf("image volume layer evicted while its bundle exists: %v", err)
+	}
+}
+
 // An unreadable record must gate the whole pass: its refcounts are
 // invisible, so a layer it shares with a readable candidate would hit
 // zero and be retired while the unreadable record still names it.
@@ -332,6 +389,9 @@ func TestEvictUnusedSkipsPassOnUnreadableRoots(t *testing.T) {
 			if err == nil {
 				t.Fatal("EvictUnused returned no error with an unenumerable root set")
 			}
+			if !errors.Is(err, ErrIncompleteEnumeration) {
+				t.Errorf("gate error does not wrap ErrIncompleteEnumeration: %v", err)
+			}
 			if stats.EvictedImages != 0 || stats.EvictedLayers != 0 {
 				t.Errorf("gated pass still evicted: %+v", stats)
 			}
@@ -388,6 +448,9 @@ func TestEvictUnusedSkipsPassOnBadRecord(t *testing.T) {
 			stats, err := store.EvictUnused(context.Background(), math.MaxInt64, false)
 			if err == nil {
 				t.Fatal("EvictUnused returned no error on a bad record")
+			}
+			if !errors.Is(err, ErrIncompleteEnumeration) {
+				t.Errorf("gate error does not wrap ErrIncompleteEnumeration: %v", err)
 			}
 			if stats.EvictedImages != 0 || stats.EvictedLayers != 0 {
 				t.Errorf("gated pass still evicted: %+v", stats)

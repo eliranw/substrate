@@ -27,19 +27,22 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/spf13/pflag"
 )
 
 var (
-	requestCount uint64
-	ready        atomic.Bool
-	fileMutex    sync.Mutex
+	requestCount             uint64
+	ready                    atomic.Bool
+	fileMutex                sync.Mutex
+	sigtermSleepDurationSecs atomic.Int64
 )
 
 func incrementFileCounter(filePath string) int {
@@ -61,11 +64,24 @@ func incrementFileCounter(filePath string) int {
 }
 
 func main() {
+	sigtermSleepDurationSecs.Store(15)
 	fileCounterDirectory := pflag.String("file-counter-directory", "/home/counter", "Directory for file counter")
 	secondFileCounterDirectory := pflag.String("second-file-counter-directory", "", "Directory for a second file counter; empty disables it. Used to exercise an Actor with more than one durable volume")
 	validateExistingFilePath := pflag.String("validate-existing-file-path", "", "Path to existing file to validate reading")
+	extraPort := pflag.Int("extra-port", 0, "Additional port to listen on, for exercising atenet-router's arbitrary-port ingress support; 0 disables it")
+	tcpPort := pflag.Int("tcp-port", 0, "Plain TCP echo port for exercising atunnel CONNECT ingress; 0 disables it")
 	pflag.Parse()
 	ctx := context.Background()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		slog.InfoContext(ctx, "Received signal, waiting before exiting", slog.String("signal", sig.String()), slog.Int64("sleep_secs", sigtermSleepDurationSecs.Load()))
+		time.Sleep(time.Duration(sigtermSleepDurationSecs.Load()) * time.Second)
+		slog.InfoContext(ctx, "Exiting now")
+		os.Exit(0)
+	}()
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
@@ -115,6 +131,24 @@ func main() {
 		w.Write([]byte("ok\n"))
 	})
 
+	defaultMux.HandleFunc("/set-sigterm-sleep", func(w http.ResponseWriter, r *http.Request) {
+		durationStr := r.URL.Query().Get("duration")
+		if durationStr == "" {
+			http.Error(w, "missing duration parameter", http.StatusBadRequest)
+			return
+		}
+		d, err := strconv.Atoi(durationStr)
+		if err != nil || d < 0 {
+			http.Error(w, "invalid duration parameter", http.StatusBadRequest)
+			return
+		}
+		sigtermSleepDurationSecs.Store(int64(d))
+		response := fmt.Sprintf("SIGTERM sleep duration set to %d seconds\n", d)
+		slog.InfoContext(r.Context(), "Updated SIGTERM sleep duration", slog.Int("duration_secs", d))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(response))
+	})
+
 	go func() {
 		slog.InfoContext(ctx, "Starting counter server on port 80")
 		if err := http.ListenAndServe(":80", defaultMux); err != nil {
@@ -122,6 +156,49 @@ func main() {
 			os.Exit(1)
 		}
 	}()
+
+	// A second, independent listener a test can address to prove traffic
+	// actually reached this port rather than falling through to the default
+	// one -- see atenet-router's arbitrary-port ingress support.
+	if *extraPort > 0 {
+		extraMux := http.NewServeMux()
+		extraMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			response := fmt.Sprintf("hello from extra port %d on pod %s\n", *extraPort, getCurrentIP())
+			slog.InfoContext(r.Context(), "Handled extra-port request", slog.String("response", response))
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(response))
+		})
+		go func() {
+			addr := fmt.Sprintf(":%d", *extraPort)
+			slog.InfoContext(ctx, "Starting counter extra-port server", slog.Int("port", *extraPort))
+			if err := http.ListenAndServe(addr, extraMux); err != nil {
+				slog.ErrorContext(ctx, "Error starting extra-port server", slog.Any("err", err))
+				os.Exit(1)
+			}
+		}()
+	}
+
+	if *tcpPort > 0 {
+		go func() {
+			listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *tcpPort))
+			if err != nil {
+				slog.ErrorContext(ctx, "Error starting counter TCP echo server", slog.Any("err", err))
+				os.Exit(1)
+			}
+			slog.InfoContext(ctx, "Starting counter TCP echo server", slog.Int("port", *tcpPort))
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					slog.ErrorContext(ctx, "Counter TCP echo accept failed", slog.Any("err", err))
+					return
+				}
+				go func() {
+					defer conn.Close()
+					_, _ = io.Copy(conn, conn)
+				}()
+			}
+		}()
+	}
 
 	// Write some random data to a file in the root filesystem, to test
 	// filesystem checkpoint/restore.

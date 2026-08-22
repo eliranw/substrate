@@ -50,9 +50,9 @@ func listAllWorkers(ctx context.Context, lister WorkerLister) ([]*ateapipb.Worke
 }
 
 // filterWorkers filters workers by Kubernetes namespace, assigned-actor
-// atespace, and worker pool label selector. Empty values match everything;
-// an atespace filter only matches workers with an assigned actor.
-func filterWorkers(workers []*ateapipb.Worker, namespace, atespace, selector string) ([]*ateapipb.Worker, error) {
+// atespace, worker pool label selector, and sandbox class. Empty values match
+// everything; an atespace filter only matches workers with an assigned actor.
+func filterWorkers(workers []*ateapipb.Worker, namespace, atespace, selector, sandboxClass string) ([]*ateapipb.Worker, error) {
 	var labelSel labels.Selector
 	if selector != "" {
 		var err error
@@ -67,10 +67,13 @@ func filterWorkers(workers []*ateapipb.Worker, namespace, atespace, selector str
 		if namespace != "" && w.GetWorkerNamespace() != namespace {
 			continue
 		}
-		if atespace != "" && w.GetAssignment().GetActor().GetAtespace() != atespace {
+		if atespace != "" && w.GetStatus().GetAssignment().GetActor().GetAtespace() != atespace {
 			continue
 		}
 		if labelSel != nil && !labelSel.Matches(labels.Set(w.GetLabels())) {
+			continue
+		}
+		if sandboxClass != "" && w.GetSandboxClass() != sandboxClass {
 			continue
 		}
 		filtered = append(filtered, w)

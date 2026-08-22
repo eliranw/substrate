@@ -29,11 +29,15 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/agent-substrate/substrate/internal/ateompath"
+	"github.com/agent-substrate/substrate/internal/sizing"
 )
 
 type runsc struct {
 	path     string
 	actorUID string
+	// size is the actor's declared limits, supplied on the RunWorkload /
+	// RestoreWorkload RPC; ensureContainerCgroupsPath writes it into the OCI spec.
+	size sizing.SandboxSize
 }
 
 // nvproxyGlobalArgs returns the runsc global flags for GPU sandboxes, enabling
@@ -74,10 +78,14 @@ func (r *runsc) ensureContainerCgroupsPath(containerName string) error {
 	if spec.Linux == nil {
 		spec.Linux = &specs.Linux{}
 	}
-	if spec.Linux.CgroupsPath != "" {
-		return nil
+	if spec.Linux.CgroupsPath == "" {
+		spec.Linux.CgroupsPath = "/" + containerName
 	}
-	spec.Linux.CgroupsPath = "/" + containerName
+	// Right-size the per-container cgroup leaf to the actor's declared limits;
+	// runsc applies spec.Linux.Resources when it creates the leaf. gVisor is the
+	// only caller: ateom-microvm sizes the VM itself and applies per-container
+	// limits through the kata-agent instead.
+	r.size.ApplyToOCISpec(&spec)
 	out, err := json.MarshalIndent(&spec, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling %q: %w", specPath, err)
@@ -107,6 +115,10 @@ func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName stri
 		// "-log-packets",
 		// "-strace",
 		"-root", ateompath.RunSCStateDir(r.actorUID),
+		// Provision the sentry's vCPU count from the cgroup CPU quota written by
+		// sizing.ApplyToOCISpec, so the sandbox is sized to the pod's limit (runsc
+		// otherwise sizes to all host CPUs). Global flag: before the subcommand.
+		"--cpu-num-from-quota",
 	}
 	args = append(args, nvproxyGlobalArgs()...)
 	args = append(args,
@@ -253,6 +265,8 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		// "-log-packets",
 		// "-strace",
 		"-root", ateompath.RunSCStateDir(r.actorUID),
+		// Match cmdCreate: size the restored sentry from the cgroup CPU quota.
+		"--cpu-num-from-quota",
 	}
 	restoreArgs = append(restoreArgs, nvproxyGlobalArgs()...)
 	restoreArgs = append(restoreArgs,
@@ -320,6 +334,70 @@ func (r *runsc) cmdState(ctx context.Context, containerName string) error {
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("while running `runsc state`: %w", err)
+	}
+	return nil
+}
+
+// killArgs builds the argv for `runsc kill <container> <signal>`. Factored out
+// so the argument construction can be unit-tested without executing runsc.
+func (r *runsc) killArgs(containerName, signal string) []string {
+	return []string{
+		"-log-format", "json",
+		"--alsologtostderr",
+		"-root", ateompath.RunSCStateDir(r.actorUID),
+		"kill",
+		containerName,
+		signal,
+	}
+}
+
+// cmdKill sends signal to the given container's process(es) inside the gVisor
+// sandbox. Used during graceful shutdown to propagate SIGTERM to the actor.
+func (r *runsc) cmdKill(ctx context.Context, containerName, signal string) error {
+	reapLock.RLock()
+	defer reapLock.RUnlock()
+
+	slog.InfoContext(ctx, "About to run runsc kill", slog.String("container", containerName), slog.String("signal", signal))
+
+	cmd := exec.CommandContext(ctx, r.path, r.killArgs(containerName, signal)...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("while running `runsc kill`: %w", err)
+	}
+	return nil
+}
+
+// waitArgs builds the argv for `runsc wait <container>`. Factored out so the
+// argument construction can be unit-tested without executing runsc.
+func (r *runsc) waitArgs(containerName string) []string {
+	return []string{
+		"-log-format", "json",
+		"--alsologtostderr",
+		"-root", ateompath.RunSCStateDir(r.actorUID),
+		"wait",
+		containerName,
+	}
+}
+
+// cmdWait blocks until the given container's process exits. Used during
+// graceful shutdown to confirm the actor has stopped before ateom exits.
+//
+// We deliberately DO NOT acquire reapLock here. If we held reapLock.RLock()
+// during this long wait, a pending background reaper write lock (reapLock.Lock())
+// would block, starving any subsequent read lock attempts (like CheckpointWorkload
+// which needs to run runsc checkpoint).
+func (r *runsc) cmdWait(ctx context.Context, containerName string) error {
+	slog.InfoContext(ctx, "About to run runsc wait", slog.String("container", containerName))
+
+	cmd := exec.CommandContext(ctx, r.path, r.waitArgs(containerName)...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		// TODO: If the background child reaper collects the runsc wait process before
+		// cmd.Run's own wait finishes, it returns ECHILD. In these cases we return an error
+		// when we shouldn't. We can fix this by forking the reap.ReapChildren() call in main.
+		return fmt.Errorf("while running `runsc wait`: %w", err)
 	}
 	return nil
 }

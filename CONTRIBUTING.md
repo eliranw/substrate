@@ -25,6 +25,14 @@ sign a new one.
 This project follows [Google's Open Source Community
 Guidelines](https://opensource.google/conduct/).
 
+### Set up a local development environment
+
+The [Quickstart (Development)](README.md#quickstart-development) in the README
+covers bringing up a local cluster with the default (gVisor) runtime. To run
+the microVM runtime locally — which needs `/dev/kvm`, or Lima nested
+virtualization on Apple Silicon — see
+[docs/dev/microvm-local.md](docs/dev/microvm-local.md).
+
 ## Contribution process
 
 This is a very new project, so we are still working out exactly how it is going
@@ -46,6 +54,10 @@ duplicating work that is already in flight.
 3) PRs which are not aligned with our near-term goals may be closed without
 extensive review. We are not trying to be discouraging, but we need to make
 sure that we are focused on the most important work.
+
+If you are building something that runs *on* Substrate rather than changing
+Substrate itself, see [Integration
+Repositories](docs/integration-repos.md) for where that code should live.
 
 ### Sizing PRs for review
 

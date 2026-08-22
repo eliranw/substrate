@@ -93,6 +93,18 @@ if [[ -z "${action}" ]]; then
   exit 1
 fi
 
+# kubectl falls back to localhost:8080 when neither --context nor a kubeconfig
+# current-context is set, which surfaces mid-install as a confusing "connection
+# refused" from the apply -- after the assets have already been assembled and
+# staged. Resolve the target cluster up front instead.
+if [[ -z "${KUBECTL_CONTEXT}" ]] && ! kubectl config current-context >/dev/null 2>&1; then
+  echo "Error: no kube context to target: KUBECTL_CONTEXT is empty and the" >&2
+  echo "       kubeconfig has no current-context." >&2
+  echo "       Set KUBECTL_CONTEXT (e.g. in .ate-dev-env.sh) or run:" >&2
+  echo "         kubectl config use-context <name>" >&2
+  exit 1
+fi
+
 # ANSI color codes for prettier output (mirrors hack/install-ate.sh).
 COLOR_CYAN='\033[1;36m'
 COLOR_RESET='\033[0m'
@@ -145,7 +157,7 @@ fi
 
 # --- 2. stage assets to rustfs (kind) / GCS (GKE) --------------------------
 # Upload the five assets under kata-assets/, where atelet fetches them: the
-# in-cluster rustfs (port-forwarded, S3 API) on kind, or the GCS bucket on GKE.
+# in-cluster rustfs (S3 API) on kind, or the GCS bucket on GKE.
 if [[ "${ATE_INSTALL_KIND}" == "true" ]]; then
   log "Staging assets to in-cluster rustfs bucket ${BUCKET_NAME} (kata-assets/)..."
   OUT="${OUT}" BUCKET="${BUCKET_NAME}" KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" hack/microvm-assets/stage-to-rustfs.sh

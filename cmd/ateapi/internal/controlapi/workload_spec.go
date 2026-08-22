@@ -15,41 +15,103 @@
 package controlapi
 
 import (
-	"context"
 	"fmt"
-	"sync"
-	"time"
 
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 )
 
-const envSecretCacheTTL = 30 * time.Second
+// toAteletResources resolves a container's declared limits into the scalars
+// atelet and the ateoms consume; everything downstream compares numbers.
+// Returns nil when the container declares no limits, so the OCI spec stays
+// untouched for templates that do not use them.
+func toAteletResources(r *atev1alpha1.ContainerResources) *ateletpb.ResourceLimits {
+	if r == nil || len(r.Limits) == 0 {
+		return nil
+	}
+	out := &ateletpb.ResourceLimits{}
+	if q, ok := r.Limits[corev1.ResourceMemory]; ok {
+		out.MemoryBytes = q.Value()
+	}
+	if q, ok := r.Limits[corev1.ResourceCPU]; ok {
+		out.CpuMillis = q.MilliValue()
+	}
+	if out.MemoryBytes == 0 && out.CpuMillis == 0 {
+		return nil
+	}
+	return out
+}
 
-// workloadSpecFromActorTemplate builds a WorkloadSpec without resolving
-// container env vars. Use this when downstream consumers (e.g. checkpoint
-// requests) don't need env entries materialized.
+// workloadSpecFromActorTemplate builds a WorkloadSpec from the template;
+// container env is copied verbatim.
 func workloadSpecFromActorTemplate(actorTemplate *atev1alpha1.ActorTemplate, actor *ateapipb.Actor) (*ateletpb.WorkloadSpec, error) {
 	workloadSpec := &ateletpb.WorkloadSpec{}
 
-	// add volumes
+	// Convert volumes to atelet's representation.  ActorTemplate validation has
+	// already ensured that only one source is set.
 	for _, vol := range actorTemplate.Spec.Volumes {
-		// volume is durable-dir type
-		if vol.VolumeSource.DurableDir != nil {
+		switch {
+		case vol.VolumeSource.DurableDir != nil:
 			workloadSpec.Volumes = append(workloadSpec.Volumes, &ateletpb.Volume{
 				Name: vol.Name,
-				Type: ateletpb.VolumeType_VOLUME_TYPE_DURABLE_DIR,
 				Source: &ateletpb.Volume_DurableDir{
 					DurableDir: &ateletpb.DurableDirVolume{},
 				},
 			})
+
+		case vol.VolumeSource.SystemInfo != nil:
+			ateletSystemInfo := &ateletpb.SystemInfoVolume{}
+			for _, dataSource := range vol.VolumeSource.SystemInfo.DataSources {
+				switch {
+				case dataSource.ActorMetadata != nil:
+					actorMetadata := &ateletpb.ActorMetadataDataSource{}
+					for _, item := range dataSource.ActorMetadata.Items {
+						actorMetadata.Items = append(actorMetadata.Items, &ateletpb.ActorMetadataItem{
+							Field: toAteletActorMetadataField(item.Field),
+							Path:  item.Path,
+						})
+					}
+					ateletSystemInfo.DataSources = append(ateletSystemInfo.DataSources, &ateletpb.SystemInfoDataSource{
+						DataSource: &ateletpb.SystemInfoDataSource_ActorMetadata{
+							ActorMetadata: actorMetadata,
+						},
+					})
+				case dataSource.TrustBundle != nil:
+					// atelet resolves named trustBundles against its allowlist
+					// and ClusterTrustBundle informer at write time
+					ateletSystemInfo.DataSources = append(ateletSystemInfo.DataSources, &ateletpb.SystemInfoDataSource{
+						DataSource: &ateletpb.SystemInfoDataSource_TrustBundle{
+							TrustBundle: &ateletpb.TrustBundleDataSource{
+								Name: dataSource.TrustBundle.Name,
+								Path: dataSource.TrustBundle.Path,
+							},
+						},
+					})
+				default:
+					continue // Drop unrecognized data sources
+				}
+			}
+			workloadSpec.Volumes = append(workloadSpec.Volumes, &ateletpb.Volume{
+				Name: vol.Name,
+				Source: &ateletpb.Volume_SystemInfo{
+					SystemInfo: ateletSystemInfo,
+				},
+			})
+
+		case vol.VolumeSource.Image != nil:
+			workloadSpec.Volumes = append(workloadSpec.Volumes, &ateletpb.Volume{
+				Name: vol.Name,
+				Source: &ateletpb.Volume_Image{
+					Image: &ateletpb.ImageVolumeSource{
+						Reference: vol.VolumeSource.Image.Reference,
+					},
+				},
+			})
+
+		default:
+			continue // Drop unrecognized volumes.
 		}
 	}
 
@@ -61,11 +123,19 @@ func workloadSpecFromActorTemplate(actorTemplate *atev1alpha1.ActorTemplate, act
 
 	for _, ctr := range actorTemplate.Spec.Containers {
 		ateletCtr := &ateletpb.Container{
-			Name:    ctr.Name,
-			Image:   ctr.Image,
-			Command: ctr.Command,
-			Args:    ctr.Args,
-			Readyz:  toAteletReadyz(ctr.Readyz),
+			Name:            ctr.Name,
+			Image:           ctr.Image,
+			Command:         ctr.Command,
+			Args:            ctr.Args,
+			Readyz:          toAteletReadyz(ctr.Readyz),
+			SecurityContext: toAteletSecurityContext(ctr.SecurityContext),
+			Resources:       toAteletResources(ctr.Resources),
+		}
+		for _, env := range ctr.Env {
+			ateletCtr.Env = append(ateletCtr.Env, &ateletpb.EnvEntry{
+				Name:  env.Name,
+				Value: env.Value,
+			})
 		}
 		for _, mount := range ctr.VolumeMounts {
 			ateletCtr.VolumeMounts = append(ateletCtr.VolumeMounts, &ateletpb.VolumeMount{
@@ -74,36 +144,6 @@ func workloadSpecFromActorTemplate(actorTemplate *atev1alpha1.ActorTemplate, act
 			})
 		}
 		workloadSpec.Containers = append(workloadSpec.Containers, ateletCtr)
-	}
-
-	return workloadSpec, nil
-}
-
-// workloadSpecFromActorTemplateWithEnv builds a WorkloadSpec and resolves each
-// container's env vars against the cluster. kubeClient must be non-nil;
-// secretCache is optional and, when supplied, deduplicates Secret reads.
-func workloadSpecFromActorTemplateWithEnv(ctx context.Context, kubeClient kubernetes.Interface, secretCache *envSecretCache, actorTemplate *atev1alpha1.ActorTemplate, actor *ateapipb.Actor) (*ateletpb.WorkloadSpec, error) {
-	workloadSpec, err := workloadSpecFromActorTemplate(actorTemplate, actor)
-	if err != nil {
-		return nil, err
-	}
-
-	resolver := envResolver{
-		kubeClient: kubeClient,
-		namespace:  actorTemplate.Namespace,
-		cache:      secretCache,
-	}
-
-	for i, ctr := range actorTemplate.Spec.Containers {
-		for _, env := range ctr.Env {
-			ateletEnv, err := resolver.resolve(ctx, ctr.Name, env)
-			if err != nil {
-				return nil, err
-			}
-			if ateletEnv != nil {
-				workloadSpec.Containers[i].Env = append(workloadSpec.Containers[i].Env, ateletEnv)
-			}
-		}
 	}
 
 	return workloadSpec, nil
@@ -127,7 +167,7 @@ func appendExternalVolumes(workloadSpec *ateletpb.WorkloadSpec, template *atev1a
 			var storageVolID string
 			var volType string
 			var volCtx map[string]string
-			for _, dbVol := range actor.GetActorVolumes() {
+			for _, dbVol := range actor.GetStatus().GetActorVolumes() {
 				if dbVol.GetVolumeName() == vol.Name {
 					storageVolID = dbVol.GetStorageVolumeId()
 					volType = dbVol.GetVolumeType()
@@ -140,7 +180,6 @@ func appendExternalVolumes(workloadSpec *ateletpb.WorkloadSpec, template *atev1a
 			}
 			workloadSpec.Volumes = append(workloadSpec.Volumes, &ateletpb.Volume{
 				Name: vol.Name,
-				Type: ateletpb.VolumeType_VOLUME_TYPE_EXTERNAL,
 				Source: &ateletpb.Volume_External{
 					External: &ateletpb.ExternalVolumeSource{
 						StorageVolumeId: storageVolID,
@@ -168,6 +207,22 @@ func isVolumeMounted(volumeName string, template *atev1alpha1.ActorTemplate) boo
 // toAteletReadyz projects the CRD readyz field onto the ateletpb wire type.
 // Returns nil when the source is nil so containers without a probe stay
 // unchanged on the wire.
+// toAteletActorMetadataField projects the CRD field selector onto the atelet
+// wire enum. Unknown values map to UNSPECIFIED, which atelet skips; CRD enum
+// validation makes that unreachable for stored templates.
+func toAteletActorMetadataField(in atev1alpha1.ActorMetadataField) ateletpb.ActorMetadataField {
+	switch in {
+	case atev1alpha1.ActorMetadataFieldName:
+		return ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_NAME
+	case atev1alpha1.ActorMetadataFieldAtespace:
+		return ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_ATESPACE
+	case atev1alpha1.ActorMetadataFieldUID:
+		return ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_UID
+	default:
+		return ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_UNSPECIFIED
+	}
+}
+
 func toAteletReadyz(in *atev1alpha1.ContainerReadyz) *ateletpb.Readyz {
 	if in == nil {
 		return nil
@@ -182,135 +237,32 @@ func toAteletReadyz(in *atev1alpha1.ContainerReadyz) *ateletpb.Readyz {
 	return out
 }
 
-type envResolver struct {
-	kubeClient kubernetes.Interface
-	namespace  string
-	cache      *envSecretCache
-}
-
-func (r *envResolver) resolve(ctx context.Context, containerName string, env atev1alpha1.EnvVar) (*ateletpb.EnvEntry, error) {
-	envID := fmt.Sprintf("container %q env %q", containerName, env.Name)
-
-	switch {
-	case env.Value != nil:
-		return &ateletpb.EnvEntry{
-			Name:  env.Name,
-			Value: *env.Value,
-		}, nil
-	case env.ValueFrom != nil:
-		value, include, err := r.resolveValueFrom(ctx, envID, env.ValueFrom)
-		if err != nil {
-			return nil, err
-		}
-		if !include {
-			return nil, nil
-		}
-		return &ateletpb.EnvEntry{
-			Name:  env.Name,
-			Value: value,
-		}, nil
+// toAteletSecurityContext projects the CRD securityContext onto the ateletpb
+// wire type. Returns nil when the source is nil or carries nothing, so
+// containers that set no security settings stay unchanged on the wire.
+func toAteletSecurityContext(in *atev1alpha1.SecurityContext) *ateletpb.SecurityContext {
+	if in == nil || in.Capabilities == nil {
+		return nil
 	}
-	return nil, status.Errorf(codes.FailedPrecondition, "%s has unknown value source", envID)
-}
-
-func (r *envResolver) resolveValueFrom(ctx context.Context, envID string, valueFrom *atev1alpha1.EnvVarSource) (string, bool, error) {
-	if ref := valueFrom.SecretKeyRef; ref != nil {
-		return r.resolveSecretKeyRef(ctx, envID, ref)
+	caps := in.Capabilities
+	if len(caps.Add) == 0 && len(caps.Drop) == 0 {
+		return nil
 	}
-	return "", false, status.Errorf(codes.FailedPrecondition, "%s uses unsupported valueFrom source; only secretKeyRef is supported", envID)
-}
-
-func (r *envResolver) resolveSecretKeyRef(ctx context.Context, envID string, ref *atev1alpha1.SecretKeySelector) (string, bool, error) {
-	if r.kubeClient == nil {
-		return "", false, status.Errorf(codes.FailedPrecondition, "%s cannot resolve secretKeyRef because Kubernetes client is unavailable", envID)
-	}
-
-	secret, err := r.secret(ctx, ref.Name)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			if isOptional(ref.Optional) {
-				return "", false, nil
-			}
-			return "", false, status.Errorf(codes.FailedPrecondition, "%s references missing secret %s/%s", envID, r.namespace, ref.Name)
-		}
-		return "", false, status.Errorf(codes.Internal, "while resolving %s secretKeyRef %s/%s: %v", envID, r.namespace, ref.Name, err)
-	}
-
-	value, ok := secret.Data[ref.Key]
-	if !ok {
-		if isOptional(ref.Optional) {
-			return "", false, nil
-		}
-		return "", false, status.Errorf(codes.FailedPrecondition, "%s references missing key %q in secret %s/%s", envID, ref.Key, r.namespace, ref.Name)
-	}
-
-	return string(value), true, nil
-}
-
-func (r *envResolver) secret(ctx context.Context, name string) (*corev1.Secret, error) {
-	if r.cache != nil {
-		return r.cache.get(ctx, r.kubeClient, r.namespace, name)
-	}
-	return r.kubeClient.CoreV1().Secrets(r.namespace).Get(ctx, name, metav1.GetOptions{})
-}
-
-type envSecretCache struct {
-	mu      sync.RWMutex
-	ttl     time.Duration
-	entries map[envSecretCacheKey]envSecretCacheEntry
-}
-
-type envSecretCacheKey struct {
-	namespace string
-	name      string
-}
-
-type envSecretCacheEntry struct {
-	secret    *corev1.Secret
-	expiresAt time.Time
-}
-
-func newEnvSecretCache(ttl time.Duration) *envSecretCache {
-	return &envSecretCache{
-		ttl:     ttl,
-		entries: map[envSecretCacheKey]envSecretCacheEntry{},
+	return &ateletpb.SecurityContext{
+		Capabilities: &ateletpb.Capabilities{
+			Add:  capabilityNames(caps.Add),
+			Drop: capabilityNames(caps.Drop),
+		},
 	}
 }
 
-func (c *envSecretCache) get(ctx context.Context, kubeClient kubernetes.Interface, namespace, name string) (*corev1.Secret, error) {
-	key := envSecretCacheKey{
-		namespace: namespace,
-		name:      name,
+func capabilityNames(in []atev1alpha1.Capability) []string {
+	if len(in) == 0 {
+		return nil
 	}
-	now := time.Now()
-
-	c.mu.RLock()
-	entry, ok := c.entries[key]
-	if ok && now.Before(entry.expiresAt) {
-		secret := entry.secret.DeepCopy()
-		c.mu.RUnlock()
-		return secret, nil
+	out := make([]string, 0, len(in))
+	for _, c := range in {
+		out = append(out, string(c))
 	}
-	c.mu.RUnlock()
-
-	// TODO: Make refresh smarter if this pattern sticks, for example by
-	// refreshing asynchronously or watching referenced Secrets.
-	secret, err := kubeClient.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	secret = secret.DeepCopy()
-	c.mu.Lock()
-	c.entries[key] = envSecretCacheEntry{
-		secret:    secret,
-		expiresAt: time.Now().Add(c.ttl),
-	}
-	c.mu.Unlock()
-
-	return secret.DeepCopy(), nil
-}
-
-func isOptional(optional *bool) bool {
-	return optional != nil && *optional
+	return out
 }

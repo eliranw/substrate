@@ -34,6 +34,7 @@ var (
 	topWorkerNamespaceFlag string
 	topWorkerAtespaceFlag  string
 	topWorkerSelectorFlag  string
+	topWorkerClassFlag     string
 )
 
 var topWorkersCmd = &cobra.Command{
@@ -48,6 +49,7 @@ func init() {
 	topWorkersCmd.Flags().StringVarP(&topWorkerNamespaceFlag, "namespace", "n", "", "Scope output to a specific Kubernetes namespace")
 	topWorkersCmd.Flags().StringVarP(&topWorkerAtespaceFlag, "atespace", "a", "", "Filter worker pods hosting actors in a specific atespace")
 	topWorkersCmd.Flags().StringVarP(&topWorkerSelectorFlag, "selector", "l", "", "Filter by worker pool labels")
+	topWorkersCmd.Flags().StringVar(&topWorkerClassFlag, "sandbox-class", "", "Filter by sandbox class (e.g. gvisor, microvm)")
 	topCmd.AddCommand(topWorkersCmd)
 }
 
@@ -75,6 +77,7 @@ type TopWorkersRunner struct {
 	namespace        string
 	atespace         string
 	selector         string
+	sandboxClass     string
 	outputFmt        string
 	out              io.Writer
 }
@@ -84,7 +87,7 @@ func (r *TopWorkersRunner) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	filtered, err := filterWorkers(allWorkers, r.namespace, r.atespace, r.selector)
+	filtered, err := filterWorkers(allWorkers, r.namespace, r.atespace, r.selector, r.sandboxClass)
 	if err != nil {
 		return err
 	}
@@ -113,7 +116,7 @@ func (r *TopWorkersRunner) Run(ctx context.Context) error {
 
 		status := "FREE"
 		assignedActor := "<none>"
-		if wass := w.GetAssignment(); wass != nil && wass.GetActor() != nil {
+		if wass := w.GetStatus().GetAssignment(); wass != nil && wass.GetActor() != nil {
 			status = "ASSIGNED"
 			if tpl := wass.GetActorTemplate(); tpl != nil && tpl.GetNamespace() != "" {
 				assignedActor = fmt.Sprintf("%s/%s/%s/%s",
@@ -143,6 +146,7 @@ func (r *TopWorkersRunner) Run(ctx context.Context) error {
 		items = append(items, &printer.WorkerTopItem{
 			Pod:           podName,
 			Pool:          pool,
+			Class:         w.GetSandboxClass(),
 			Status:        status,
 			AssignedActor: assignedActor,
 			CPU:           cpuStr,
@@ -191,7 +195,7 @@ func extractContainerUsage(pm metricsv1beta1.PodMetrics) (string, string) {
 
 func runTopWorkers(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
-	apiClient, err := ateclient.NewClient(ctx, kubeconfig, k8sContext, endpoint, traceEnabled)
+	apiClient, err := ateclient.NewClient(ctx, kubeconfig, k8sContext, endpoint, tokenFile, traceEnabled)
 	if err != nil {
 		return fmt.Errorf("failed to connect to ate-api-server: %w", err)
 	}
@@ -209,6 +213,7 @@ func runTopWorkers(cmd *cobra.Command, args []string) error {
 		namespace:        topWorkerNamespaceFlag,
 		atespace:         topWorkerAtespaceFlag,
 		selector:         topWorkerSelectorFlag,
+		sandboxClass:     topWorkerClassFlag,
 		outputFmt:        outputFmt,
 		out:              os.Stdout,
 	}

@@ -70,14 +70,14 @@ func PrintActorsTo(out io.Writer, actors []*ateapipb.Actor, format string) error
 		return printProto(out, &ateapipb.ListActorsResponse{Actors: actors}, format)
 	case "table":
 		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
-		fmt.Fprintln(w, "ATESPACE\tNAME\tTEMPLATE\tSTATUS\tATEOM POD\tATEOM IP\tVERSION\tAGE")
+		fmt.Fprintln(w, "ATESPACE\tNAME\tTEMPLATE\tSTATE\tATEOM POD\tATEOM IP\tVERSION\tAGE")
 		for _, actor := range actors {
 			atespace := actor.GetMetadata().GetAtespace()
 			name := actor.GetMetadata().GetName()
 			template := actor.GetActorTemplateNamespace() + "/" + actor.GetActorTemplateName()
-			status := actor.GetStatus().String()
+			state := actor.GetStatus().GetState().String()
 
-			assignment := actor.GetWorkerAssignment()
+			assignment := actor.GetStatus().GetWorkerAssignment()
 			worker := "<none>"
 			if assignment != nil {
 				worker = assignment.GetWorkerNamespace() + "/" + assignment.GetWorkerPod()
@@ -85,7 +85,7 @@ func PrintActorsTo(out io.Writer, actors []*ateapipb.Actor, format string) error
 
 			version := actor.GetMetadata().GetVersion()
 			age := formatAge(actor.GetMetadata().GetCreateTime())
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", atespace, name, template, status, worker, assignment.GetWorkerPodIp(), version, age)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", atespace, name, template, state, worker, assignment.GetWorkerPodIp(), version, age)
 		}
 		return w.Flush()
 	default:
@@ -118,21 +118,22 @@ func PrintWorkersTo(out io.Writer, workers []*ateapipb.Worker, format string) er
 		return printProto(out, &ateapipb.ListWorkersResponse{Workers: workers}, format)
 	case "table":
 		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
-		fmt.Fprintln(w, "NAMESPACE\tPOOL\tPOD\tSTATUS\tASSIGNED ACTOR")
+		fmt.Fprintln(w, "NAMESPACE\tPOOL\tCLASS\tPOD\tSTATUS\tASSIGNED ACTOR")
 		for _, worker := range workers {
 			ns := worker.GetWorkerNamespace()
 			pool := worker.GetWorkerPool()
+			class := worker.GetSandboxClass()
 			pod := worker.GetWorkerPod()
 
 			status := "FREE"
 			assignedActor := "<none>"
-			if wass := worker.Assignment; wass != nil {
+			if wass := worker.GetStatus().GetAssignment(); wass != nil {
 				status = "ASSIGNED"
 				assignedActor = fmt.Sprintf("%s/%s/%s/%s",
 					wass.ActorTemplate.Namespace, wass.ActorTemplate.Name, wass.Actor.Atespace, wass.Actor.Name)
 			}
 
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", ns, pool, pod, status, assignedActor)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", ns, pool, class, pod, status, assignedActor)
 		}
 		return w.Flush()
 	default:
@@ -144,6 +145,7 @@ func PrintWorkersTo(out io.Writer, workers []*ateapipb.Worker, format string) er
 type WorkerTopItem struct {
 	Pod           string `json:"pod" yaml:"pod"`
 	Pool          string `json:"pool" yaml:"pool"`
+	Class         string `json:"class,omitempty" yaml:"class,omitempty"`
 	Status        string `json:"status" yaml:"status"`
 	AssignedActor string `json:"assignedActor" yaml:"assignedActor"`
 	CPU           string `json:"cpu" yaml:"cpu"`
@@ -191,10 +193,10 @@ func PrintWorkerTopTo(out io.Writer, items []*WorkerTopItem, format string) erro
 // PrintWorkerTopTable prints worker top items as a formatted table.
 func PrintWorkerTopTable(out io.Writer, items []*WorkerTopItem) error {
 	w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "NAME\tPOOL\tSTATUS\tASSIGNED ACTOR\tCPU(CORES)\tMEMORY(bytes)")
+	fmt.Fprintln(w, "NAME\tPOOL\tCLASS\tSTATUS\tASSIGNED ACTOR\tCPU(CORES)\tMEMORY(bytes)")
 	for _, item := range items {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			item.Pod, item.Pool, item.Status, item.AssignedActor, item.CPU, item.Memory)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			item.Pod, item.Pool, item.Class, item.Status, item.AssignedActor, item.CPU, item.Memory)
 	}
 	return w.Flush()
 }
@@ -252,8 +254,8 @@ func PrintActorSnapshots(snapshots []*ateapipb.ActorSnapshot, format string) err
 	for _, snapshot := range snapshots {
 		fmt.Fprintf(w, "%s\t%s\t%s/%s\t%d\t%s\t%s\n",
 			snapshot.GetMetadata().GetAtespace(), snapshot.GetMetadata().GetName(),
-			snapshot.GetSourceActor().GetAtespace(), snapshot.GetSourceActor().GetName(),
-			snapshot.GetSourceActorVersion(), snapshot.GetContentScope(), formatAge(snapshot.GetMetadata().GetCreateTime()))
+			snapshot.GetStatus().GetSourceActor().GetAtespace(), snapshot.GetStatus().GetSourceActor().GetName(),
+			snapshot.GetStatus().GetSourceActorVersion(), snapshot.GetStatus().GetContentScope(), formatAge(snapshot.GetMetadata().GetCreateTime()))
 	}
 	return w.Flush()
 }

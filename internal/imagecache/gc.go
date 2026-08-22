@@ -60,6 +60,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// ErrIncompleteEnumeration marks a pass that did nothing because the
+// image records or bundle specs could not be fully enumerated. Callers
+// use errors.Is to tell "nothing was attempted" (repair the named file;
+// not a shortfall) from per-item failures on a pass that ran.
+var ErrIncompleteEnumeration = errors.New("image cache enumeration incomplete")
+
 // --- root set ---
 
 // RootSet is the set of images and layers that eviction must not touch,
@@ -160,24 +166,33 @@ func (s *Store) InUse() (RootSet, error) {
 	return rs, errors.Join(errs...)
 }
 
-// addSpecRoots roots one bundle spec's image digest, layers, and exact
-// layer-set signature.
+// addSpecRoots roots one bundle spec's image digests (including image volume
+// images), layers, and exact layer-set signatures.
 func addSpecRoots(rs *RootSet, spec *OverlaySpec, bundle string, dbg bool) {
-	if spec.ImageDigest != "" {
-		rs.ImageDigests[spec.ImageDigest] = true
+	addImageRoots(rs, spec.ImageDigest, spec.Layers, bundle, dbg)
+	for _, vol := range spec.ImageVolumes {
+		addImageRoots(rs, vol.ImageDigest, vol.Layers, bundle+"/volumes/"+vol.Name, dbg)
+	}
+}
+
+// addImageRoots roots one image's digest, layer hexes, and exact layer-set
+// signature.
+func addImageRoots(rs *RootSet, digest string, layers []string, bundle string, dbg bool) {
+	if digest != "" {
+		rs.ImageDigests[digest] = true
 		if dbg {
 			slog.Debug("Image cache root-set: bundle roots image",
 				slog.String("bundle", bundle),
-				slog.String("digest", spec.ImageDigest),
-				slog.Int("layers", len(spec.Layers)))
+				slog.String("digest", digest),
+				slog.Int("layers", len(layers)))
 		}
-	} else if len(spec.Layers) > 0 && dbg {
+	} else if len(layers) > 0 && dbg {
 		slog.Debug("Image cache root-set: digestless bundle roots layers only",
 			slog.String("bundle", bundle),
-			slog.Int("layers", len(spec.Layers)))
+			slog.Int("layers", len(layers)))
 	}
-	hexes := make([]string, 0, len(spec.Layers))
-	for _, layerDir := range spec.Layers {
+	hexes := make([]string, 0, len(layers))
+	for _, layerDir := range layers {
 		hex := filepath.Base(layerDir)
 		rs.LayerHexes[hex] = true
 		hexes = append(hexes, hex)
@@ -243,9 +258,9 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 	if rootsErr != nil {
 		// Same shape as the record gate below: refcounts and roots from a
 		// partial scan would retire layers a running actor still mounts.
-		slog.ErrorContext(ctx, "Image cache eviction pass skipped: bundle specs could not be fully enumerated",
-			slog.Any("err", rootsErr))
-		return stats, rootsErr
+		// Not logged here — the caller logs the gated pass once, with its
+		// own context (see ErrIncompleteEnumeration).
+		return stats, fmt.Errorf("%w: %w", ErrIncompleteEnumeration, rootsErr)
 	}
 	cutoff := time.Now().Add(-s.minAge)
 
@@ -255,13 +270,13 @@ func (s *Store) EvictUnused(ctx context.Context, targetBytes int64, dryRun bool)
 		// be retired while that record still names it. Fail the whole pass
 		// toward retention; the error names the records to repair or
 		// delete, and every later pass retries.
-		slog.ErrorContext(ctx, "Image cache eviction pass skipped: image records could not be fully enumerated",
-			slog.Any("err", listErr))
-		return stats, listErr
+		return stats, fmt.Errorf("%w: %w", ErrIncompleteEnumeration, listErr)
 	}
 	stats.Candidates = len(candidates)
 
-	slog.InfoContext(ctx, "Image cache eviction pass",
+	// Debug: the driving caller logs the pass outcome once, and a
+	// no-target pass should be silent.
+	slog.DebugContext(ctx, "Image cache eviction pass",
 		slog.Int64("target_bytes", targetBytes),
 		slog.Bool("dry_run", dryRun),
 		slog.Int("rooted_images", stats.RootedImages),
@@ -485,16 +500,12 @@ func (s *Store) RecoverOrphans(ctx context.Context) (EvictStats, error) {
 
 	roots, rootsErr := s.InUse()
 	if rootsErr != nil {
-		slog.ErrorContext(ctx, "Image cache startup orphan scan skipped: bundle specs could not be fully enumerated; orphaned layers (if any) will persist until the specs are repaired",
-			slog.Any("err", rootsErr))
-		return stats, rootsErr
+		return stats, fmt.Errorf("%w: %w", ErrIncompleteEnumeration, rootsErr)
 	}
 	cutoff := time.Now().Add(-s.minAge)
 	_, refcount, complete, listErr := s.listEviction(roots, cutoff, &stats)
 	if !complete {
-		slog.ErrorContext(ctx, "Image cache startup orphan scan skipped: image records could not be fully enumerated; orphaned layers (if any) will persist until the records are repaired",
-			slog.Any("err", listErr))
-		return stats, listErr
+		return stats, fmt.Errorf("%w: %w", ErrIncompleteEnumeration, listErr)
 	}
 
 	retired, errs := s.sweepOrphanLayers(ctx, roots, refcount, cutoff, false, &stats)
@@ -599,10 +610,11 @@ func (s *Store) dryRunRetire(hex string, cutoff time.Time) (int64, retireStatus)
 // their references are what keep shared layers alive — counting
 // listing-stage vetoes into stats.
 //
-// complete reports whether every record was read and decoded. Refcounts
-// from a partial listing understate references — a layer shared with an
-// unread record looks unreferenced — so both callers gate on it and do
-// nothing with a partial listing.
+// complete reports whether every record was read and decoded, and is
+// false only alongside a non-nil err (the gates wrap that err with %w,
+// which a nil would garble). Refcounts from a partial listing understate
+// references — a layer shared with an unread record looks unreferenced —
+// so both callers gate on it and do nothing with a partial listing.
 func (s *Store) listEviction(roots RootSet, cutoff time.Time, stats *EvictStats) (cands []evictionCandidate, refcount map[string]int, complete bool, err error) {
 	refcount = map[string]int{}
 	entries, err := os.ReadDir(s.manifestsDir())

@@ -29,7 +29,6 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -96,6 +95,103 @@ func TestActorTemplateValidation(t *testing.T) {
 	}{{
 		name:    "base template",
 		mutate:  func(at *ActorTemplate) {},
+		wantErr: false,
+	}, {
+		name: "container resources on a micro-VM template",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Containers[0].Resources = &ContainerResources{
+				Limits: ContainerResourceList{
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
+					corev1.ResourceCPU:    resource.MustParse("200m"),
+				},
+			}
+		},
+		wantErr: false,
+		// The limits must survive the round-trip through the CRD schema, not
+		// merely be accepted: a pruned or renormalized quantity would leave the
+		// actor unlimited with no error anywhere.
+		verify: func(t *testing.T, at *ActorTemplate) {
+			got := at.Spec.Containers[0].Resources
+			if got == nil {
+				t.Fatal("Resources = nil after create, want the declared limits")
+			}
+			if q := got.Limits[corev1.ResourceMemory]; q.Value() != 268435456 {
+				t.Errorf("memory limit = %v (%d bytes), want 256Mi", q, q.Value())
+			}
+			if q := got.Limits[corev1.ResourceCPU]; q.MilliValue() != 200 {
+				t.Errorf("cpu limit = %v (%dm), want 200m", q, q.MilliValue())
+			}
+		},
+	}, {
+		name: "unsupported resource key",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Containers[0].Resources = &ContainerResources{
+				Limits: ContainerResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+			}
+		},
+		wantErr: true,
+		errMsg:  "only cpu and memory limits are supported",
+	}, {
+		name: "negative memory limit",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Containers[0].Resources = &ContainerResources{
+				Limits: ContainerResourceList{corev1.ResourceMemory: resource.MustParse("-1Gi")},
+			}
+		},
+		wantErr: true,
+		errMsg:  "must be greater than zero",
+	}, {
+		name: "zero cpu limit",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Containers[0].Resources = &ContainerResources{
+				Limits: ContainerResourceList{corev1.ResourceCPU: resource.MustParse("0")},
+			}
+		},
+		wantErr: true,
+		errMsg:  "must be greater than zero",
+	}, {
+		name: "cpu limit large enough to overflow the quota conversion",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Containers[0].Resources = &ContainerResources{
+				Limits: ContainerResourceList{corev1.ResourceCPU: resource.MustParse("1e14")},
+			}
+		},
+		wantErr: true,
+		errMsg:  "less than 1000 cores",
+	}, {
+		name: "container resources on a gvisor template",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].Resources = &ContainerResources{
+				Limits: ContainerResourceList{
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "container resources are only supported when sandboxClass is 'microvm'",
+	}, {
+		name: "container resources on one of several containers still gates the template",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers = append(at.Spec.Containers, Container{
+				Name:  "sidecar",
+				Image: "busybox@sha256:326e0e090a9a4057e62a1b94236e7a2df2f2f76722f67232e0e47854e4df9c53",
+				Resources: &ContainerResources{
+					Limits: ContainerResourceList{corev1.ResourceMemory: resource.MustParse("64Mi")},
+				},
+			})
+		},
+		wantErr: true,
+		errMsg:  "container resources are only supported when sandboxClass is 'microvm'",
+	}, {
+		name: "no container resources is fine on gvisor",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].Resources = nil
+		},
 		wantErr: false,
 	}, {
 		name: "missing SnapshotsConfig.Location",
@@ -199,7 +295,7 @@ func TestActorTemplateValidation(t *testing.T) {
 		name: "valid EnvVar",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.Containers[0].Env = []EnvVar{
-				{Name: "FOO", Value: ptr.To("BAR")},
+				{Name: "FOO", Value: "BAR"},
 			}
 		},
 		wantErr: false,
@@ -207,7 +303,7 @@ func TestActorTemplateValidation(t *testing.T) {
 		name: "long EnvVar",
 		mutate: func(at *ActorTemplate) {
 			for range 32 {
-				at.Spec.Containers[0].Env = append(at.Spec.Containers[0].Env, EnvVar{Name: "X", Value: ptr.To("Y")})
+				at.Spec.Containers[0].Env = append(at.Spec.Containers[0].Env, EnvVar{Name: "X", Value: "Y"})
 			}
 		},
 		wantErr: false,
@@ -215,7 +311,7 @@ func TestActorTemplateValidation(t *testing.T) {
 		name: "too-many EnvVar",
 		mutate: func(at *ActorTemplate) {
 			for range 33 {
-				at.Spec.Containers[0].Env = append(at.Spec.Containers[0].Env, EnvVar{Name: "X", Value: ptr.To("Y")})
+				at.Spec.Containers[0].Env = append(at.Spec.Containers[0].Env, EnvVar{Name: "X", Value: "Y"})
 			}
 		},
 		wantErr: true,
@@ -223,143 +319,29 @@ func TestActorTemplateValidation(t *testing.T) {
 	}, {
 		name: "envVar Name with space",
 		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{Name: "FOO BAR", Value: ptr.To("VAL")}}
+			at.Spec.Containers[0].Env = []EnvVar{{Name: "FOO BAR", Value: "VAL"}}
 		},
 		wantErr: false, // strange but valid
 	}, {
 		name: "empty EnvVar Name",
 		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{Name: "", Value: ptr.To("VAL")}}
+			at.Spec.Containers[0].Env = []EnvVar{{Name: "", Value: "VAL"}}
 		},
 		wantErr: true,
 		errMsg:  "Invalid value",
 	}, {
 		name: "invalid EnvVar Name (contains '=')",
 		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{Name: "FOO=BAR", Value: ptr.To("VAL")}}
+			at.Spec.Containers[0].Env = []EnvVar{{Name: "FOO=BAR", Value: "VAL"}}
 		},
 		wantErr: true,
 		errMsg:  "Invalid value",
 	}, {
-		name: "missing EnvVar Value",
+		name: "empty EnvVar Value",
 		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{Name: "FOO"}}
-		},
-		wantErr: true,
-		errMsg:  "Invalid value",
-	}, {
-		name: "EnvVar with ValueFrom SecretKeyRef",
-		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{
-				Name: "FOO",
-				ValueFrom: &EnvVarSource{
-					SecretKeyRef: &SecretKeySelector{
-						Name: "my-secret",
-						Key:  "my-key",
-					},
-				},
-			}}
+			at.Spec.Containers[0].Env = []EnvVar{{Name: "FOO", Value: ""}}
 		},
 		wantErr: false,
-	}, {
-		name: "EnvVar with both Value and ValueFrom",
-		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{
-				Name:  "FOO",
-				Value: ptr.To("BAR"),
-				ValueFrom: &EnvVarSource{
-					SecretKeyRef: &SecretKeySelector{
-						Name: "my-secret",
-						Key:  "my-key",
-					},
-				},
-			}}
-		},
-		wantErr: true,
-		errMsg:  "exactly one of the fields in",
-	}, {
-		name: "EnvVarSource empty",
-		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{
-				Name:      "FOO",
-				ValueFrom: &EnvVarSource{},
-			}}
-		},
-		wantErr: true,
-		errMsg:  "Invalid value",
-	}, {
-		name: "SecretKeySelector missing Name",
-		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{
-				Name: "FOO",
-				ValueFrom: &EnvVarSource{
-					SecretKeyRef: &SecretKeySelector{
-						Key: "my-key",
-					},
-				},
-			}}
-		},
-		wantErr: true,
-		errMsg:  "Name must be a valid DNS subdomain",
-	}, {
-		name: "SecretKeySelector Name too long",
-		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{
-				Name: "FOO",
-				ValueFrom: &EnvVarSource{
-					SecretKeyRef: &SecretKeySelector{
-						Name: strings.Repeat("x", 254),
-						Key:  "my-key",
-					},
-				},
-			}}
-		},
-		wantErr: true,
-		errMsg:  "Too long",
-	}, {
-		name: "SecretKeySelector invalid Name",
-		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{
-				Name: "FOO",
-				ValueFrom: &EnvVarSource{
-					SecretKeyRef: &SecretKeySelector{
-						Name: "Invalid_Name",
-						Key:  "my-key",
-					},
-				},
-			}}
-		},
-		wantErr: true,
-		errMsg:  "Name must be a valid DNS subdomain",
-	}, {
-		name: "SecretKeySelector missing Key",
-		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{
-				Name: "FOO",
-				ValueFrom: &EnvVarSource{
-					SecretKeyRef: &SecretKeySelector{
-						Name: "my-secret",
-					},
-				},
-			}}
-		},
-		wantErr: true,
-		errMsg:  "at least 1 chars long",
-	}, {
-		name: "SecretKeySelector invalid Key",
-		mutate: func(at *ActorTemplate) {
-			at.Spec.Containers[0].Env = []EnvVar{{
-				Name: "FOO",
-				ValueFrom: &EnvVarSource{
-					SecretKeyRef: &SecretKeySelector{
-						Name: "my-secret",
-						Key:  "invalid/key",
-					},
-				},
-			}}
-		},
-		wantErr: true,
-		errMsg:  "Invalid value",
 	}, {
 		name: "valid Readyz with default path",
 		mutate: func(at *ActorTemplate) {
@@ -529,6 +511,90 @@ func TestActorTemplateValidation(t *testing.T) {
 		},
 		wantErr: false,
 	}, {
+		name: "microvm memory limit at the 256Mi floor is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Resources = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "microvm memory limit above the floor is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Resources = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "microvm memory limit below the floor is rejected",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Resources = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+			}
+		},
+		wantErr: true,
+		errMsg:  "must be at least 256Mi",
+	}, {
+		name: "microvm memory limit just below the floor is rejected",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+			at.Spec.Resources = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("255Mi")},
+			}
+		},
+		wantErr: true,
+		errMsg:  "must be at least 256Mi",
+	}, {
+		name: "microvm with no resources is valid (floor only applies to a set limit)",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassMicroVM
+		},
+		wantErr: false,
+	}, {
+		name: "gvisor is exempt from the micro-VM memory floor",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.SandboxClass = SandboxClassGvisor
+			at.Spec.Resources = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("64Mi")},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "resources with requests is rejected",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+			}
+		},
+		wantErr: true,
+		errMsg:  "spec.resources.requests is not supported",
+	}, {
+		name: "resources with claims is rejected",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Resources = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+				Claims: []corev1.ResourceClaim{{Name: "claim-1"}},
+			}
+		},
+		wantErr: true,
+		errMsg:  "spec.resources.claims is not supported",
+	}, {
+		name: "resources with limits only is accepted",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Resources = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("2"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+			}
+		},
+		wantErr: false,
+	}, {
 		name: "invalid SandboxClass",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.SandboxClass = "kvm"
@@ -638,6 +704,93 @@ func TestActorTemplateValidation(t *testing.T) {
 			}
 			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
 				{Name: "vol1", MountPath: "/home"},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "Volumes: 1 Image mount is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{Name: "agent", VolumeSource: VolumeSource{Image: &ImageVolumeSource{
+					Reference: "example.com/agent@sha256:326e0e090a9a4057e62a1b94236e7a2df2f2f76722f67232e0e47854e4df9c53",
+				}}},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "agent", MountPath: "/ate"},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "Volumes: unpinned Image reference is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{Name: "agent", VolumeSource: VolumeSource{Image: &ImageVolumeSource{
+					Reference: "example.com/agent:latest",
+				}}},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "agent", MountPath: "/ate"},
+			}
+		},
+		wantErr: true,
+		errMsg:  "All images must be pinned",
+	}, {
+		name: "Volumes: Image reference is required",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{Name: "agent", VolumeSource: VolumeSource{Image: &ImageVolumeSource{}}},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "agent", MountPath: "/ate"},
+			}
+		},
+		wantErr: true,
+		errMsg:  "All images must be pinned",
+	}, {
+		name: "Volumes: VolumeSource with both Image and DurableDir set is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "agent",
+					VolumeSource: VolumeSource{
+						DurableDir: &DurableDirVolumeSource{},
+						Image: &ImageVolumeSource{
+							Reference: "example.com/agent@sha256:326e0e090a9a4057e62a1b94236e7a2df2f2f76722f67232e0e47854e4df9c53",
+						},
+					},
+				},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "agent", MountPath: "/ate"},
+			}
+		},
+		wantErr: true,
+		errMsg:  "exactly one of the fields in [durableDir externalVolumeTemplate image systemInfo] must be set",
+	}, {
+		name: "Volumes: an unmounted Image volume is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{Name: "agent", VolumeSource: VolumeSource{Image: &ImageVolumeSource{
+					Reference: "example.com/agent@sha256:326e0e090a9a4057e62a1b94236e7a2df2f2f76722f67232e0e47854e4df9c53",
+				}}},
+			}
+		},
+		wantErr: true,
+		errMsg:  "All volumes defined in spec.volumes must be mounted by at least one container",
+	}, {
+		name: "Volumes: 2 Image volumes in template is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{Name: "agent", VolumeSource: VolumeSource{Image: &ImageVolumeSource{
+					Reference: "example.com/agent@sha256:326e0e090a9a4057e62a1b94236e7a2df2f2f76722f67232e0e47854e4df9c53",
+				}}},
+				{Name: "tools", VolumeSource: VolumeSource{Image: &ImageVolumeSource{
+					Reference: "example.com/tools@sha256:326e0e090a9a4057e62a1b94236e7a2df2f2f76722f67232e0e47854e4df9c53",
+				}}},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "agent", MountPath: "/ate"},
+				{Name: "tools", MountPath: "/tools"},
 			}
 		},
 		wantErr: false,
@@ -792,7 +945,7 @@ func TestActorTemplateValidation(t *testing.T) {
 			}
 		},
 		wantErr: true,
-		errMsg:  "exactly one of the fields in [durableDir externalVolumeTemplate] must be set",
+		errMsg:  "exactly one of the fields in [durableDir externalVolumeTemplate image systemInfo] must be set",
 	}, {
 		name: "Volumes: VolumeSource with no source set is invalid",
 		mutate: func(at *ActorTemplate) {
@@ -801,7 +954,7 @@ func TestActorTemplateValidation(t *testing.T) {
 			}
 		},
 		wantErr: true,
-		errMsg:  "exactly one of the fields in [durableDir externalVolumeTemplate] must be set",
+		errMsg:  "exactly one of the fields in [durableDir externalVolumeTemplate image systemInfo] must be set",
 	}, {
 		name: "Volumes: VolumeSource with no source set is invalid (mixed with a valid DurableDir volume)",
 		mutate: func(at *ActorTemplate) {
@@ -815,7 +968,335 @@ func TestActorTemplateValidation(t *testing.T) {
 			}
 		},
 		wantErr: true,
-		errMsg:  "exactly one of the fields in [durableDir externalVolumeTemplate] must be set",
+		errMsg:  "exactly one of the fields in [durableDir externalVolumeTemplate image systemInfo] must be set",
+	}, {
+		name: "Volumes: SystemInfo volume projecting all actor metadata fields is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{ActorMetadata: &ActorMetadataDataSource{
+									Items: []ActorMetadataItem{
+										{Field: ActorMetadataFieldName, Path: "actor-name"},
+										{Field: ActorMetadataFieldAtespace, Path: "atespace"},
+										{Field: ActorMetadataFieldUID, Path: "identity/actor-uid"},
+									},
+								}},
+							},
+						},
+					},
+				},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "system-info", MountPath: "/run/ate"},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "Volumes: SystemInfo data source with no member set is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{{}},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "exactly one of the fields in [actorMetadata trustBundle] must be set",
+	}, {
+		name: "Volumes: SystemInfo actorMetadata with no items is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{ActorMetadata: &ActorMetadataDataSource{Items: []ActorMetadataItem{}}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+	}, {
+		name: "Volumes: SystemInfo item with unknown field is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{ActorMetadata: &ActorMetadataDataSource{
+									Items: []ActorMetadataItem{
+										{Field: ActorMetadataField("hostname"), Path: "hostname"},
+									},
+								}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+	}, {
+		name: "Volumes: SystemInfo item with empty path is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{ActorMetadata: &ActorMetadataDataSource{
+									Items: []ActorMetadataItem{
+										{Field: ActorMetadataFieldName, Path: ""},
+									},
+								}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+	}, {
+		name: "Volumes: SystemInfo item with absolute path is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{ActorMetadata: &ActorMetadataDataSource{
+									Items: []ActorMetadataItem{
+										{Field: ActorMetadataFieldName, Path: "/etc/actor-name"},
+									},
+								}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "path must be a clean relative Unix path",
+	}, {
+		name: "Volumes: SystemInfo item with path traversal is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{ActorMetadata: &ActorMetadataDataSource{
+									Items: []ActorMetadataItem{
+										{Field: ActorMetadataFieldName, Path: "../escape"},
+									},
+								}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "path must be a clean relative Unix path",
+	}, {
+		name: "Volumes: SystemInfo items projecting the same field twice are invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{ActorMetadata: &ActorMetadataDataSource{
+									Items: []ActorMetadataItem{
+										{Field: ActorMetadataFieldName, Path: "actor-name"},
+										{Field: ActorMetadataFieldName, Path: "name-again"},
+									},
+								}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "items must not project the same field twice",
+	}, {
+		name: "Volumes: SystemInfo items with duplicate paths are invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{ActorMetadata: &ActorMetadataDataSource{
+									Items: []ActorMetadataItem{
+										{Field: ActorMetadataFieldName, Path: "actor-name"},
+										{Field: ActorMetadataFieldUID, Path: "actor-name"},
+									},
+								}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "items must not contain duplicate paths",
+	}, {
+		name: "Volumes: SystemInfo trustBundle data source is valid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{TrustBundle: &TrustBundleDataSource{Name: "egress-trust", Path: "trust/ca.pem"}},
+							},
+						},
+					},
+				},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "system-info", MountPath: "/run/substrate/certs"},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "Volumes: SystemInfo clusterTrustBundle with empty name is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{TrustBundle: &TrustBundleDataSource{Name: "", Path: "ca.pem"}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+	}, {
+		name: "Volumes: SystemInfo clusterTrustBundle with absolute path is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{TrustBundle: &TrustBundleDataSource{Name: "egress-trust", Path: "/etc/ca.pem"}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "path must be a clean relative Unix path",
+	}, {
+		name: "Volumes: SystemInfo data source with both members set is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{
+									ActorMetadata: &ActorMetadataDataSource{Items: []ActorMetadataItem{{Field: ActorMetadataFieldName, Path: "actor-name"}}},
+									TrustBundle:   &TrustBundleDataSource{Name: "egress-trust", Path: "ca.pem"},
+								},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "exactly one of the fields in [actorMetadata trustBundle] must be set",
+	}, {
+		name: "Volumes: SystemInfo clusterTrustBundles with duplicate paths are invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{TrustBundle: &TrustBundleDataSource{Name: "bundle-a", Path: "ca.pem"}},
+								{TrustBundle: &TrustBundleDataSource{Name: "bundle-b", Path: "ca.pem"}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "dataSources must not contain duplicate paths",
+	}, {
+		name: "Volumes: SystemInfo clusterTrustBundle path colliding with an actorMetadata item is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{ActorMetadata: &ActorMetadataDataSource{Items: []ActorMetadataItem{{Field: ActorMetadataFieldName, Path: "shared-path"}}}},
+								{TrustBundle: &TrustBundleDataSource{Name: "egress-trust", Path: "shared-path"}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "dataSources must not contain duplicate paths",
+	}, {
+		name: "Volumes: SystemInfo with two actorMetadata entries is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{
+					Name: "system-info",
+					VolumeSource: VolumeSource{
+						SystemInfo: &SystemInfoVolumeSource{
+							DataSources: []SystemInfoDataSource{
+								{ActorMetadata: &ActorMetadataDataSource{
+									Items: []ActorMetadataItem{{Field: ActorMetadataFieldName, Path: "actor-name"}},
+								}},
+								{ActorMetadata: &ActorMetadataDataSource{
+									Items: []ActorMetadataItem{{Field: ActorMetadataFieldUID, Path: "actor-uid"}},
+								}},
+							},
+						},
+					},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "dataSources must contain at most one actorMetadata entry",
 	}, {
 		name: "Volumes: DurableDir MountPath with nested absolute path is valid",
 		mutate: func(at *ActorTemplate) {
@@ -1136,7 +1617,7 @@ func TestActorTemplateValidation(t *testing.T) {
 		},
 		wantErr: false,
 	}, {
-		name: "Volumes: ExternalVolumeTemplate volume with SandboxClass microvm is invalid",
+		name: "Volumes: ExternalVolumeTemplate volume with SandboxClass microvm is valid",
 		mutate: func(at *ActorTemplate) {
 			at.Spec.SandboxClass = SandboxClassMicroVM
 			at.Spec.Volumes = []Volume{
@@ -1154,8 +1635,7 @@ func TestActorTemplateValidation(t *testing.T) {
 				{Name: "vol1", MountPath: "/mnt/data"},
 			}
 		},
-		wantErr: true,
-		errMsg:  "ExternalVolumes are not supported when sandboxClass is 'microvm'",
+		wantErr: false,
 	}, {
 		name: "Volumes: ExternalVolumeTemplate volume with SandboxClass gvisor is valid",
 		mutate: func(at *ActorTemplate) {
@@ -1220,6 +1700,88 @@ func TestActorTemplateValidation(t *testing.T) {
 		},
 		wantErr: true,
 		errMsg:  "All volumes defined in spec.volumes must be mounted by at least one container",
+	}, {
+		name: "Volumes: volumeMount without volume is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "missing-vol", MountPath: "/mnt/data"},
+			}
+		},
+		wantErr: true,
+		errMsg:  "All volume mounts must refer to a volume defined in spec.volumes",
+	}, {
+		name: "Volumes: duplicate volume names is invalid",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Volumes = []Volume{
+				{Name: "vol1", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
+				{Name: "vol1", VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}}},
+			}
+			at.Spec.Containers[0].VolumeMounts = []VolumeMount{
+				{Name: "vol1", MountPath: "/mnt/data"},
+			}
+		},
+		wantErr: true,
+		errMsg:  "vol1",
+	}, {
+		name: "capabilities add and drop",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].SecurityContext = &SecurityContext{
+				Capabilities: &Capabilities{
+					Add:  []Capability{"NET_ADMIN"},
+					Drop: []Capability{"ALL"},
+				},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "capability with CAP_ prefix",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].SecurityContext = &SecurityContext{
+				Capabilities: &Capabilities{
+					Add: []Capability{"CAP_NET_ADMIN"},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "must be named without the 'CAP_' prefix",
+	}, {
+		name: "lower-case capability",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].SecurityContext = &SecurityContext{
+				Capabilities: &Capabilities{
+					Drop: []Capability{"net_admin"},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "should match",
+	}, {
+		name: "ALL in add",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].SecurityContext = &SecurityContext{
+				Capabilities: &Capabilities{
+					Add: []Capability{"ALL"},
+				},
+			}
+		},
+		wantErr: true,
+		errMsg:  "add does not accept 'ALL'",
+	}, {
+		name: "ALL in drop",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].SecurityContext = &SecurityContext{
+				Capabilities: &Capabilities{
+					Drop: []Capability{"ALL"},
+				},
+			}
+		},
+		wantErr: false,
+	}, {
+		name: "empty securityContext",
+		mutate: func(at *ActorTemplate) {
+			at.Spec.Containers[0].SecurityContext = &SecurityContext{}
+		},
+		wantErr: false,
 	}}
 
 	for _, tt := range tests {
