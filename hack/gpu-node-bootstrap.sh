@@ -65,18 +65,29 @@ phase1() {
 
   # VFIO cannot isolate a device without an IOMMU, and passthrough then fails at
   # the first step with no useful error.
-  say "IOMMU: adding intel_iommu=on iommu=pt to the kernel cmdline"
-  if grep -q "intel_iommu=on" /etc/default/grub; then
+  #
+  # The enable flag is vendor-specific, and the kernel ignores the other vendor's
+  # without complaint -- so hardcoding one boots the wrong host with no IOMMU
+  # while every step here still reports success. The group count checked after
+  # the reboot is what finally catches it, a whole reboot later.
+  local iommu_flag
+  if grep -q '^vendor_id.*AuthenticAMD' /proc/cpuinfo; then
+    iommu_flag="amd_iommu=on"
+  else
+    iommu_flag="intel_iommu=on"
+  fi
+  say "IOMMU: adding $iommu_flag iommu=pt to the kernel cmdline"
+  if grep -q "$iommu_flag" /etc/default/grub; then
     echo "   already present"
   else
-    sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 intel_iommu=on iommu=pt"/' \
+    sed -i "s/GRUB_CMDLINE_LINUX=\"\(.*\)\"/GRUB_CMDLINE_LINUX=\"\1 $iommu_flag iommu=pt\"/" \
       /etc/default/grub
     # Assert the substitution matched. A silent no-op here means booting without
     # an IOMMU and discovering it much later, at the first passthrough attempt.
-    grep -q 'GRUB_CMDLINE_LINUX=".*intel_iommu=on' /etc/default/grub || {
+    grep -q "GRUB_CMDLINE_LINUX=\".*$iommu_flag" /etc/default/grub || {
       echo "!! the GRUB_CMDLINE_LINUX substitution did not match. /etc/default/grub is:" >&2
       grep GRUB_CMDLINE /etc/default/grub >&2
-      echo "!! add 'intel_iommu=on iommu=pt' by hand, then re-run" >&2
+      echo "!! add '$iommu_flag iommu=pt' by hand, then re-run" >&2
       exit 1
     }
   fi

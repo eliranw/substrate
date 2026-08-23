@@ -64,14 +64,26 @@ sudo reboot
 VFIO cannot isolate a device without it, and passthrough fails at the first step
 with no useful error.
 
+The enable flag is vendor-specific, and the kernel ignores the other vendor's
+without complaint — so using the wrong one boots a host with no IOMMU while
+every step still looks like it worked.
+
 ```bash
-sudo sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 intel_iommu=on iommu=pt"/' \
+grep -q '^vendor_id.*AuthenticAMD' /proc/cpuinfo && F=amd_iommu=on || F=intel_iommu=on
+sudo sed -i "s/GRUB_CMDLINE_LINUX=\"\(.*\)\"/GRUB_CMDLINE_LINUX=\"\1 $F iommu=pt\"/" \
   /etc/default/grub
 sudo update-grub && sudo reboot
 ```
 
 `iommu=pt` (passthrough) leaves DMA unremapped for devices not assigned to a VM,
 so host-attached hardware keeps normal performance.
+
+After the reboot, the group count is the assertion — an ignored flag shows up
+here as zero, and nowhere earlier:
+
+```bash
+find /sys/kernel/iommu_groups -maxdepth 1 -mindepth 1 | wc -l
+```
 
 **Verify:**
 ```bash
