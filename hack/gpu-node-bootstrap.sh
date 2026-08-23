@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # The executable form of docs/dev/gpu-node-bootstrap.md: takes a bare Ubuntu
-# 22.04 GPU box to a single-node cluster substrate can run micro-VM GPU actors
+# Ubuntu GPU box to a single-node cluster substrate can run micro-VM GPU actors
 # on. Read that document for why each step is here; this only performs them.
 #
 # Two phases, because the kernel and IOMMU changes need a reboot and nothing
@@ -297,7 +297,20 @@ EOF
   kubectl label node "$(hostname)" ate.dev/sandboxClass=microvm --overwrite
 
   say "build tooling"
-  sudo apt-get install -y -qq git gettext-base awscli
+  sudo apt-get install -y -qq git gettext-base
+  # awscli left the Ubuntu archive after 22.04, so apt cannot supply it on a
+  # newer release and takes the whole install line down with it. The vendor
+  # bundle installs the same way on any release -- and it is v2, where the v1
+  # deb that 22.04 shipped ignores AWS_ENDPOINT_URL and silently targets real
+  # AWS instead of the in-cluster object store.
+  if ! command -v aws >/dev/null; then
+    sudo apt-get install -y -qq unzip
+    curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+    unzip -q -o /tmp/awscliv2.zip -d /tmp
+    sudo /tmp/aws/install --update
+    rm -rf /tmp/aws /tmp/awscliv2.zip
+  fi
+  aws --version
   if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VER}"; then
     curl -fsSL "https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz" | sudo tar -C /usr/local -xz
   fi

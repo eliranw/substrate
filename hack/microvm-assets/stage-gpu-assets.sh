@@ -83,7 +83,8 @@ upload() {
     aws --endpoint-url "http://localhost:${port}" s3 cp "$1" "s3://${BUCKET}/${PREFIX}/$(basename "$1")"
 }
 command -v aws >/dev/null || {
-  echo "!! the aws CLI is required (pip install awscli, or apt install awscli)" >&2
+  echo "!! the aws CLI is required. gpu-node-bootstrap.sh phase2 installs it;" >&2
+  echo "!! otherwise see https://awscli.amazonaws.com (apt has no awscli after 22.04)" >&2
   exit 1
 }
 
