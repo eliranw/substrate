@@ -105,9 +105,22 @@ phase1() {
   # imagecache mounts container rootfs overlays with one lowerdir+ per layer,
   # which overlayfs only understands from 6.5. On 5.15 every actor fails with a
   # bare "invalid argument" that names neither overlayfs nor a version.
-  say "kernel: installing the HWE stack (need >= 6.5, 22.04 ships 5.15)"
-  apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-generic-hwe-22.04
+  #
+  # 22.04 ships 5.15 and needs the HWE stack; 24.04 already ships 6.8. Deciding
+  # on what is actually on /boot rather than on the release means a new Ubuntu
+  # needs no case added here -- it just does not qualify for the install.
+  local have; have="$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's/.*vmlinuz-//' | sort -V | tail -1)"
+  case "${have:-0}" in
+    [0-5].*|6.[0-4].*|0)
+      . /etc/os-release
+      say "kernel: installing the HWE stack (need >= 6.5, have ${have:-none}, ${PRETTY_NAME:-unknown})"
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "linux-generic-hwe-${VERSION_ID}"
+      ;;
+    *)
+      say "kernel: ${have} is already >= 6.5, skipping the HWE stack"
+      ;;
+  esac
 
   # Confirm a >= 6.5 kernel actually landed and has an initramfs. Rebooting into
   # a kernel that was never fully installed is the failure this catches.
