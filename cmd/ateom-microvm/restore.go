@@ -359,10 +359,16 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 
 	// Confirm from inside the actor that the device is usable, now that the
 	// guest is running again and can be asked.
+	//
+	// Failing here rather than warning, for the same reason detachPassthrough
+	// refuses an eject it cannot confirm: an actor that reports RUNNING with an
+	// unusable device is worse than one that failed, because the only signal is
+	// a log line and the workload silently never starts. Observed against a VMM
+	// that aborted moments after the attach -- ateom logged the warning, dialled
+	// a socket whose process was gone, and still reported the actor restored.
 	if len(passthrough) > 0 {
 		if err := verifyGuestGPU(ctx, client, actorUID, workloadIDs); err != nil {
-			slog.WarnContext(ctx, "The actor's GPU is not usable after re-attach",
-				slog.String("id", actorUID), slog.Any("err", err))
+			return fmt.Errorf("the actor's GPU is not usable after re-attach: %w", err)
 		}
 	}
 
