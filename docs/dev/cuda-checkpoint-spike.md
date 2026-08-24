@@ -11,8 +11,13 @@ byte-identically afterwards — but only once you enumerate the right processes.
 **The enumeration method is load-bearing**, and getting it wrong looks exactly
 like the technique not working.
 
+It also survives landing on a **different physical GPU**, which is the ordinary
+case as soon as a node has more than one: actors resume on whichever worker is
+free.
+
 Measured on `ipp1-1984`, A100-PCIE-40GB, guest driver 595.58.03,
-cloud-hypervisor v52, 2026-08-19 and 2026-08-20. Throwaway fixture on
+cloud-hypervisor v52, 2026-08-19 and 2026-08-20; cross-card on `a4u8g-0069`,
+8x A40, cloud-hypervisor v53, 2026-08-24. Throwaway fixture on
 `eliranw/poc-cuda-checkpoint`; nothing here is product code.
 
 Reproduction detail — environment, pod shapes, full manifests, raw logs — is in
@@ -205,13 +210,52 @@ tensor parallelism, where `vllm-project/vllm#37921` (RFC #34303) is adding
 `gpu_worker` `suspend()`/`resume()` that destroy and reinitialise NCCL
 communicators. That work may still be required above TP=1.
 
+## Restoring onto a different physical card
+
+Actors resume on whichever worker is free, so a restore lands on a different GPU
+as soon as the node has more than one. Everything above was measured on a
+single-GPU node, where the actor could only ever return to the card it left.
+
+Suspended on one A40, resumed on another **on a different NUMA node**:
+
+```
+CARD BEFORE : GPU-d96411d6-804a-a758-344e-dae4f51bd940   0000:24:00.0  NUMA 0
+CARD AFTER  : GPU-6e6cfab7-fdd7-3862-2e69-a9c27582bcbe   0000:e1:00.0  NUMA 1
+
+TOGGLE   pid 87 rc=0 in  247ms
+device back after 2s of polling
+UNTOGGLE pid 87 rc=0 in 1898ms
+
+round=14..21  exact=ok(mismatched=0) ref=ok(maxerr=3.499e-03) custom=ok(mismatched=0)
+```
+
+**The UUID changing is the result.** The fixture prints `VACUOUS` rather than a
+pass when it does not, because a same-card landing produces three green checks
+indistinguishable from a real one — and with the device plugin choosing which
+card each worker gets, a same-card landing is entirely possible.
+
+`maxerr` is bit-identical across the move. The custom kernel is again the
+load-bearing check: an `nvcc`-compiled module lives in context state
+`cuda-checkpoint` has to reconstruct, and here it was reconstructed against
+**different silicon**.
+
+Forcing the landing takes some care. Suspending an actor frees the worker it
+just left, so a naive resume puts it straight back on the same card. Deleting
+that worker's pod first is enough: the replacement re-runs device allocation and
+came back with a different card.
+
+### What this does not show
+
+One observation, same GPU model, same driver version. Nothing here speaks to
+restoring onto a **different model** -- different BAR sizes and device IDs, and
+the guest driver would be resuming a context captured against other silicon.
+
 ## Still untested
 
-**In-flight work** — the device was quiesced before every checkpoint, which
-sidesteps precisely the restriction NVIDIA documents. Also multi-GPU, IPC and
-peer access, NCCL, CUDA graphs, and restoring onto a **different physical card**
-(actors resume on whichever worker is free; behaviour across GPU UUIDs is
-unknown, and this is a single-GPU node).
+**In-flight work** -- the device was quiesced before every checkpoint, which
+sidesteps precisely the restriction NVIDIA documents. Also multi-GPU per actor,
+IPC and peer access, CUDA graphs, and NCCL (reached only through vLLM's failure
+at TP=1, never exercised directly).
 
 ## What it costs
 
@@ -236,7 +280,7 @@ One number worth chasing: suspend wall time was 325 s, of which ateom's own
 work was 21 s. The remaining ~5 minutes sat in the control plane before ateom
 was asked to do anything. Not investigated.
 
-## Two defects found along the way
+## Defects found along the way
 
 ### A failed suspend strands the actor and leaks its GPU
 
@@ -258,9 +302,68 @@ the suspend error path never rolls the actor's state back.
 
 This is reachable on merged code today by any GPU actor doing real work.
 
+### A restore reported success over a dead VM
+
+`verifyGuestGPU` already asks the guest whether the device came back, and already
+reports why when it has not. The caller logged that at `WARN` and continued, so
+an actor whose GPU was dead still reached `STATUS_RUNNING` and ateom still
+emitted `Actor restored`.
+
+Seen when the VMM aborted three seconds after the attach: ateom logged the
+warning, dialled a vsock whose process was gone, logged that too, and reported
+success. Every status an operator could see said the actor was healthy; the
+workload had never started, and the stale log from the *previous* actor on that
+pod made it look merely slow.
+
+`detachPassthrough` already takes the opposite stance and says why -- it refuses
+an eject it cannot confirm rather than snapshotting on the strength of it.
+Restore had the same shape and the opposite behaviour. Now returns the error.
+
+The two are mirror images: `STATUS_SUSPENDING` strands an actor after a failure,
+this one dresses a failure as success. Both end with the actor's status not
+describing reality.
+
+### Envoy sizes its worker pool from the host, not the cgroup
+
+Not GPU-related, and reachable by anyone deploying on a large node. On a
+256-CPU host Envoy tried to start 256 workers and exhausted the file-descriptor
+limit before finishing startup:
+
+```
+[warn] evutil_make_internal_pipe_: pipe: Too many open files
+[err]  evsig_init_: socketpair: Too many open files
+```
+
+Both atenet-router and atenet-egress crashloop with the Go container beside them
+healthy, which reads as an atenet fault rather than a sizing one. Pinned to four
+workers.
+
+### cloud-hypervisor aborts on a large-BAR GPU
+
+Upstream, and unfixed as of v53.0. A vCPU thread touches the GPU's BAR and clh
+unwraps a `None`:
+
+```
+thread 'vcpu0' panicked at pci/src/vfio.rs:1365:53:
+called `Option::unwrap()` on a `None` value
+thread 'vmm' panicked at device_manager.rs:5599:41: PoisonError
+panic in a destructor during cleanup -- aborting
+```
+
+Intermittent -- 3 of 4 attempts on v52.0, 1 of 4 on v53.0 -- and it hits cold
+boot and restore alike, always ~26-28s in, which is when the guest driver first
+programs the BAR. The A40's 48 GB BAR takes ~26s to map against the
+A100-PCIE-40GB's ~12s, and the A100 never showed it, so a wider race window is
+the likely explanation. v53's #8237 ("return all-ones for unregistered MMIO/PIO
+reads") and #8369 ("fix a PCI device hotplug race by deferring device
+visibility") narrowed it without closing it.
+
+Guest memory is ruled out: re-running on the 2048 MiB config the A100 proved
+panicked identically.
+
 ### `ActorTemplate` spec is immutable
 
-Sensible — a changed template invalidates its snapshots — but it means each
+Sensible -- a changed template invalidates its snapshots -- but it means each
 fixture revision needs a new template name. Worth knowing before iterating.
 
 ## Reproducing

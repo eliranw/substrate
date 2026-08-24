@@ -4,8 +4,8 @@ Reproduction detail for `docs/dev/cuda-checkpoint-spike.md`. That document
 argues the result; this one records exactly what was run, on what, and what came
 back, so the numbers can be re-derived or disputed.
 
-**Run dates:** 2026-08-19 (context, PyTorch) and 2026-08-20 (kernel correctness,
-vLLM) · **Branch:** `eliranw/poc-cuda-checkpoint`
+**Run dates:** 2026-08-19 (context, PyTorch), 2026-08-20 (kernel correctness,
+vLLM), 2026-08-24 (cross-card) · **Branch:** `eliranw/microvm-gpu-evidence`
 **Everything below is throwaway PoC material**, not product code.
 
 ---
@@ -582,16 +582,70 @@ during this work. `workerSelector` lets them share one WorkerPool.
 - **Multi-GPU**, IPC / peer access, CUDA graphs, NCCL. vLLM ran at TP=1, so no
   collectives existed to tear down; `vllm-project/vllm#37921` may still be
   required above TP=1.
-- **Restoring onto a different physical card.** Actors resume on whichever
-  worker is free; behaviour across GPU UUIDs is unknown, and this is a
-  single-GPU node so it could not be tested.
+- ~~**Restoring onto a different physical card.**~~ **Measured** -- section 9.
+  Everything above ran on a single-GPU node, where an actor could only ever
+  return to the card it left, so none of it could have answered this.
 - **Large VRAM footprints.** 568 MiB was moved. The interesting regime is tens
   of GB, where snapshot size and eager restore dominate.
 - **Repeat runs.** Each figure is a single observation, not a distribution.
 
 ---
 
-## 9. Cluster defects encountered
+## 9. Second host: cross-card, and what a different machine broke
+
+The cross-card run needed two GPUs, so it moved to `a4u8g-0069` -- a Colossus
+A4U8G: **8x A40** (GA102, `10de:2235`, 48 GB BAR), AMD EPYC 7742, 256 CPUs,
+1 TB RAM, Ubuntu 24.04, kernel 6.17. Eight cards, eight IOMMU groups, one member
+each.
+
+One card was excluded before anything was built. `0000:01:00.0` had logged
+4,074 corrected AER errors and one `NonFatalErr` at idle, at full link width --
+so it was removed from the host (`echo 1 > .../remove`) rather than left for the
+device plugin to hand out. A flaky link during a cross-card restore produces
+exactly the symptom the test measures.
+
+### 9a. The result
+
+See `cuda-checkpoint-spike.md`. Suspended on `0000:24:00.0` (NUMA 0), resumed on
+`0000:e1:00.0` (NUMA 1), UUID changed, all three checks bit-identical after.
+
+Forcing a cross-card landing needs a step: suspending frees the worker the actor
+just left, so a naive resume returns it to the same card. Deleting that worker's
+pod first is enough -- the replacement re-runs device allocation and came back
+with a different card.
+
+### 9b. Five single-host assumptions
+
+Every one was invisible on a single Intel/22.04 box, and each stopped bring-up:
+
+| assumption | what happened |
+|---|---|
+| `intel_iommu=on` hardcoded | a no-op on AMD; grub written, phase1 reports success, node boots with no IOMMU |
+| `linux-generic-hwe-22.04` hardcoded | absent on 24.04, so apt fails -- while the 6.17 kernel already exceeded the >= 6.5 requirement |
+| `awscli` in a shared apt line | gone from the archive after 22.04, taking `git` and `gettext-base` down with it |
+| `ATE_INSTALL_KIND` defaults `false` | `install-ate-kind.sh` sets it, but `install-microvm-deps.sh` is a separate invocation -- so it took the GCS branch and died on missing `gcloud` |
+| `stage-to-rustfs.sh` needs docker + a kind node container | genuinely kind-specific: it joins the node container's netns to reach a ClusterIP |
+
+The last two share a cause worth naming: **"kind" means two things here.**
+Sometimes "self-contained, no cloud" -- which a bare-metal box is -- and
+sometimes "literally a kind cluster". One flag selects both, so choosing the
+right object store also opts you into `docker`.
+
+`install-ate.sh --deploy-ate-system` is likewise the **GCP** path:
+`ATE_STORAGE_BACKEND=gcs`, GCP registry auth, and no object store deployed at
+all. atelet dies twice over on absent ADC. `install-ate-kind.sh` is the
+bare-metal installer despite its name.
+
+### 9c. A rebuild is per-WorkerPool
+
+`ateomImage` is set on the WorkerPool, so `ko apply` of one fixture does not
+update another pool's ateom. A fixture was run against a build without the
+restore fix for exactly this reason -- worth checking the digest matches before
+attributing a result to code you think is deployed.
+
+---
+
+## 10. Cluster defects encountered
 
 Neither is a GPU issue, but both cost time and one invalidated an earlier
 finding, so they are recorded here.
