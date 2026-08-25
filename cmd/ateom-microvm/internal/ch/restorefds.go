@@ -65,7 +65,20 @@ func LaunchVMM(ctx context.Context, o LaunchVMMOptions) (*exec.Cmd, *Client, err
 	_ = os.Remove(o.APISocket)
 	// Deliberately NOT exec.CommandContext: the VMM must outlive the RPC whose
 	// ctx launched it. The caller owns cmd; WaitReady honors ctx.
-	cmd := exec.Command(bin, "--api-socket", o.APISocket)
+	args := []string{"--api-socket", o.APISocket}
+	// RUST_BACKTRACE below is not sufficient on its own: unwinding resolves
+	// symbols via stat(2), and the VMM's own seccomp filter kills the thread
+	// mid-backtrace -- "Possible seccomp violation ... Syscall number: 4" is
+	// printed where the frames should be. So a panic on a vCPU thread cannot
+	// produce the diagnostic upstream's issue template asks for.
+	//
+	// Opt-in, never a default: the filter is a real containment boundary around
+	// a VMM that maps guest memory and drives passthrough devices. Set this only
+	// while reproducing a crash.
+	if os.Getenv("ATEOM_VMM_NO_SECCOMP") == "1" {
+		args = append(args, "--seccomp", "false")
+	}
+	cmd := exec.Command(bin, args...)
 	// When the VMM aborts, its panic message is all that reaches the actor's
 	// log, and a file and line alone are rarely enough to act on -- especially
 	// for a panic raised on a vCPU thread, where the interesting question is
