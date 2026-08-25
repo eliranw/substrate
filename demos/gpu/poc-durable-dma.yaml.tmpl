@@ -46,7 +46,7 @@ spec:
 apiVersion: ate.dev/v1alpha1
 kind: ActorTemplate
 metadata:
-  name: poc-dma
+  name: poc-dma-v2
   namespace: ate-poc-dma
 spec:
   sandboxClass: microvm
@@ -69,7 +69,7 @@ spec:
       say "gpu: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
       say "durable mount: $(findmnt -n -o SOURCE,FSTYPE --target /durable 2>&1 | head -1)"
 
-      python3 - <<'PYEOF'
+      python3 - <<'PYEOF' | tee /durable/verdict.txt
       import ctypes, mmap, os, sys
 
       SIZE = 4 << 20
@@ -125,8 +125,15 @@ spec:
           say("VERDICT: register succeeded but the device write did not land.")
       PYEOF
 
-      say "probe done; holding so the actor can be inspected"
-      sleep infinity
+      # The probe runs once, at boot -- which means its verdict lands in whichever
+      # actor first ran it, usually the golden. Persist it to the durable share
+      # (which survives snapshot and restore) and re-announce on a loop, so any
+      # later actor reports the answer instead of an empty log.
+      while :; do
+        echo "----- verdict (persisted) -----"
+        cat /durable/verdict.txt 2>/dev/null || echo "no verdict recorded"
+        sleep 30
+      done
   workerSelector:
     matchLabels:
       workload: poc-dma
