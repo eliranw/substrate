@@ -66,6 +66,12 @@ func LaunchVMM(ctx context.Context, o LaunchVMMOptions) (*exec.Cmd, *Client, err
 	// Deliberately NOT exec.CommandContext: the VMM must outlive the RPC whose
 	// ctx launched it. The caller owns cmd; WaitReady honors ctx.
 	cmd := exec.Command(bin, "--api-socket", o.APISocket)
+	// When the VMM aborts, its panic message is all that reaches the actor's
+	// log, and a file and line alone are rarely enough to act on -- especially
+	// for a panic raised on a vCPU thread, where the interesting question is
+	// which guest access got there. A backtrace names the frames. Costs nothing
+	// until something actually panics.
+	cmd.Env = append(os.Environ(), "RUST_BACKTRACE=1")
 	cmd.Stdout = o.Stdout
 	cmd.Stderr = o.Stderr
 	if err := cmd.Start(); err != nil {
