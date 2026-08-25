@@ -41,10 +41,16 @@ import (
 // passthrough device.
 //
 // This guards correctness, not just completeness: cloud-hypervisor does NOT
-// refuse the snapshot. VfioPciDevice's Pausable impl is empty, so vm.pause stops
-// the vCPUs but never quiesces the device — a bus-mastering device keeps DMA-ing
-// into guest RAM while the memory ranges are written out. The result is a TORN
-// memory image, not merely one missing the device state.
+// refuse the snapshot. vm.pause stops the vCPUs but never quiesces the device --
+// a bus-mastering device keeps DMA-ing into guest RAM while the memory ranges are
+// written out. The result is a TORN memory image, not merely one missing the
+// device state.
+//
+// Through v52 that was because VfioPciDevice's Pausable impl was literally empty.
+// v53 gave it a body, but every branch is gated on migration_flags, which is set
+// only for a device advertising the kernel's VFIO migration v2 protocol. Plain
+// vfio-pci never advertises it -- only vGPU does, and that carries licensing --
+// so pause remains a no-op for a passthrough GPU and this check still stands.
 //
 // It asks the VMM what it still holds rather than consulting our own record of
 // what we detached. Bookkeeping would agree with itself even when the eject
