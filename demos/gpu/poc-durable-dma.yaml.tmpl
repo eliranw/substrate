@@ -1,0 +1,138 @@
+# THROWAWAY -- PoC only.
+#
+# Can a CUDA process DMA into a page backing the durable-dir share?
+#
+# checkpoint.go refuses a Data-scope snapshot while a passthrough device is
+# attached, and says the rejection is "conservative rather than provable": a
+# paused vCPU does not stop DMA into a page backing a durable-share mapping.
+#
+# That concern is only reachable if the GPU can write into such a page at all.
+# The share is virtio-fs with cache=auto and no DAX, so a guest mmap of a file
+# there is guest PAGE CACHE, not host memory -- and the bytes only reach the
+# host file when the guest submits a virtio-fs request, which needs a vCPU.
+#
+# This probe answers the first half: does cudaHostRegister accept the mapping,
+# and can a device write land in it. If it cannot, the rejection is provably
+# over-cautious and no snapshot experiment is needed.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-poc-dma
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: poc-dma
+  namespace: ate-poc-dma
+  labels:
+    workload: poc-dma
+spec:
+  replicas: 1
+  sandboxClass: microvm
+  sandboxConfigName: microvm-gpu-poc
+  ateomImage: ATEOM_IMAGE
+  template:
+    resources:
+      requests:
+        nvidia.com/GA102GL_A40: "1"
+      limits:
+        nvidia.com/GA102GL_A40: "1"
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: poc-dma
+  namespace: ate-poc-dma
+spec:
+  sandboxClass: microvm
+  containers:
+  - name: probe
+    image: nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c
+    volumeMounts:
+    - name: data
+      mountPath: /durable
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -u
+      exec 2>&1
+      say() { echo "[$(date -Is)] DMA: $*"; }
+
+      say "waiting for the GPU"
+      for i in $(seq 1 60); do nvidia-smi -L >/dev/null 2>&1 && break; sleep 5; done
+      say "gpu: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
+      say "durable mount: $(findmnt -n -o SOURCE,FSTYPE --target /durable 2>&1 | head -1)"
+
+      python3 - <<'PYEOF'
+      import ctypes, mmap, os, sys
+
+      SIZE = 4 << 20
+      PATH = "/durable/dma-probe.bin"
+
+      def say(m): print(f"DMA: {m}", flush=True)
+
+      with open(PATH, "wb") as f:
+          f.write(b"\x00" * SIZE)
+
+      fd = os.open(PATH, os.O_RDWR)
+      mm = mmap.mmap(fd, SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+      buf = (ctypes.c_char * SIZE).from_buffer(mm)
+      addr = ctypes.addressof(buf)
+      say(f"mapped {PATH} at 0x{addr:x} ({SIZE} bytes)")
+
+      rt = ctypes.CDLL("libcudart.so")
+      rt.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+      rt.cudaGetErrorString.restype = ctypes.c_char_p
+
+      # cudaHostRegisterMapped = 0x02
+      rc = rt.cudaHostRegister(ctypes.c_void_p(addr), ctypes.c_size_t(SIZE), 0x02)
+      msg = rt.cudaGetErrorString(rc).decode()
+      say(f"cudaHostRegister rc={rc} ({msg})")
+
+      if rc != 0:
+          say("VERDICT: the GPU CANNOT register a durable-share mapping.")
+          say("VERDICT: DMA into the durable share is unreachable -- the Data-scope")
+          say("VERDICT: rejection is over-cautious for this share type.")
+          sys.exit(0)
+
+      dev = ctypes.c_void_p()
+      rt.cudaHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+      rc = rt.cudaHostGetDevicePointer(ctypes.byref(dev), ctypes.c_void_p(addr), 0)
+      say(f"cudaHostGetDevicePointer rc={rc} devptr=0x{(dev.value or 0):x}")
+      if rc != 0:
+          say("VERDICT: registered, but no device pointer -- GPU cannot address it.")
+          sys.exit(0)
+
+      # Device-side write straight into the mapping.
+      rt.cudaMemset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+      rc = rt.cudaMemset(dev, 0xAB, ctypes.c_size_t(SIZE))
+      rt.cudaDeviceSynchronize()
+      say(f"cudaMemset(devptr, 0xAB) rc={rc}")
+
+      seen = bytes(buf[:16])
+      say(f"first 16 bytes as the GUEST sees them: {seen.hex()}")
+      if seen == b"\xab" * 16:
+          say("VERDICT: the GPU CAN write into a durable-share mapping.")
+          say("VERDICT: whether those bytes reach the HOST file while vCPUs are")
+          say("VERDICT: paused is the remaining question -- needs the snapshot test.")
+      else:
+          say("VERDICT: register succeeded but the device write did not land.")
+      PYEOF
+
+      say "probe done; holding so the actor can be inspected"
+      sleep infinity
+  workerSelector:
+    matchLabels:
+      workload: poc-dma
+  volumes:
+  - name: data
+    durableDir: {}
+  snapshotsConfig:
+    onPause: Full
+    location: gs://BUCKET/ate-poc-dma/
