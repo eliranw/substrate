@@ -338,28 +338,50 @@ Both atenet-router and atenet-egress crashloop with the Go container beside them
 healthy, which reads as an atenet fault rather than a sizing one. Pinned to four
 workers.
 
-### cloud-hypervisor aborts on a large-BAR GPU
+### cloud-hypervisor aborts on a config-space read of an MSI-X capability
 
-Upstream, and unfixed as of v53.0. A vCPU thread touches the GPU's BAR and clh
-unwraps a `None`:
+Upstream, present in v52.0 and v53.0. A guest PCI config-space read panics the
+vCPU thread that issued it:
+
+```rust
+// VfioCommon::read_config_register   v52 vfio.rs:1365:53, v53 vfio.rs:1523:53
+if let Some(id) = self.get_msix_cap_idx() {
+    let msix = self.interrupt.msix.as_mut().unwrap();   // <- None
+```
+
+The two sides disagree. `get_msix_cap_idx()` reads the **device's** config space
+and finds an MSI-X capability, so it returns `Some`; **clh's** `interrupt.msix`
+has not been populated yet. Any guest read of the MSI-X capability registers in
+that window unwraps a `None`.
+
+The panicking thread holds a mutex, so every later access hits `PoisonError`
+(`device_manager.rs`), and a panic while unwinding a panic is unrecoverable:
 
 ```
-thread 'vcpu0' panicked at pci/src/vfio.rs:1365:53:
-called `Option::unwrap()` on a `None` value
-thread 'vmm' panicked at device_manager.rs:5599:41: PoisonError
-panic in a destructor during cleanup -- aborting
+thread 'vcpu0' panicked at pci/src/vfio.rs:1523:53: called `Option::unwrap()` on a `None` value
+thread 'vmm'   panicked at vmm/src/device_manager.rs:5930:41: PoisonError
+panic in a destructor during cleanup -- thread caused non-unwinding panic. aborting.
 ```
 
-Intermittent -- 3 of 4 attempts on v52.0, 1 of 4 on v53.0 -- and it hits cold
-boot and restore alike, always ~26-28s in, which is when the guest driver first
-programs the BAR. The A40's 48 GB BAR takes ~26s to map against the
-A100-PCIE-40GB's ~12s, and the A100 never showed it, so a wider race window is
-the likely explanation. v53's #8237 ("return all-ones for unregistered MMIO/PIO
-reads") and #8369 ("fix a PCI device hotplug race by deferring device
-visibility") narrowed it without closing it.
+Different line per release, identical expression — the file grew from 2183 to
+2729 lines.
 
-Guest memory is ruled out: re-running on the 2048 MiB config the A100 proved
-panicked identically.
+Intermittent: 3 of 4 attempts on v52.0, 1 of 4 on v53.0. Hits **cold boot** as
+well as restore, which follows from it being config-space enumeration rather
+than anything to do with hot-plug. Guest RAM is irrelevant — measured, 2048 MiB
+and 16384 MiB behave identically. An A100-PCIE-40GB never showed it across two
+days; why the A40 does is unproven, plausibly MSI-X vector count or capability
+layout, or simply a longer device setup widening the window.
+
+Worth recording that this was written up first as a **BAR-mapping race** — the
+file is `vfio.rs`, the thread is a vCPU, and the timing fit. Reading the source
+killed that: lines 1516-1519 trap BAR reads and return *above* this code.
+
+**Both diagnostics upstream asks for are unavailable.** `RUST_BACKTRACE=1`
+yields `==== Possible seccomp violation ==== Syscall number: 4` where the frames
+should be, because `stat(2)` is denied on a vCPU thread; with `--seccomp false`
+the unwinder runs but every frame is `<unknown>`, the published static binary
+being stripped.
 
 ### `ActorTemplate` spec is immutable
 

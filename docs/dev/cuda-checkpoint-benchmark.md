@@ -598,6 +598,13 @@ A4U8G: **8x A40** (GA102, `10de:2235`, 48 GB BAR), AMD EPYC 7742, 256 CPUs,
 1 TB RAM, Ubuntu 24.04, kernel 6.17. Eight cards, eight IOMMU groups, one member
 each.
 
+The A40 also surfaced an upstream cloud-hypervisor abort — a `None` unwrap in
+`read_config_register` when the guest reads an MSI-X capability the VMM has not
+finished modelling. Intermittent, hits cold boot and restore, present in v52.0
+and v53.0. See `cuda-checkpoint-spike.md`; it is orthogonal to whether a
+checkpoint survives a card change, and the cross-card result below was obtained
+on the ~3-in-4 of attempts that do not hit it.
+
 One card was excluded before anything was built. `0000:01:00.0` had logged
 4,074 corrected AER errors and one `NonFatalErr` at idle, at full link width --
 so it was removed from the host (`echo 1 > .../remove`) rather than left for the
