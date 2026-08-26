@@ -55,7 +55,7 @@ spec:
 apiVersion: ate.dev/v1alpha1
 kind: ActorTemplate
 metadata:
-  name: poc-datascope
+  name: poc-datascope-v2
   namespace: ate-poc-datascope
 spec:
   sandboxClass: microvm
@@ -117,10 +117,16 @@ spec:
           say("VERIFY no prior file; this is a first run")
           say("VERDICT: N/A (nothing to verify)")
 
-      # ---- hold a live CUDA context so the device is genuinely in use ------
-      dev = torch.device("cuda")
-      a = torch.randn(512, 512, device=dev)
-      say(f"cuda ctx held on {torch.cuda.get_device_name(0)}")
+      # ---- deliberately NO CUDA context ------------------------------------
+      # The device is attached either way, and attached is what
+      # errIfPassthroughSnapshot keys on -- it asks the VMM for
+      # VFIOPassthroughIDs, not whether anything is computing.
+      #
+      # Holding a context would ALSO block the eject, so the control run (normal
+      # path, eject happens) could never complete without adding cuda-checkpoint
+      # to a fixture whose subject has nothing to do with it. The hazard under
+      # test is CPU-side virtio-fs writes still in flight at pause.
+      say(f"gpu present, no context held: {torch.cuda.get_device_name(0)}")
 
       say(f"idle {os.environ.get('HOLD_DELAY_SECONDS','150')}s (golden window)")
       time.sleep(int(os.environ.get("HOLD_DELAY_SECONDS", "150")))
@@ -138,8 +144,6 @@ spec:
           os.fsync(fd)
           seq += 1
           if seq % 200 == 0:
-              torch.matmul(a, a)          # keep the device busy
-              torch.cuda.synchronize()
               dt = time.time() - t0
               say(f"seq={seq} rate={(seq-n0)/dt:.0f} rec/s")
       PYEOF
