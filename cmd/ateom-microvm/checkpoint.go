@@ -159,9 +159,28 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	for _, c := range req.GetSpec().GetContainers() {
 		workloadIDs = append(workloadIDs, overlayWorkloadID(c.GetName()))
 	}
-	detached, err := s.detachPassthrough(ctx, client, ra, actorUID, workloadIDs)
-	if err != nil {
-		return nil, err
+	// ATEOM_UNSAFE_SNAPSHOT_WITH_DEVICE=1 skips BOTH the eject and the guard
+	// below, so a snapshot is taken with the device still attached. That is the
+	// exact situation errIfPassthroughSnapshot exists to prevent, and it can
+	// produce a torn image -- it is here only to measure whether the Data-scope
+	// half of that rejection, which the guard's own comment calls conservative
+	// rather than provable, is reachable. Never set it outside an experiment.
+	//
+	// Skipping only the guard would be worse than useless: detachPassthrough
+	// would still eject, so nothing would be attached and the run would pass
+	// while appearing to have tested something.
+	unsafeKeepDevice := os.Getenv("ATEOM_UNSAFE_SNAPSHOT_WITH_DEVICE") == "1"
+	if unsafeKeepDevice {
+		slog.WarnContext(ctx, "ATEOM_UNSAFE_SNAPSHOT_WITH_DEVICE set: snapshotting with the device attached",
+			slog.String("id", actorUID), slog.String("scope", scope.String()))
+	}
+	detached := false
+	if !unsafeKeepDevice {
+		var err error
+		detached, err = s.detachPassthrough(ctx, client, ra, actorUID, workloadIDs)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// Only re-read the device tree when there was something to eject. The gate is
 	// an assertion about a detach that just happened; running it for every actor

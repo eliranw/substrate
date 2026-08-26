@@ -1,0 +1,155 @@
+# THROWAWAY -- PoC only. Deliberately produces a possibly-torn snapshot.
+#
+# Does a Data-scope snapshot taken with the GPU still attached corrupt the
+# durable share?
+#
+# checkpoint.go ejects the device for BOTH scopes, and errIfPassthroughSnapshot
+# refuses to snapshot while one is attached. Its comment is explicit that the
+# Data half of that is "conservative rather than provable": a paused vCPU does
+# not stop DMA into a page backing a durable-share mapping.
+#
+# poc-durable-dma showed cudaHostRegister REFUSES a virtio-fs mapping, so the
+# GPU cannot address those pages and that specific hazard is closed. What is
+# left is virtio-fs writes still IN FLIGHT when the vCPUs stop: virtiofsd is a
+# host process and is never paused, so it can still be writing into the host
+# directory that tarDurableVolumes is reading.
+#
+# That residual is NOT GPU-specific -- it would affect every Data snapshot of
+# every actor with a durable volume -- which is why it is worth measuring.
+#
+# The workload is maximally hostile to it: fixed-size CRC'd records, fsync'd
+# one at a time, as fast as the share will take them, with a live CUDA context
+# alongside so the device is genuinely attached and bus-mastering.
+#
+# Reads TORN records (bad CRC), not MISSING ones. The guest is paused, so a
+# short tail is expected and correct -- only a bad checksum is corruption.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-poc-datascope
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: poc-datascope
+  namespace: ate-poc-datascope
+  labels:
+    workload: poc-datascope
+spec:
+  replicas: 1
+  sandboxClass: microvm
+  sandboxConfigName: microvm-gpu-poc
+  ateomImage: ATEOM_IMAGE
+  template:
+    resources:
+      requests:
+        nvidia.com/TU104GL_TESLA_T4: "1"
+      limits:
+        nvidia.com/TU104GL_TESLA_T4: "1"
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: poc-datascope
+  namespace: ate-poc-datascope
+spec:
+  sandboxClass: microvm
+  containers:
+  - name: writer
+    image: nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c
+    volumeMounts:
+    - name: data
+      mountPath: /durable
+    env:
+    - name: HOLD_DELAY_SECONDS
+      value: "150"
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -u
+      exec 2>&1
+      say() { echo "[$(date -Is)] DS: $*"; }
+
+      say "waiting for the GPU"
+      for i in $(seq 1 60); do nvidia-smi -L >/dev/null 2>&1 && break; sleep 5; done
+      say "gpu: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
+
+      python3 - <<'PYEOF'
+      import os, struct, zlib, sys, time
+      import torch
+
+      REC   = 4096
+      HDR   = struct.Struct("<QI")          # seq, crc32 of payload
+      PAY   = REC - HDR.size
+      PATH  = "/durable/records.bin"
+
+      def say(m): print(f"DS: {m}", flush=True)
+
+      # ---- verify what a previous life left behind -------------------------
+      torn, total, first_bad, maxseq, short = 0, 0, None, -1, 0
+      if os.path.exists(PATH):
+          size = os.path.getsize(PATH)
+          whole, rem = divmod(size, REC)
+          short = rem
+          with open(PATH, "rb") as f:
+              for i in range(whole):
+                  b = f.read(REC)
+                  seq, crc = HDR.unpack(b[:HDR.size])
+                  total += 1
+                  if zlib.crc32(b[HDR.size:]) != crc:
+                      torn += 1
+                      if first_bad is None: first_bad = seq
+                  else:
+                      maxseq = max(maxseq, seq)
+          say(f"VERIFY file={size}B records={total} torn={torn} "
+              f"trailing_partial_bytes={short} maxseq={maxseq}")
+          if torn or short:
+              say(f"VERDICT: CORRUPT -- torn={torn} first_bad_seq={first_bad} partial={short}")
+          else:
+              say("VERDICT: INTACT -- every record's CRC matched, no partial tail")
+      else:
+          say("VERIFY no prior file; this is a first run")
+          say("VERDICT: N/A (nothing to verify)")
+
+      # ---- hold a live CUDA context so the device is genuinely in use ------
+      dev = torch.device("cuda")
+      a = torch.randn(512, 512, device=dev)
+      say(f"cuda ctx held on {torch.cuda.get_device_name(0)}")
+
+      say(f"idle {os.environ.get('HOLD_DELAY_SECONDS','150')}s (golden window)")
+      time.sleep(int(os.environ.get("HOLD_DELAY_SECONDS", "150")))
+
+      # ---- write hard, fsync every record ---------------------------------
+      seq = maxseq + 1
+      fd = os.open(PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+      say(f"appending from seq={seq}, fsync per record")
+      t0, n0 = time.time(), seq
+      while True:
+          pat = bytes(((seq + i) & 0xFF) for i in range(64))
+          payload = (pat * (PAY // 64 + 1))[:PAY]   # PAY is not a multiple of 64
+          rec = HDR.pack(seq, zlib.crc32(payload)) + payload
+          os.write(fd, rec)
+          os.fsync(fd)
+          seq += 1
+          if seq % 200 == 0:
+              torch.matmul(a, a)          # keep the device busy
+              torch.cuda.synchronize()
+              dt = time.time() - t0
+              say(f"seq={seq} rate={(seq-n0)/dt:.0f} rec/s")
+      PYEOF
+  workerSelector:
+    matchLabels:
+      workload: poc-datascope
+  volumes:
+  - name: data
+    durableDir: {}
+  snapshotsConfig:
+    # Data, not Full: this is the scope whose rejection is unproven.
+    onPause: Data
+    location: gs://BUCKET/ate-poc-datascope/
