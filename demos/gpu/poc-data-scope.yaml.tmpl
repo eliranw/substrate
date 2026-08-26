@@ -55,7 +55,7 @@ spec:
 apiVersion: ate.dev/v1alpha1
 kind: ActorTemplate
 metadata:
-  name: poc-datascope-v2
+  name: poc-datascope-v3
   namespace: ate-poc-datascope
 spec:
   sandboxClass: microvm
@@ -82,7 +82,10 @@ spec:
 
       python3 - <<'PYEOF'
       import os, struct, zlib, sys, time
-      import torch
+      # Deliberately no torch: even torch.cuda.get_device_name() INITIALISES
+      # CUDA and creates a context, which holds the device open and blocks the
+      # eject. nvidia-smi in the prologue already proved the GPU is there, and
+      # it exits.
 
       REC   = 4096
       HDR   = struct.Struct("<QI")          # seq, crc32 of payload
@@ -126,7 +129,7 @@ spec:
       # path, eject happens) could never complete without adding cuda-checkpoint
       # to a fixture whose subject has nothing to do with it. The hazard under
       # test is CPU-side virtio-fs writes still in flight at pause.
-      say(f"gpu present, no context held: {torch.cuda.get_device_name(0)}")
+      say("gpu attached; no CUDA context created by this process")
 
       say(f"idle {os.environ.get('HOLD_DELAY_SECONDS','150')}s (golden window)")
       time.sleep(int(os.environ.get("HOLD_DELAY_SECONDS", "150")))
