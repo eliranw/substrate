@@ -151,5 +151,11 @@ spec:
     durableDir: {}
   snapshotsConfig:
     # Data, not Full: this is the scope whose rejection is unproven.
+    #
+    # onCommit has to move with it. The CRD enforces
+    #   (onPause ?: Full) == Full || (onCommit ?: Full) == (onPause ?: Full)
+    # so a Data onPause with onCommit left to default to Full is rejected --
+    # a commit may not capture more than the pause it derives from.
     onPause: Data
+    onCommit: Data
     location: gs://BUCKET/ate-poc-datascope/
